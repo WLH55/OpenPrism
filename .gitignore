@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+*.local
+credentials*.json
+
+# Personal data (local-first, never commit)
+data/
+*.sqlite
+*.db
+
+# Logs & caches
+logs/
+*.log
+.cache/
+coverage/
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Agent tooling local state
+.claude/settings.local.json
+.agents/*.local.*
