@@ -1,10 +1,9 @@
-# Dependencies
+# Build output
 node_modules/
 .pnpm-store/
-
-# Build output
 dist/
 build/
+lib/
 *.tsbuildinfo
 
 # Environment & secrets
@@ -34,3 +33,4 @@ Thumbs.db
 # Agent tooling local state
 .claude/settings.local.json
 .agents/*.local.*
+.dsh-e2e/
