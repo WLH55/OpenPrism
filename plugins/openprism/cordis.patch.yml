@@ -1,0 +1,15 @@
+# OpenPrism 组合包：生活面板插件（host 半边 + 浏览器半边）。
+# 行按包名引用，由 Node 从 profile / dsh 安装的 node_modules 解析。
+#
+# 依赖的 storage-domain seam（storage / storage-json / storage-domain 三行）由
+# dsh-web-app 组合提供；本 patch 不重复 insert（同 id 重复 insert 会因
+# "duplicate loader entry id" 失败）。若在无 web-app 的组合（如 headless）中
+# 使用，请在宿主 profile 的 cordis.patch.yml 补上这三行：
+#   - id: storage        name: '@deepseek-ai/dsh-storage'
+#   - id: storage-json   name: '@deepseek-ai/dsh-storage-json'
+#       config: { root: !!js dshHomePath('storages') }
+#   - id: storage-domain name: '@deepseek-ai/dsh-storage-domain'
+#       config: { backend: json }
+- insert:
+    - id: openprism
+      name: openprism
