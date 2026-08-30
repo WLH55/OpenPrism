@@ -39,7 +39,9 @@ import { rebuildFromSessions } from './rebuild.js'
 import { DshSessionFileSource } from './session-files.js'
 import { resolveEventsFile } from './home.js'
 import { normalizeRecordArgs } from './records.js'
+import { applyCorrection, describeRecord, parseCorrectionRequest } from './corrections.js'
 import { panelDataFromFold } from './summary.js'
+import { dayKey } from './panel.js'
 import type { ActivityDimension, CategoryDimension } from './types.js'
 
 export const name = 'openprism'
@@ -63,7 +65,20 @@ export async function apply(ctx: Context): Promise<void> {
   }
 
   async function readSummary(): Promise<PanelSummary> {
-    return buildPanelSummary(panelDataFromFold(fold()))
+    const state = fold()
+    const summary = buildPanelSummary(panelDataFromFold(state))
+    summary.recent = state.records
+      .filter((r) => !r.deleted && r.kind !== 'goal')
+      .sort((a, b) => b.occurredAt - a.occurredAt)
+      .slice(0, 12)
+      .map((r) => ({
+        id: r.id,
+        kind: r.kind as 'expense' | 'mood' | 'activity',
+        occurredAt: r.occurredAt,
+        date: dayKey(r.occurredAt),
+        title: describeRecord(r),
+      }))
+    return summary
   }
 
   // ─── 分类：播种 / 解析（未知名称自动建类，internal 事件） ───
@@ -114,6 +129,7 @@ export async function apply(ctx: Context): Promise<void> {
   ctx.tools.register(moodTool())
   ctx.tools.register(activityTool(bootCategories))
   ctx.tools.register(panelTool())
+  ctx.tools.register(correctTool())
 
   function categoryDescription(list: readonly string[]): string {
     return `Existing: ${list.join('、')}. Reuse one when reasonable; any other non-empty name creates a new custom category.`
@@ -340,6 +356,61 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }
 
+  function correctTool(): ToolDefinition {
+    return {
+      name: 'openprism_correct',
+      description:
+        'Correct or delete one previously recorded OpenPrism entry (expense/mood/activity). Provide `target` (event id from '
+        + 'openprism_panel 最近记录) to hit an exact entry, or provide `kind` (+optional dimension/category filter) to hit the '
+        + 'most recent match. op=update needs at least one field to change: amount/score/category/note/durationMinutes/occurredAt. '
+        + 'Call it when the user says an entry was wrong ("刚才记错了", "改成 28", "删掉那条").',
+      parameters: {
+        type: 'object',
+        properties: {
+          op: { type: 'string', enum: ['update', 'delete'], description: 'update changes fields; delete removes the entry.' },
+          target: { type: 'string', description: 'Event id of the entry (from openprism_panel 最近记录). (optional)' },
+          kind: { type: 'string', enum: ['expense', 'mood', 'activity'], description: 'Required when target is omitted.' },
+          dimension: { type: 'string', enum: [...ACTIVITY_DIMENSIONS], description: 'Activity dimension filter. (optional)' },
+          amount: { type: 'number', description: 'update: corrected amount (expense). (optional)' },
+          score: { type: 'number', description: 'update: corrected mood score 1-5. (optional)' },
+          category: { type: 'string', description: 'update: corrected category. (optional)' },
+          note: { type: 'string', description: 'update: corrected note. (optional)' },
+          durationMinutes: { type: 'number', description: 'update: corrected duration in minutes. (optional)' },
+          occurredAt: { type: 'string', description: 'update: corrected occurrence time (ISO date/time). (optional)' },
+        },
+        required: ['op'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['corrected', 'op', 'target', 'entry'],
+          properties: {
+            corrected: { type: 'boolean' },
+            op: { type: 'string' },
+            target: { type: 'string', description: 'Id of the corrected original event.' },
+            entry: { type: 'string', description: 'Human-readable description of the corrected entry (before this correction).' },
+          },
+        },
+        render: (_args: unknown, value: JsonValue) => {
+          const v = value as { op: string; entry: string }
+          return textBlock(`${v.op === 'delete' ? '已删除' : '已更正'}：${v.entry}`)
+        },
+      },
+      async execute(args: unknown, _exec: unknown): Promise<JsonValue> {
+        const request = parseCorrectionRequest(args as Record<string, unknown>)
+        if ('error' in request) throw new Error(`openprism: ${request.error}`)
+        const result = await applyCorrection(store, request, { source: 'internal' })
+        return { corrected: true, op: result.op, target: result.target, entry: describeRecord(result.record) }
+      },
+      presentCall: (args: unknown): ToolCallView | undefined => {
+        const raw = args as Record<string, unknown>
+        if (raw.op !== 'update' && raw.op !== 'delete') return undefined
+        return { card: 'generic', title: '更正记录', kind: 'other', rawInput: args as JsonValue }
+      },
+    }
+  }
+
   // ─── 浏览器面板端点（webServer seam 可选组合时注册） ───
 
   ctx.inject(['webServer'], (webCtx) => {
@@ -373,6 +444,25 @@ export async function apply(ctx: Context): Promise<void> {
           }
         },
       })
+      const disposeCorrections = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/corrections',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          try {
+            const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+            const request = parseCorrectionRequest(body)
+            if ('error' in request) throw new Error(request.error)
+            const result = await applyCorrection(store, request, { source: 'ui' })
+            sendJson(res, 200, { ok: true, op: result.op, target: result.target })
+          } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+          }
+        },
+      })
       const disposeRebuild = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/rebuild',
@@ -391,6 +481,7 @@ export async function apply(ctx: Context): Promise<void> {
       })
       return () => {
         disposeRebuild()
+        disposeCorrections()
         disposeCategories()
         disposePanel()
       }
