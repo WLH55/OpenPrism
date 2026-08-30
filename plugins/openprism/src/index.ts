@@ -49,6 +49,8 @@ import { dayKey } from './panel.js'
 import { CaptureStore } from './captures.js'
 import { distillPending, type DistillLlmPort } from './distill.js'
 import { buildDailyBriefing, buildWeeklyBriefing } from './briefing.js'
+import { resolveDelivery, type DeliveryPort } from './delivery.js'
+import { ChatlogConnector } from './chatlog.js'
 import { join } from 'node:path'
 import type { ActivityDimension, CategoryDimension } from './types.js'
 
@@ -95,6 +97,16 @@ export async function apply(ctx: Context): Promise<void> {
 
   // ─── 简报（D7）：数据模板零 token，周报解读可选过 LLM；落 reports/YYYY-MM/ ───
 
+  const delivery: DeliveryPort = resolveDelivery()
+  async function deliverBriefing(title: string, path: string, markdown: string): Promise<void> {
+    try {
+      const ok = await delivery.deliver(title, path, markdown)
+      if (ok) ctx.logger.info(`openprism: 简报已投递 ${path}`)
+    } catch (error) {
+      ctx.logger.warn(`openprism: 简报投递异常：${String(error)}`)
+    }
+  }
+
   async function runDailyBriefing(): Promise<{ path: string; markdown: string }> {
     const now = Date.now()
     const state = fold()
@@ -111,6 +123,7 @@ export async function apply(ctx: Context): Promise<void> {
     await mkdir(join(fullPath, '..'), { recursive: true })
     await writeFile(fullPath, briefing.markdown, 'utf8')
     ctx.logger.info(`openprism: 每日简报已生成 ${briefing.path}`)
+    void deliverBriefing('OpenPrism 每日简报', briefing.path, briefing.markdown)
     return briefing
   }
 
@@ -135,6 +148,7 @@ export async function apply(ctx: Context): Promise<void> {
     await mkdir(join(fullPath, '..'), { recursive: true })
     await writeFile(fullPath, briefing.markdown, 'utf8')
     ctx.logger.info(`openprism: 周报已生成 ${briefing.path}`)
+    void deliverBriefing('OpenPrism 周报', briefing.path, briefing.markdown)
     return briefing
   }
 
@@ -173,6 +187,21 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }, 'openprism: nightly jobs')
   void catchUpBriefing()
+
+  // ─── 连接器（D8）：Chatlog → 采集日志（配置 OPENPRISM_CHATLOG_URL 启用） ───
+
+  let chatlog: ChatlogConnector | undefined
+  const chatlogUrl = process.env.OPENPRISM_CHATLOG_URL
+  if (chatlogUrl !== undefined && chatlogUrl.length > 0) {
+    chatlog = new ChatlogConnector(chatlogUrl, captures, join(resolveOpenPrismHome(), 'captures'))
+    await chatlog.load()
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        void chatlog?.poll().catch((error: unknown) => ctx.logger.warn(`openprism: chatlog 轮询失败：${String(error)}`))
+      }, 3600 * 1000)
+      return () => clearInterval(timer)
+    }, 'openprism: chatlog hourly poll')
+  }
 
   lastApplied = { store, captures }
 
@@ -796,6 +825,25 @@ export async function apply(ctx: Context): Promise<void> {
           }
         },
       })
+      const disposeChatlogPoll = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/connectors/chatlog/poll',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          if (chatlog === undefined) {
+            sendJson(res, 200, { ran: false, reason: 'no-url', fetched: 0, appended: 0 })
+            return
+          }
+          try {
+            sendJson(res, 200, await chatlog.poll())
+          } catch (error) {
+            sendJson(res, 500, { error: String(error) })
+          }
+        },
+      })
       const disposeRebuild = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/rebuild',
@@ -814,6 +862,7 @@ export async function apply(ctx: Context): Promise<void> {
       })
       return () => {
         disposeRebuild()
+        disposeChatlogPoll()
         disposeBriefingDaily()
         disposeBriefingWeekly()
         disposeBriefingsList()
