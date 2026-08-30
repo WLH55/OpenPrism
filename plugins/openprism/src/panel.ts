@@ -100,9 +100,22 @@ export interface PanelSummary {
   activities: Record<ActivityDimension, ActivityDimensionSummary>
   /** 各维度的当前分类清单（自定义后实时变化）。 */
   categories: Record<CategoryDimension, string[]>
+  /** 最近记录（含事件 id，供 openprism_correct 更正/删除与 UI 编辑入口）；由宿主侧装配。 */
+  recent?: RecentItem[]
 }
 
-function dayKey(time: number): string {
+/** 最近记录行（更正回路的取 target 来源，4.1）。 */
+export interface RecentItem {
+  id: string
+  kind: 'expense' | 'mood' | 'activity'
+  occurredAt: number
+  /** YYYY-MM-DD（本地时区，按 occurredAt）。 */
+  date: string
+  title: string
+}
+
+/** YYYY-MM-DD（本地时区）。 */
+export function dayKey(time: number): string {
   const d = new Date(time)
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
@@ -253,6 +266,12 @@ export function renderPanelSummary(summary: PanelSummary): string {
   lines.push('可录分类（record 时优先复用，新名称会自动创建）：')
   for (const dim of CATEGORY_DIMENSIONS) {
     lines.push(`  ${dim === 'finance' ? '支出' : ACTIVITY_DIMENSION_LABEL[dim as ActivityDimension]}：${summary.categories[dim].join('、')}`)
+  }
+  if (summary.recent !== undefined && summary.recent.length > 0) {
+    lines.push('最近记录（[id] 可用 openprism_correct 更正/删除）：')
+    for (const item of summary.recent) {
+      lines.push(`  [${item.id}] ${item.date} ${item.title}`)
+    }
   }
   return lines.join('\n')
 }
