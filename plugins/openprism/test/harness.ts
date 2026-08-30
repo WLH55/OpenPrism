@@ -17,6 +17,7 @@ export interface FakeCtx {
   inject: (services: string[], cb: (ctx: WebCtx) => void) => void
   on: (event: string, listener: (...args: unknown[]) => void) => void
   emit: (event: string, ...args: unknown[]) => void
+  effect: (fn: () => () => void, name?: string) => void
 }
 
 export interface WebCtx {
@@ -74,6 +75,9 @@ export async function createHarness(): Promise<Harness> {
       const list = listeners.get(event) ?? []
       list.push(listener)
       listeners.set(event, list)
+    },
+    effect(fn) {
+      fn()
     },
     emit(event, ...args) {
       for (const listener of listeners.get(event) ?? []) listener(...args)

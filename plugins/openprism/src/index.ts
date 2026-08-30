@@ -37,15 +37,24 @@ import type { FoldedState } from './fold.js'
 import { Mirror, type MirrorSessionLike } from './mirror.js'
 import { rebuildFromSessions } from './rebuild.js'
 import { DshSessionFileSource } from './session-files.js'
-import { resolveEventsFile } from './home.js'
+import { resolveEventsFile, resolveOpenPrismHome } from './home.js'
 import { normalizeRecordArgs } from './records.js'
 import { applyCorrection, describeRecord, parseCorrectionRequest } from './corrections.js'
 import { panelDataFromFold } from './summary.js'
 import { dayKey } from './panel.js'
+import { CaptureStore } from './captures.js'
+import { distillPending, type DistillLlmPort } from './distill.js'
+import { join } from 'node:path'
 import type { ActivityDimension, CategoryDimension } from './types.js'
 
 export const name = 'openprism'
 export const inject = ['tools']
+
+/** 最近一次 apply 的存储实例（测试与运维内省用；生产单实例语义不变）。 */
+let lastApplied: { store: EventStore; captures: CaptureStore } | undefined
+export function lastAppliedStores(): { store: EventStore; captures: CaptureStore } | undefined {
+  return lastApplied
+}
 
 export async function apply(ctx: Context): Promise<void> {
   ctx.logger.info('openprism: 六维度生活面板就绪（全局事件日志版 v0.4：镜像器 + 折叠 + 更正 + rebuild）')
@@ -54,11 +63,49 @@ export async function apply(ctx: Context): Promise<void> {
   await store.load()
   await seedCategories()
 
-  const mirror = new Mirror(store)
+  const captures = new CaptureStore(join(resolveOpenPrismHome(), 'captures'))
+  await captures.load()
+
+  const mirror = new Mirror(store, captures)
   ctx.on('session/event', mirror.handleSessionEvent)
   ctx.on('session/created', (session: MirrorSessionLike) => {
     void mirror.backfillSession(session)
   })
+
+  // ─── 夜间提炼（5.3）：凌晨 3 点批量提炼 pending 原料；错过补跑=下次启动照跑 ───
+
+  let llmPort: DistillLlmPort | undefined
+  ctx.inject(['llm'], (llmCtx) => {
+    llmPort = createLlmPort(llmCtx)
+  })
+
+  async function runDistill(): Promise<unknown> {
+    try {
+      return await distillPending({ store, captures, route: mirror.getRoute(), llm: llmPort })
+    } catch (error) {
+      ctx.logger.warn(`openprism: 夜间提炼失败：${String(error)}`)
+      return { ran: false, reason: 'no-llm', error: String(error) }
+    }
+  }
+
+  ctx.effect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const scheduleNext = (): void => {
+      const now = new Date()
+      const next = new Date(now)
+      next.setHours(3, 0, 0, 0)
+      if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
+      timer = setTimeout(() => {
+        void runDistill().finally(scheduleNext)
+      }, Math.min(next.getTime() - now.getTime(), 2 ** 31 - 1))
+    }
+    scheduleNext()
+    return () => {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, 'openprism: nightly distill')
+
+  lastApplied = { store, captures }
 
   function fold(): FoldedState {
     return foldEvents(store.list())
@@ -411,6 +458,34 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }
 
+  /** ctx.llm → 提炼端口的适配（dsh-llm 只做类型检查，运行时动态 import 到宿主副本）。 */
+  function createLlmPort(llmCtx: { llm: import('@deepseek-ai/dsh-llm').LlmRuntime }): DistillLlmPort {
+    return {
+      async complete({ provider, model, system, prompt, maxTokens }) {
+        const { createUserMessage, BlockAssembler } = await import('@deepseek-ai/dsh-llm')
+        const options = {
+          provider,
+          model,
+          messages: [
+            createUserMessage({
+              content: [{ type: 'text', text: prompt }],
+              source: { kind: 'plugin', plugin: 'openprism' },
+            }),
+          ],
+          system,
+          maxTokens,
+          purpose: 'openprism-distill',
+        } as unknown as import('@deepseek-ai/dsh-llm').GenerateOptions
+        const assembler = new BlockAssembler()
+        for await (const chunk of llmCtx.llm.stream(options)) assembler.push(chunk)
+        return (assembler.blocks() as Array<{ type?: string; text?: string }>)
+          .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+          .map((b) => (b as { text: string }).text)
+          .join('')
+      },
+    }
+  }
+
   // ─── 浏览器面板端点（webServer seam 可选组合时注册） ───
 
   ctx.inject(['webServer'], (webCtx) => {
@@ -463,6 +538,18 @@ export async function apply(ctx: Context): Promise<void> {
           }
         },
       })
+      const disposeDistill = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/distill',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          const report = await runDistill()
+          sendJson(res, 200, report)
+        },
+      })
       const disposeRebuild = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/rebuild',
@@ -481,6 +568,7 @@ export async function apply(ctx: Context): Promise<void> {
       })
       return () => {
         disposeRebuild()
+        disposeDistill()
         disposeCorrections()
         disposeCategories()
         disposePanel()
