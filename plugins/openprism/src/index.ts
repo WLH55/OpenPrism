@@ -22,6 +22,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-session'
 // ctx.webServer 键的类型增强；该 seam 未组合时注入回调不激活
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import {
   ACTIVITY_DIMENSIONS,
   ACTIVITY_DIMENSION_LABEL,
@@ -47,6 +48,7 @@ import { panelDataFromFold } from './summary.js'
 import { dayKey } from './panel.js'
 import { CaptureStore } from './captures.js'
 import { distillPending, type DistillLlmPort } from './distill.js'
+import { buildDailyBriefing, buildWeeklyBriefing } from './briefing.js'
 import { join } from 'node:path'
 import type { ActivityDimension, CategoryDimension } from './types.js'
 
@@ -91,22 +93,86 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }
 
+  // ─── 简报（D7）：数据模板零 token，周报解读可选过 LLM；落 reports/YYYY-MM/ ───
+
+  async function runDailyBriefing(): Promise<{ path: string; markdown: string }> {
+    const now = Date.now()
+    const state = fold()
+    const goalRecords = state.records
+      .filter((r) => r.kind === 'goal' && !r.deleted)
+      .map((r) => ({ id: r.id, payload: r.payload as import('./events.js').GoalPayload }))
+    const briefing = buildDailyBriefing({
+      records: state.records,
+      goals: buildGoalProgress(goalRecords, state.records, now),
+      distillCount: store.list().filter((e) => e.source === 'extraction' && e.recordedAt >= now - 24 * 3600 * 1000).length,
+      now,
+    })
+    const fullPath = join(resolveOpenPrismHome(), briefing.path)
+    await mkdir(join(fullPath, '..'), { recursive: true })
+    await writeFile(fullPath, briefing.markdown, 'utf8')
+    ctx.logger.info(`openprism: 每日简报已生成 ${briefing.path}`)
+    return briefing
+  }
+
+  async function runWeeklyBriefing(): Promise<{ path: string; markdown: string }> {
+    const state = fold()
+    const briefing = await buildWeeklyBriefing({
+      records: state.records,
+      now: Date.now(),
+      llm: llmPort === undefined
+        ? undefined
+        : {
+          completeOnce: (system, prompt) => {
+            const route = mirror.getRoute()
+            const port = llmPort
+            if (route === undefined || port === undefined) return Promise.reject(new Error('no model route'))
+            return port.complete({ provider: route.provider, model: route.model, system, prompt, maxTokens: 800 })
+          },
+        },
+      llmRoute: mirror.getRoute(),
+    })
+    const fullPath = join(resolveOpenPrismHome(), briefing.path)
+    await mkdir(join(fullPath, '..'), { recursive: true })
+    await writeFile(fullPath, briefing.markdown, 'utf8')
+    ctx.logger.info(`openprism: 周报已生成 ${briefing.path}`)
+    return briefing
+  }
+
+  /** 启动补跑：今天已过 07:00 但昨天的每日简报缺失 → 补生成（5.3 补跑语义的简报版）。 */
+  async function catchUpBriefing(): Promise<void> {
+    const now = new Date()
+    if (now.getHours() < 7) return
+    const yesterday = dayKey(now.getTime() - 24 * 3600 * 1000)
+    const relPath = `reports/${yesterday.slice(0, 7)}/daily-${yesterday}.md`
+    const exists = await readdir(join(resolveOpenPrismHome(), 'reports', yesterday.slice(0, 7)))
+      .then((files) => files.includes(`daily-${yesterday}.md`))
+      .catch(() => false)
+    if (!exists) await runDailyBriefing()
+  }
+
   ctx.effect(() => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const scheduleNext = (): void => {
+    const timers: Array<ReturnType<typeof setTimeout>> = []
+    const schedule = (job: () => Promise<void>, hour: number, minute: number, sundayOnly = false): void => {
       const now = new Date()
       const next = new Date(now)
-      next.setHours(3, 0, 0, 0)
-      if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
-      timer = setTimeout(() => {
-        void runDistill().finally(scheduleNext)
-      }, Math.min(next.getTime() - now.getTime(), 2 ** 31 - 1))
+      next.setHours(hour, minute, 0, 0)
+      if (sundayOnly) {
+        while (next.getDay() !== 0 || next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
+      } else if (next.getTime() <= now.getTime()) {
+        next.setDate(next.getDate() + 1)
+      }
+      timers.push(setTimeout(() => {
+        void job().finally(() => schedule(job, hour, minute, sundayOnly))
+      }, Math.min(next.getTime() - now.getTime(), 2 ** 31 - 1)))
     }
-    scheduleNext()
+    schedule(async () => { await runDistill() }, 3, 0) // 凌晨 3 点：提炼（5.3）
+    schedule(async () => { await runDailyBriefing() }, 7, 0) // 清晨 7 点：每日简报（D7）
+    schedule(async () => { await runWeeklyBriefing() }, 21, 0, true) // 周日 21 点：周报（D7）
     return () => {
-      if (timer !== undefined) clearTimeout(timer)
+      for (const timer of timers) clearTimeout(timer)
     }
-  }, 'openprism: nightly distill')
+  }, 'openprism: nightly jobs')
+  void catchUpBriefing()
 
   lastApplied = { store, captures }
 
@@ -682,6 +748,54 @@ export async function apply(ctx: Context): Promise<void> {
           sendJson(res, 200, report)
         },
       })
+      const disposeBriefingDaily = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/briefing/daily',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          try {
+            sendJson(res, 200, await runDailyBriefing())
+          } catch (error) {
+            sendJson(res, 500, { error: String(error) })
+          }
+        },
+      })
+      const disposeBriefingWeekly = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/briefing/weekly',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          try {
+            sendJson(res, 200, await runWeeklyBriefing())
+          } catch (error) {
+            sendJson(res, 500, { error: String(error) })
+          }
+        },
+      })
+      const disposeBriefingsList = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/briefings',
+        handler: async (_req: IncomingMessage, res: ServerResponse) => {
+          try {
+            const reportsDir = join(resolveOpenPrismHome(), 'reports')
+            const months = await readdir(reportsDir).catch(() => [] as string[])
+            const files: string[] = []
+            for (const month of months) {
+              const monthFiles = await readdir(join(reportsDir, month)).catch(() => [] as string[])
+              for (const file of monthFiles) files.push(`reports/${month}/${file}`)
+            }
+            sendJson(res, 200, { briefings: files.sort() })
+          } catch (error) {
+            sendJson(res, 500, { error: String(error) })
+          }
+        },
+      })
       const disposeRebuild = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/rebuild',
@@ -700,6 +814,9 @@ export async function apply(ctx: Context): Promise<void> {
       })
       return () => {
         disposeRebuild()
+        disposeBriefingDaily()
+        disposeBriefingWeekly()
+        disposeBriefingsList()
         disposeDistill()
         disposeRecords()
         disposeCorrections()
