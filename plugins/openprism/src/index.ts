@@ -27,7 +27,10 @@ import {
   ACTIVITY_DIMENSION_LABEL,
   CATEGORY_DIMENSIONS,
   DEFAULT_CATEGORIES,
+  buildGoalProgress,
+  buildHeatmap,
   buildPanelSummary,
+  buildSlices,
   renderPanelSummary,
 } from './panel.js'
 import type { PanelSummary } from './panel.js'
@@ -114,6 +117,7 @@ export async function apply(ctx: Context): Promise<void> {
   async function readSummary(): Promise<PanelSummary> {
     const state = fold()
     const summary = buildPanelSummary(panelDataFromFold(state))
+    const now = summary.updatedAt
     summary.recent = state.records
       .filter((r) => !r.deleted && r.kind !== 'goal')
       .sort((a, b) => b.occurredAt - a.occurredAt)
@@ -125,6 +129,14 @@ export async function apply(ctx: Context): Promise<void> {
         date: dayKey(r.occurredAt),
         title: describeRecord(r),
       }))
+    // 聚合 v2（批次 4）：目标进度 / 热力图 / 周期切片
+    const goalRecords = state.records
+      .filter((r) => r.kind === 'goal' && !r.deleted)
+      .map((r) => ({ id: r.id, payload: r.payload as import('./events.js').GoalPayload }))
+    summary.goals = buildGoalProgress(goalRecords, state.records, now)
+    const dims = ['finance', 'mood', 'life', 'work', 'family', 'study'] as const
+    summary.heatmap = Object.fromEntries(dims.map((dim) => [dim, buildHeatmap(state.records, dim, now)])) as PanelSummary['heatmap']
+    summary.slices = Object.fromEntries(dims.map((dim) => [dim, buildSlices(state.records, dim, now)])) as PanelSummary['slices']
     return summary
   }
 
@@ -177,6 +189,7 @@ export async function apply(ctx: Context): Promise<void> {
   ctx.tools.register(activityTool(bootCategories))
   ctx.tools.register(panelTool())
   ctx.tools.register(correctTool())
+  ctx.tools.register(goalTool())
 
   function categoryDescription(list: readonly string[]): string {
     return `Existing: ${list.join('、')}. Reuse one when reasonable; any other non-empty name creates a new custom category.`
@@ -486,6 +499,108 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }
 
+  const GOAL_METRIC_DIMENSIONS: Record<string, readonly string[]> = {
+    expenseTotal: ['finance'],
+    activityDuration: [...ACTIVITY_DIMENSIONS],
+    activityCount: [...ACTIVITY_DIMENSIONS],
+    moodCount: ['mood'],
+  }
+
+  function goalTool(): ToolDefinition {
+    return {
+      name: 'openprism_set_goal',
+      description:
+        'Set or replace a personal goal/budget (🎯). expenseTotal = monthly/weekly/daily spending cap on finance; '
+        + 'activityDuration / activityCount = time or count targets for one activity dimension; moodCount = mood check-in count. '
+        + 'Call it when the user says things like "这个月吃饭预算 2000", "每周跑步 3 次", "每天学习 1 小时". '
+        + 'Setting a goal for the same metric+dimension+period supersedes the previous one.',
+      parameters: {
+        type: 'object',
+        properties: {
+          metric: { type: 'string', enum: ['expenseTotal', 'activityDuration', 'activityCount', 'moodCount'] },
+          dimension: {
+            type: 'string',
+            enum: ['finance', 'life', 'work', 'family', 'study', 'mood'],
+            description: 'expenseTotal→finance; activityDuration/Count→life/work/family/study; moodCount→mood.',
+          },
+          target: { type: 'number', description: 'Target value (yuan for expenseTotal, minutes for activityDuration, count otherwise).' },
+          period: { type: 'string', enum: ['daily', 'weekly', 'monthly'] },
+          note: { type: 'string', description: 'Short label, e.g. "餐饮预算". (optional)' },
+        },
+        required: ['metric', 'dimension', 'target', 'period'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['set', 'metric', 'dimension', 'target', 'period'],
+          properties: {
+            set: { type: 'boolean' },
+            metric: { type: 'string' },
+            dimension: { type: 'string' },
+            target: { type: 'number' },
+            period: { type: 'string' },
+          },
+        },
+        render: (_args: unknown, value: JsonValue) => {
+          const v = value as { metric: string; dimension: string; target: number; period: string }
+          const periodLabel = v.period === 'daily' ? '每天' : v.period === 'weekly' ? '每周' : '每月'
+          return textBlock(`已设定目标：${periodLabel}${v.dimension}·${v.metric} ≤ ${String(v.target)}。可随时重新设定覆盖。`)
+        },
+      },
+      async execute(args: unknown, _exec: unknown): Promise<JsonValue> {
+        const raw = args as Record<string, unknown>
+        const metric = requireString(raw, 'metric')
+        const dimension = requireString(raw, 'dimension')
+        const allowed = GOAL_METRIC_DIMENSIONS[metric]
+        if (allowed === undefined) throw new Error(`openprism: 未知 metric ${metric}`)
+        if (!allowed.includes(dimension)) {
+          throw new Error(`openprism: metric ${metric} 的 dimension 必须是 ${allowed.join('/')}`)
+        }
+        const target = requireNumber(raw, 'target')
+        if (!(target > 0)) throw new Error('openprism: target 必须为正数')
+        const period = requireString(raw, 'period')
+        if (!['daily', 'weekly', 'monthly'].includes(period)) throw new Error('openprism: period 必须是 daily/weekly/monthly')
+
+        // 同 metric+dimension+period 的旧目标 → 追加 delete 更正（6.1 的“重设即覆盖”）
+        const state = fold()
+        for (const record of state.records) {
+          if (record.kind !== 'goal' || record.deleted) continue
+          const payload = record.payload as import('./events.js').GoalPayload
+          if (payload.metric === metric && payload.dimension === dimension && payload.period === period) {
+            await store.append({
+              id: randomEventId('x'),
+              kind: 'correction',
+              source: 'internal',
+              recordedAt: Date.now(),
+              payload: { target: record.id, op: 'delete' },
+            } as import('./events.js').OpenEvent)
+          }
+        }
+
+        await store.append({
+          id: randomEventId('g'),
+          kind: 'goal',
+          source: 'internal',
+          recordedAt: Date.now(),
+          payload: {
+            dimension: dimension as import('./events.js').GoalPayload['dimension'],
+            metric: metric as import('./events.js').GoalPayload['metric'],
+            target,
+            period: period as import('./events.js').GoalPayload['period'],
+            ...(typeof raw.note === 'string' && raw.note.trim().length > 0 ? { note: raw.note.trim() } : {}),
+          },
+        })
+        return { set: true, metric, dimension, target, period }
+      },
+      presentCall: (args: unknown): ToolCallView | undefined => {
+        const raw = args as Record<string, unknown>
+        if (typeof raw.metric !== 'string' || typeof raw.target !== 'number') return undefined
+        return { card: 'generic', title: '设定目标', kind: 'other', rawInput: args as JsonValue }
+      },
+    }
+  }
+
   // ─── 浏览器面板端点（webServer seam 可选组合时注册） ───
 
   ctx.inject(['webServer'], (webCtx) => {
@@ -538,6 +653,23 @@ export async function apply(ctx: Context): Promise<void> {
           }
         },
       })
+      const disposeRecords = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/records',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { error: 'POST only' })
+            return
+          }
+          try {
+            const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+            const result = await quickRecord(body)
+            sendJson(res, 200, result)
+          } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+          }
+        },
+      })
       const disposeDistill = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/distill',
@@ -569,6 +701,7 @@ export async function apply(ctx: Context): Promise<void> {
       return () => {
         disposeRebuild()
         disposeDistill()
+        disposeRecords()
         disposeCorrections()
         disposeCategories()
         disposePanel()
@@ -631,6 +764,32 @@ export async function apply(ctx: Context): Promise<void> {
     return { ok: true }
   }
 
+  /** 速记表单直录（不经模型，workbench 借鉴）：ui 事件 + 表单渠道 + 自动建类。 */
+  async function quickRecord(body: Record<string, unknown>): Promise<{ ok: true; id: string }> {
+    const kind = requireString(body, 'kind')
+    if (kind !== 'expense' && kind !== 'mood' && kind !== 'activity') {
+      throw new Error('kind 必须是 expense / mood / activity')
+    }
+    const normalized = normalizeRecordArgs(kind, body)
+    if (!normalized.ok) throw new Error(normalized.error)
+    const payload = normalized.payload
+    if (kind !== 'mood') {
+      const dim = kind === 'expense' ? 'finance' : (payload as { dimension: CategoryDimension }).dimension
+      await resolveCategory(dim, (payload as { category: string }).category)
+    }
+    const id = randomEventId('u')
+    await store.append({
+      id,
+      kind,
+      source: 'ui',
+      channel: 'form',
+      recordedAt: Date.now(),
+      ...(normalized.occurredAt !== undefined ? { occurredAt: normalized.occurredAt } : {}),
+      payload,
+    } as import('./events.js').OpenEvent)
+    return { ok: true, id }
+  }
+
   function validateCategoryName(name: string): void {
     if (name.length === 0 || name.length > 24) throw new Error('分类名长度须在 1-24 之间')
     if (name.includes('/')) throw new Error('分类名不允许包含 "/"')
@@ -650,6 +809,22 @@ export async function apply(ctx: Context): Promise<void> {
       chunks.push(chunk as Buffer)
     }
     return Buffer.concat(chunks).toString('utf8')
+  }
+
+  function requireNumber(args: Record<string, unknown>, key: string): number {
+    const value = args[key]
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error(`openprism: 参数 ${key} 必须是数字，收到 ${JSON.stringify(value) ?? 'undefined'}`)
+    }
+    return value
+  }
+
+  function requireString(args: Record<string, unknown>, key: string): string {
+    const value = args[key]
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`openprism: 参数 ${key} 必须是非空字符串，收到 ${JSON.stringify(value) ?? 'undefined'}`)
+    }
+    return value
   }
 
   function textBlock(text: string): Array<{ type: 'text'; text: string }> {
