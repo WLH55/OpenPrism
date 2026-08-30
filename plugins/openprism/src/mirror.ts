@@ -19,6 +19,7 @@ import type { OpenEvent } from './events.js'
 import { mirrorEventId, randomEventId } from './store.js'
 import { foldEvents, type FoldedState } from './fold.js'
 import { RECORD_TOOL_NAMES, normalizeRecordArgs } from './records.js'
+import { captureId, type CaptureEntry, type CaptureStore } from './captures.js'
 import type { CategoryDimension } from './types.js'
 
 /** dsh 会话事件的最小结构面（真实 dsh 事件是它的超集）。 */
@@ -36,9 +37,19 @@ export interface MirrorSessionLike {
 
 export class Mirror {
   private fold: FoldedState
+  /** 从 request/header 事件捕获的模型路由（提炼器用；dsh 源码核实 header.config）。 */
+  private route: { provider: string; model: string } | undefined
 
-  constructor(private readonly store: import('./store.js').EventStore) {
+  constructor(
+    private readonly store: import('./store.js').EventStore,
+    private readonly captures?: CaptureStore,
+  ) {
     this.fold = foldEvents(store.list())
+  }
+
+  /** 提炼器用的模型路由（主对话最近一次 request/header）。 */
+  getRoute(): { provider: string; model: string } | undefined {
+    return this.route
   }
 
   private refresh(): void {
@@ -48,14 +59,20 @@ export class Mirror {
   /** cordis `ctx.on('session/event', mirror.handleSessionEvent)` 的处理器。 */
   readonly handleSessionEvent = (session: MirrorSessionLike, event: SessionEventLike): void => {
     try {
-      if (event.type === 'tool/call') this.mirrorToolCall(session, event)
+      this.handleEventLike(session, event)
     } catch (error) {
       // 镜像失败不得影响宿主会话（dsh 对 emit 监听器已有容错，这里双保险）
       console.warn(`openprism: 镜像事件失败：${String(error)}`)
     }
   }
 
-  /** resume/插件晚启动：回填该会话历史里的 openprism_* 调用。 */
+  private handleEventLike(session: MirrorSessionLike, event: SessionEventLike): void {
+    if (event.type === 'tool/call') this.mirrorToolCall(session, event)
+    else if (event.type === 'user/message') this.captureUserMessage(session, event)
+    else if (event.type === 'request/header') this.captureRoute(event)
+  }
+
+  /** resume/插件晚启动：回填该会话历史（工具调用镜像 + 用户消息采集 + 路由捕获）。 */
   async backfillSession(session: MirrorSessionLike): Promise<void> {
     const source: unknown = session.events
     let history: unknown
@@ -70,7 +87,7 @@ export class Mirror {
     if (!Array.isArray(history)) return
     for (const event of history as SessionEventLike[]) {
       try {
-        if (event?.type === 'tool/call') this.mirrorToolCall(session, event)
+        this.handleEventLike(session, event)
       } catch (error) {
         console.warn(`openprism: 会话 ${String(session.id)} 回填单条失败：${String(error)}`)
       }
@@ -132,5 +149,44 @@ export class Mirror {
       recordedAt: Date.now(),
       payload: { op: 'create', dimension, name: canonical },
     })
+  }
+
+  // ─── 采集（5.1/5.2：always-record 用户消息 → 采集日志） ───
+
+  private captureUserMessage(session: MirrorSessionLike, event: SessionEventLike): void {
+    if (!this.captures) return
+    const data = event.data as {
+      id?: unknown
+      content?: Array<{ type?: unknown; text?: unknown }>
+      source?: { kind?: unknown }
+    } | undefined
+    if (!data) return
+    // 合成注入（schedule/插件 followup）不采集——防止提炼回环（dsh 源码核实 source.kind）
+    if (data.source?.kind !== undefined && data.source.kind !== 'user') return
+    const text = Array.isArray(data.content)
+      ? data.content.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text as string).join('\n').trim()
+      : ''
+    if (text.length === 0) return
+    const sessionId = typeof session?.id === 'string' && session.id.length > 0 ? session.id : 'unknown-session'
+    const ref = typeof data.id === 'string' && data.id.length > 0 ? data.id : `${event.time ?? ''}`
+    const entry: CaptureEntry = {
+      id: captureId(sessionId, ref),
+      sessionId,
+      text,
+      channel: 'chat',
+      recordedAt: typeof event.time === 'number' ? event.time : Date.now(),
+    }
+    void this.captures.append(entry).catch((error: unknown) => {
+      console.warn(`openprism: 采集落盘失败：${String(error)}`)
+    })
+  }
+
+  /** 捕获主对话的模型路由（header.config: LlmCallConfig），供夜间提炼使用。 */
+  private captureRoute(event: SessionEventLike): void {
+    const data = event.data as { header?: { config?: { provider?: unknown; model?: unknown } } } | undefined
+    const config = data?.header?.config
+    if (typeof config?.provider === 'string' && typeof config?.model === 'string') {
+      this.route = { provider: config.provider, model: config.model }
+    }
   }
 }

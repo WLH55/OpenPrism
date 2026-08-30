@@ -84,6 +84,8 @@ interface BaseEvent {
   sessionId?: string
   recordedAt: number
   occurredAt?: number
+  /** 提炼产出时回链的采集原料 id（5.1；mirror/ui/internal 事件没有）。 */
+  captureId?: string
 }
 
 export type OpenEvent = BaseEvent &
@@ -152,6 +154,9 @@ export function validateEvent(event: OpenEvent): string | null {
   if (typeof event.recordedAt !== 'number' || !Number.isFinite(event.recordedAt)) return 'recordedAt 必须是数字'
   if (event.occurredAt !== undefined && (typeof event.occurredAt !== 'number' || !Number.isFinite(event.occurredAt))) {
     return 'occurredAt 必须是数字'
+  }
+  if (event.captureId !== undefined && (typeof event.captureId !== 'string' || event.captureId.length === 0)) {
+    return 'captureId 必须是非空字符串'
   }
   if (event.kind === 'correction' && event.payload.op === 'update' && (event.payload.patch === undefined || Object.keys(event.payload.patch).length === 0)) {
     return 'update 更正必须带 patch'
