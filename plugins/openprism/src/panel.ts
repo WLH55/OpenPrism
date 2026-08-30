@@ -102,6 +102,39 @@ export interface PanelSummary {
   categories: Record<CategoryDimension, string[]>
   /** 最近记录（含事件 id，供 openprism_correct 更正/删除与 UI 编辑入口）；由宿主侧装配。 */
   recent?: RecentItem[]
+  /** 目标/预算进度（6.1）；由宿主侧装配。 */
+  goals?: GoalProgress[]
+  /** 每维度记录密度热力图（近 91 天）；由宿主侧装配。 */
+  heatmap?: Record<DimensionKey, Array<{ date: string; count: number }>>
+  /** 周期切片（今日/本周/本月/今年，按 occurredAt）；由宿主侧装配。 */
+  slices?: Record<DimensionKey, Record<PeriodKey, SliceValue>>
+}
+
+/** 六个面板维度的键（client 页签与切片/热力图共用）。 */
+export type DimensionKey = 'finance' | 'mood' | 'life' | 'work' | 'family' | 'study'
+export type PeriodKey = 'today' | 'week' | 'month' | 'year'
+
+/** 周期切片值：count=记录数；amount=支出合计（finance）；minutes=时长合计（活动维度）。 */
+export interface SliceValue {
+  count: number
+  amount?: number
+  minutes?: number
+}
+
+/** 目标进度（目标事件 × 当期实际，6.1）。 */
+export interface GoalProgress {
+  id: string
+  dimension: string
+  metric: string
+  target: number
+  period: 'daily' | 'weekly' | 'monthly'
+  note?: string
+  /** 当期实际值。 */
+  current: number
+  /** current/target（可 >1）。 */
+  ratio: number
+  /** 窗口起始（YYYY-MM-DD）。 */
+  windowStart: string
 }
 
 /** 最近记录行（更正回路的取 target 来源，4.1）。 */
@@ -225,6 +258,162 @@ export function buildPanelSummary(data: PanelData, now: number = Date.now()): Pa
     activities,
     categories: categoryLists(data),
   }
+}
+
+// ─── 聚合 v2（批次 4）：目标进度 / 热力图 / 周期切片 ───
+
+function startOfDay(time: number): number {
+  const d = new Date(time)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+/** 周期窗口起点（本地时区）：日=今天零点；周=本周一；月=本月 1 日；年=今年 1 月 1 日。 */
+export function periodStart(period: 'daily' | 'weekly' | 'monthly' | 'today' | 'week' | 'month' | 'year', now: number): number {
+  const d = new Date(startOfDay(now))
+  if (period === 'daily' || period === 'today') return d.getTime()
+  if (period === 'weekly' || period === 'week') {
+    const dow = (d.getDay() + 6) % 7 // 周一=0
+    return d.getTime() - dow * 24 * 3600 * 1000
+  }
+  if (period === 'monthly' || period === 'month') {
+    d.setDate(1)
+    return d.getTime()
+  }
+  d.setMonth(0, 1)
+  return d.getTime()
+}
+
+function inWindow(occurredAt: number, from: number): boolean {
+  return occurredAt >= from
+}
+
+/**
+ * 目标进度（6.1）：活跃目标 × 当期实际值。
+ * metric 取值：expenseTotal（理财支出合计）/ activityDuration / activityCount
+ * （activity 维度时长与条数）/ moodCount（心情打卡数）。
+ */
+export function buildGoalProgress(
+  goalRecords: Array<{ id: string; payload: import('./events.js').GoalPayload }>,
+  records: FoldedRecordLike[],
+  now: number,
+): GoalProgress[] {
+  const starts: Record<'daily' | 'weekly' | 'monthly', number> = {
+    daily: periodStart('daily', now),
+    weekly: periodStart('weekly', now),
+    monthly: periodStart('monthly', now),
+  }
+  return goalRecords.map((goal) => {
+    const from = starts[goal.payload.period]
+    let current = 0
+    for (const record of records) {
+      if (record.deleted) continue
+      if (!inWindow(record.occurredAt, from)) continue
+      if (goal.payload.metric === 'expenseTotal') {
+        if (record.kind === 'expense') current += (record.payload as { amount: number }).amount
+      } else if (goal.payload.metric === 'activityDuration') {
+        if (record.kind === 'activity' && (record.payload as { dimension: string }).dimension === goal.payload.dimension) {
+          current += (record.payload as { durationMinutes?: number }).durationMinutes ?? 0
+        }
+      } else if (goal.payload.metric === 'activityCount') {
+        if (record.kind === 'activity' && (record.payload as { dimension: string }).dimension === goal.payload.dimension) {
+          current += 1
+        }
+      } else if (goal.payload.metric === 'moodCount') {
+        if (record.kind === 'mood') current += 1
+      }
+    }
+    return {
+      id: goal.id,
+      dimension: goal.payload.dimension,
+      metric: goal.payload.metric,
+      target: goal.payload.target,
+      period: goal.payload.period,
+      ...(goal.payload.note !== undefined ? { note: goal.payload.note } : {}),
+      current,
+      ratio: goal.payload.target > 0 ? current / goal.payload.target : 0,
+      windowStart: dayKey(from),
+    }
+  })
+}
+
+/** 折叠记录的最小结构面（panel.ts 不反向依赖 fold.ts）。 */
+export interface FoldedRecordLike {
+  kind: 'expense' | 'mood' | 'activity' | 'goal'
+  occurredAt: number
+  deleted: boolean
+  payload: unknown
+}
+
+/** 每维度记录密度热力图：近 days 天（含今天）逐日记录数，旧→新。 */
+export function buildHeatmap(
+  records: FoldedRecordLike[],
+  dimension: DimensionKey,
+  now: number,
+  days = 91,
+): Array<{ date: string; count: number }> {
+  const counts = new Map<string, number>()
+  for (const record of records) {
+    if (record.deleted) continue
+    const dim = recordDimension(record)
+    if (dim !== dimension) continue
+    if (record.occurredAt > now) continue
+    const key = dayKey(record.occurredAt)
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  const out: Array<{ date: string; count: number }> = []
+  const todayStart = startOfDay(now)
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const date = dayKey(todayStart - i * 24 * 3600 * 1000)
+    out.push({ date, count: counts.get(date) ?? 0 })
+  }
+  return out
+}
+
+/** 周期切片：今日/本周/本月/今年的 count（+amount/minutes）。 */
+export function buildSlices(
+  records: FoldedRecordLike[],
+  dimension: DimensionKey,
+  now: number,
+): Record<PeriodKey, SliceValue> {
+  const windows: Record<PeriodKey, number> = {
+    today: periodStart('today', now),
+    week: periodStart('week', now),
+    month: periodStart('month', now),
+    year: periodStart('year', now),
+  }
+  const result = {} as Record<PeriodKey, SliceValue>
+  for (const [period, from] of Object.entries(windows) as Array<[PeriodKey, number]>) {
+    let count = 0
+    let amount: number | undefined
+    let minutes: number | undefined
+    for (const record of records) {
+      if (record.deleted || record.occurredAt > now) continue
+      if (recordDimension(record) !== dimension) continue
+      if (!inWindow(record.occurredAt, from)) continue
+      count += 1
+      if (record.kind === 'expense') {
+        amount = (amount ?? 0) + (record.payload as { amount: number }).amount
+      }
+      if (record.kind === 'activity') {
+        const minutesOf = (record.payload as { durationMinutes?: number }).durationMinutes
+        if (minutesOf !== undefined) minutes = (minutes ?? 0) + minutesOf
+      }
+    }
+    result[period] = {
+      count,
+      ...(amount !== undefined ? { amount } : {}),
+      ...(minutes !== undefined ? { minutes } : {}),
+    }
+  }
+  return result
+}
+
+function recordDimension(record: FoldedRecordLike): DimensionKey {
+  if (record.kind === 'expense') return 'finance'
+  if (record.kind === 'mood') return 'mood'
+  if (record.kind === 'activity') return (record.payload as { dimension: DimensionKey }).dimension
+  return 'life'
 }
 
 function formatMinutes(minutes: number): string {
