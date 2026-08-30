@@ -40,7 +40,7 @@ OpenPrism/
         └── build-client.mjs      # esbuild 打包为 __ModuleLoader__ 闭包
 ```
 
-数据流：`对话 → 模型调用工具 → storage-domain（$DSH_HOME/storages，跨会话持久）→ 聚合纯函数 → 面板 UI / 模型汇总文本`。会话日志只携带标准 `tool/call` / `tool/result` 事件——卸载插件后任何 dsh 都能加载这些会话。
+数据流（v0.4）：`对话 → 模型调用工具 → 会话日志（tool/call，录入凭据）→ 镜像器 → 全局事件日志（唯一持久层，可随时从会话日志重建）→ 折叠 → 面板 UI / 模型汇总 / 简报`。采集管线（always-record）把用户消息落按月分片的采集日志，夜间提炼为结构化事件。卸载插件后任何 dsh 都能加载这些会话。
 
 核心设计原则：
 
@@ -59,11 +59,15 @@ dsh plugin --profile web remove openprism  # 卸载
 
 ## 状态
 
-- [x] 六维度录入工具 + 跨会话聚合（storage-domain）
-- [x] Web 面板 UI（分页签 + 图表 + 分类管理，5 秒轮询）
+- [x] 六维度录入工具 + 跨会话聚合（v0.4 起数据存全局事件日志，可从会话日志重建）
+- [x] Web 面板 UI（分页签 + 图表 + 分类管理 + 目标进度 + 91 天热力图 + 周期切片，移动优先）
 - [x] 自定义分类（对话自动创建 / UI 增删改名 / 持久化）
-- [ ] 记录删除与编辑 UI
-- [ ] 平台连接器（笔记、AI 工具、各类平台资源）
+- [x] 记录删除与编辑（对话 openprism_correct + 面板最近记录操作）
+- [x] 采集管线（always-record 捕获 + 夜间 LLM 提炼，采集原料按月分片）
+- [x] 目标/预算体系（openprism_set_goal + 面板目标进度）
+- [x] 每日/每周简报（reports/YYYY-MM markdown，数据零 token + 可选 LLM 解读）
+- [ ] 微信投递（webhook 投递缝已就绪，im-bridge fork 待做）
+- [ ] 平台连接器（Chatlog 适配已就绪，需本机 chatlog 服务）
 
 ## License
 
