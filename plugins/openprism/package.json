@@ -45,6 +45,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "vitest run",
     "prepare": "pnpm build"
   },
   "dependencies": {
@@ -62,6 +63,7 @@
     "@types/react-dom": "^19.2.5",
     "esbuild": "^0.25.0",
     "react": "^19.1.0",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.11"
   }
 }
