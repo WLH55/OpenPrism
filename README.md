@@ -2,72 +2,46 @@
 
 > 一个你，折射出生活的每一个维度。
 
-OpenPrism 是一个**个人智能工作台**：与智能体对话，随手记录；数据自动沉淀为各个生活维度的统计面板，并打通你的笔记、AI 工具与各类平台资源。
+OpenPrism 是一个**安卓个人智能工作台 App**：与智能体对话，随手记录；数据自动沉淀为六个生活维度的统计面板；定时任务按你的自然语言指令主动做事。
 
-**OpenPrism 以 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 插件的形式存在**——不是独立的 agent 框架，而是一组可插拔安装在 dsh 本体上的组合包（bundle）。`dsh plugin add openprism` 即装、`remove` 即卸。
-
-## 定位
-
-- **不是**又一个待办清单或笔记软件，而是挂在 dsh 上的"对话即录入"数据中枢
-- 一次输入（对话、记录、自动采集）→ 多维视图（面板）→ 洞察与行动
-- 复用 dsh 的全部底座：事件溯源会话日志、插件体系、审批与沙箱、Web UI
-
-## 六大维度面板（v0.3 全部实现）
-
-| 维度 | 录入工具 | 面板内容 |
-|---|---|---|
-| 💰 理财 | `openprism_record_expense` | 本月合计、近 14 天趋势、分类条形图 |
-| ❤️ 情感 | `openprism_record_mood` | 均值、记录数、最近 7 条 |
-| 🌱 生活 · 💼 工作 · 🏠 家庭 · 📚 学习 | `openprism_record_activity`（dimension 参数区分） | 本月条数/时长、分类聚合、最近记录 |
-| 全部 | `openprism_panel` | 六维度汇总文本（供模型引用回答） |
-
-**分类维度完全自定义**：每个维度自带一组默认分类，同时支持三种扩展方式——
-
-1. **对话即扩展**：记账时说"分类用猫咪"，未知分类名自动创建；
-2. **面板 UI 管理**：每个维度页签底部的"分类管理"支持添加 / 改名（已有记录跟随迁移）/ 删除（记录归入兜底分类「其他」）；
-3. 分类清单持久化在 storage-domain，重启不丢。
+**Expo (React Native) + TypeScript** 单码库。数据全部本地——App 私有目录里的 JSONL 事件日志是唯一持久层；模型接入走通用 OpenAI 兼容协议，各厂商 API key 自配、存系统安全存储，不上传任何地方。
 
 ## 架构
 
 ```
-OpenPrism/
-└── plugins/
-    └── openprism/               # dsh 组合包（dsh.bundle manifest + cordis.patch.yml）
-        ├── src/index.ts          # 宿主半边：storage 域 + 4 个模型面工具 + HTTP 端点
-        ├── src/panel.ts          # 六维度聚合（storage 记录 → 统计的纯函数）
-        ├── src/types.ts          # 记录形状（expenses / moods / activities / categories）
-        ├── src/client.tsx        # 浏览器半边：分页可视化面板（dsh.client 声明）
-        └── build-client.mjs      # esbuild 打包为 __ModuleLoader__ 闭包
+对话 UI（RN）─▶ agent 循环 ─▶ OpenAI 兼容客户端 ─▶ 各厂商 API
+                   │ 工具执行（录入 / 更正 / 目标 / 查询）
+                   ▼
+        事件日志（events.jsonl，App 私有目录，唯一持久层）
+                   │ 折叠（更正链 / 改名链 / 目标进度）
+                   ▼
+         面板 UI / 简报 markdown / 无头任务产物
 ```
 
-数据流（v0.4）：`对话 → 模型调用工具 → 会话日志（tool/call，录入凭据）→ 镜像器 → 全局事件日志（唯一持久层，可随时从会话日志重建）→ 折叠 → 面板 UI / 模型汇总 / 简报`。采集管线（always-record）把用户消息落按月分片的采集日志，夜间提炼为结构化事件。卸载插件后任何 dsh 都能加载这些会话。
-
-核心设计原则：
-
-1. **一切皆插件**：OpenPrism 是 dsh 组合包，`dsh plugin` 插拔
-2. **对话即录入**：结构化数据落在 storage-domain，面板只是数据的投影
-3. **站在 dsh 肩膀上**：审批、沙箱、压缩、持久化、Web UI 全部继承自宿主
+领域语言见 [CONTEXT.md](CONTEXT.md)；设计决策见 [设计纪要 2026-09](docs/design/2026-09-mobile-app.md) 与 [docs/adr/](docs/adr/)。
 
 ## 快速开始
 
 ```sh
-pnpm install && pnpm build                # 构建 lib/
-dsh plugin --profile web add ./plugins/openprism
-dsh --profile web                          # 重启后在对话里说"花了 35 吃午饭"
-dsh plugin --profile web remove openprism  # 卸载
+pnpm install
+pnpm start          # Expo 开发服务器（手机 Expo Go 扫码预览）
+pnpm android        # 连接真机 / 模拟器运行
+pnpm typecheck      # tsc --noEmit
 ```
 
-## 状态
+正式包自用 sideload（无需上架）：`npx expo run:android --variant release`。
 
-- [x] 六维度录入工具 + 跨会话聚合（v0.4 起数据存全局事件日志，可从会话日志重建）
-- [x] Web 面板 UI（分页签 + 图表 + 分类管理 + 目标进度 + 91 天热力图 + 周期切片，移动优先）
-- [x] 自定义分类（对话自动创建 / UI 增删改名 / 持久化）
-- [x] 记录删除与编辑（对话 openprism_correct + 面板最近记录操作）
-- [x] 采集管线（always-record 捕获 + 夜间 LLM 提炼，采集原料按月分片）
-- [x] 目标/预算体系（openprism_set_goal + 面板目标进度）
-- [x] 每日/每周简报（reports/YYYY-MM markdown，数据零 token + 可选 LLM 解读）
-- [ ] 微信投递（webhook 投递缝已就绪，im-bridge fork 待做）
-- [ ] 平台连接器（Chatlog 适配已就绪，需本机 chatlog 服务）
+> pnpm 需要 `.npmrc` 的 `node-linker=hoisted`（已随库提供）。
+
+## 路线图（两批交付）
+
+- [ ] 第一批：对话录入六维度 + 面板 + 厂商配置 + 手动简报
+- [ ] 第二批：定时任务（自然语言指令 + 补跑）+ 本地通知
+- [ ] 后续演进：采集/提炼管线、连接器（Chatlog、微信通道）
+
+## 前史
+
+v0.4 之前本项目是 dsh（DeepSeek Harness）插件，2026-09 按 [ADR 0004](docs/adr/0004-mobile-app-rewrite.md) 推翻、移动端重写。插件时代终态见 `dev` 分支（`f54c8ec`，68 测试绿）；事件日志格式不变，旧 `~/.dsh/openprism/events.jsonl` 可导入。
 
 ## License
 
