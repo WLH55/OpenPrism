@@ -1,10 +1,30 @@
-# Build output
+# dependencies
 node_modules/
 .pnpm-store/
+
+# Expo
+.expo/
 dist/
-build/
-lib/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+/ios
+/android
+
+# Metro
+.metro-health-check*
+
+# Build output
 *.tsbuildinfo
+build/
 
 # Environment & secrets
 .env
@@ -22,10 +42,14 @@ logs/
 *.log
 .cache/
 coverage/
+npm-debug.*
+yarn-debug.*
+yarn-error.*
 
 # OS & editor
 .DS_Store
 Thumbs.db
+*.pem
 .idea/
 .vscode/*
 !.vscode/extensions.json
