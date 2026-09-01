@@ -17,8 +17,7 @@ import {
 } from 'react-native'
 import type { ListRenderItem } from 'react-native'
 import { randomUUID } from 'expo-crypto'
-import { createEventStore } from '../store/eventStore'
-import { eventsFile } from '../store/paths'
+import { sharedEventStore as store } from '../store/store'
 import { appendMessage, loadSession } from '../store/sessions'
 import { resolveCurrentProvider } from '../store/providers'
 import type { ChatMessage } from '../llm/client'
@@ -26,7 +25,6 @@ import { LlmError, friendlyLlmMessage } from '../llm/errors'
 import { runAgentLoop } from '../agent/loop'
 
 const SESSION_ID = 'main'
-const store = createEventStore(eventsFile)
 
 interface DisplayItem {
   key: string
