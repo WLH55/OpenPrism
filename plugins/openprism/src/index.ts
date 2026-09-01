@@ -8,7 +8,10 @@
  * - 分类、目标等非会话写入直接追加日志，带 source（mirror/ui/internal/extraction/rule）
  *   与可选 channel（3.3）；
  * - 面板/汇总从日志折叠（fold.ts），旧的「同版本加表」与快照迁移全部消失；
- * - POST /openprism/rebuild 可从 `$DSH_HOME/sessions` 全量重建 mirror 事件（3.3）。
+ * - POST /openprism/rebuild 可从 `$DSH_HOME/sessions` 全量重建 mirror 事件（3.3）；
+ * - 定时任务（夜间提炼/每日简报/周报）在面板 ⚙ 设置（D7 2026-08-31：面板里由用户
+ *   设置、保存即热生效并持久化 schedule.json；patch 行 config 仅作文件缺席时的
+ *   引导值，解析与默认值见 config.ts）。
  *
  * 【零声明的 dsh 依赖】本包不声明任何 @deepseek-ai/* 依赖（peer 也不声明），
  * 类型检查用 devDependencies——避免 profile 遮蔽副本的双实例崩溃（铁律一，不变）。
@@ -51,6 +54,7 @@ import { distillPending, type DistillLlmPort } from './distill.js'
 import { buildDailyBriefing, buildWeeklyBriefing } from './briefing.js'
 import { resolveDelivery, type DeliveryPort } from './delivery.js'
 import { ChatlogConnector } from './chatlog.js'
+import { parsePluginConfig, describeSchedule, serializeSchedule, ScheduleStore, type ScheduledJob, type PluginConfig } from './config.js'
 import { join } from 'node:path'
 import type { ActivityDimension, CategoryDimension } from './types.js'
 
@@ -63,8 +67,15 @@ export function lastAppliedStores(): { store: EventStore; captures: CaptureStore
   return lastApplied
 }
 
-export async function apply(ctx: Context): Promise<void> {
-  ctx.logger.info('openprism: 六维度生活面板就绪（全局事件日志版 v0.4：镜像器 + 折叠 + 更正 + rebuild）')
+export async function apply(ctx: Context, configInput: unknown = {}): Promise<void> {
+  const seeded = parsePluginConfig(configInput) // patch 行 config：仅作 schedule.json 缺席时的引导值
+  // console 而非 ctx.logger：宿主 web 部署的日志级别不透传 info，启动时刻表要落进 dsh-web.log
+  for (const warning of seeded.warnings) console.warn(`openprism: ${warning}`)
+  const scheduleStore = new ScheduleStore(join(resolveOpenPrismHome(), 'schedule.json'))
+  const savedSchedule = await scheduleStore.load()
+  let activeSchedule = savedSchedule ?? seeded.config
+  console.info('openprism: 六维度生活面板就绪（全局事件日志版 v0.4：镜像器 + 折叠 + 更正 + rebuild）')
+  console.info(`openprism: 定时任务--${describeSchedule(activeSchedule)}（${savedSchedule === null ? '默认/引导值' : '面板设置'}；面板 ⚙ 可改，保存即生效）`)
 
   const store = new EventStore(resolveEventsFile())
   await store.load()
@@ -79,7 +90,7 @@ export async function apply(ctx: Context): Promise<void> {
     void mirror.backfillSession(session)
   })
 
-  // ─── 夜间提炼（5.3）：凌晨 3 点批量提炼 pending 原料；错过补跑=下次启动照跑 ───
+  // ─── 夜间提炼（5.3）：默认凌晨 3 点批量提炼 pending 原料；时刻经 config.distillTime 自定义 ───
 
   let llmPort: DistillLlmPort | undefined
   ctx.inject(['llm'], (llmCtx) => {
@@ -164,29 +175,46 @@ export async function apply(ctx: Context): Promise<void> {
     if (!exists) await runDailyBriefing()
   }
 
-  ctx.effect(() => {
-    const timers: Array<ReturnType<typeof setTimeout>> = []
-    const schedule = (job: () => Promise<void>, hour: number, minute: number, sundayOnly = false): void => {
+  // ─── 定时任务（5.3/D7）：时刻由插件 config 自定义（cordis.patch.yml 的 openprism 行 config 块）───
+
+  // ─── 定时任务（5.3/D7）：面板 ⚙ 设置（schedule.json）保存即热生效；patch config 仅作引导值 ───
+
+  let jobTimers: Array<ReturnType<typeof setTimeout>> = []
+  let jobsDisposed = false
+  const armJobs = (): void => {
+    for (const timer of jobTimers) clearTimeout(timer)
+    jobTimers = []
+    if (jobsDisposed) return
+    const schedule = (job: () => Promise<void>, when: ScheduledJob): void => {
       const now = new Date()
       const next = new Date(now)
-      next.setHours(hour, minute, 0, 0)
-      if (sundayOnly) {
-        while (next.getDay() !== 0 || next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
-      } else if (next.getTime() <= now.getTime()) {
-        next.setDate(next.getDate() + 1)
+      next.setHours(when.time.hour, when.time.minute, 0, 0)
+      if (when.day === undefined) {
+        if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
+      } else {
+        while (next.getDay() !== when.day || next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
       }
-      timers.push(setTimeout(() => {
-        void job().finally(() => schedule(job, hour, minute, sundayOnly))
+      jobTimers.push(setTimeout(() => {
+        void job().finally(() => armJobs())
       }, Math.min(next.getTime() - now.getTime(), 2 ** 31 - 1)))
     }
-    schedule(async () => { await runDistill() }, 3, 0) // 凌晨 3 点：提炼（5.3）
-    schedule(async () => { await runDailyBriefing() }, 7, 0) // 清晨 7 点：每日简报（D7）
-    schedule(async () => { await runWeeklyBriefing() }, 21, 0, true) // 周日 21 点：周报（D7）
+    if (activeSchedule.distill !== null) schedule(async () => { await runDistill() }, activeSchedule.distill) // 夜间提炼（5.3）
+    if (activeSchedule.dailyBriefing !== null) schedule(async () => { await runDailyBriefing() }, activeSchedule.dailyBriefing) // 每日简报（D7）
+    if (activeSchedule.weeklyBriefing !== null) schedule(async () => { await runWeeklyBriefing() }, activeSchedule.weeklyBriefing) // 周报（D7）
+  }
+  const applySchedule = (next: PluginConfig): void => {
+    activeSchedule = next
+    armJobs()
+    console.info(`openprism: 定时任务已更新--${describeSchedule(next)}`)
+  }
+  ctx.effect(() => {
+    armJobs()
     return () => {
-      for (const timer of timers) clearTimeout(timer)
+      jobsDisposed = true
+      for (const timer of jobTimers) clearTimeout(timer)
     }
-  }, 'openprism: nightly jobs')
-  void catchUpBriefing()
+  }, 'openprism: scheduled jobs')
+  if (activeSchedule.dailyBriefing !== null) void catchUpBriefing()
 
   // ─── 连接器（D8）：Chatlog → 采集日志（配置 OPENPRISM_CHATLOG_URL 启用） ───
 
@@ -825,6 +853,34 @@ export async function apply(ctx: Context): Promise<void> {
           }
         },
       })
+      const disposeSchedule = webCtx.webServer.register({
+        kind: 'exact',
+        path: '/openprism/schedule',
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          try {
+            if (req.method === 'POST') {
+              const body = JSON.parse(await readBody(req)) as Record<string, unknown>
+              const { config: next, warnings } = parsePluginConfig(body)
+              // 面板保存走严格面：任何告警（非法时刻/未知字段）都拒收并原样回显
+              if (warnings.length > 0) {
+                sendJson(res, 400, { error: warnings.join('；') })
+                return
+              }
+              await scheduleStore.save(next)
+              applySchedule(next)
+              sendJson(res, 200, { ok: true, schedule: serializeSchedule(next), description: describeSchedule(next) })
+            } else {
+              sendJson(res, 200, {
+                schedule: serializeSchedule(activeSchedule),
+                description: describeSchedule(activeSchedule),
+                customized: scheduleStore.loaded,
+              })
+            }
+          } catch (error) {
+            sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+          }
+        },
+      })
       const disposeChatlogPoll = webCtx.webServer.register({
         kind: 'exact',
         path: '/openprism/connectors/chatlog/poll',
@@ -861,6 +917,7 @@ export async function apply(ctx: Context): Promise<void> {
         },
       })
       return () => {
+        disposeSchedule()
         disposeRebuild()
         disposeChatlogPoll()
         disposeBriefingDaily()

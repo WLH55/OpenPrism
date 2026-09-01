@@ -9,14 +9,14 @@
  * @module openprism/client
  */
 
-import { createElement, useEffect, useState, type ReactNode } from 'react'
+import { createElement, useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 
 // ─── 与宿主 panel.ts 对应的形状（浏览器半边自持副本，避免跨包类型耦合） ───
 
 type ActivityDim = 'life' | 'work' | 'family' | 'study'
 type CategoryDim = 'finance' | ActivityDim
-type TabKey = 'overview' | 'mood' | CategoryDim
+type TabKey = 'overview' | 'mood' | CategoryDim | 'settings'
 
 const CATEGORY_DIMS: CategoryDim[] = ['finance', 'life', 'work', 'family', 'study']
 const ACTIVITY_DIMS: ActivityDim[] = ['life', 'work', 'family', 'study']
@@ -170,6 +170,7 @@ function PanelModal(props: { onClose: () => void }): ReactNode {
     { key: 'overview', label: '总览' },
     { key: 'mood', label: '❤️ 情感' },
     ...CATEGORY_DIMS.map((dim) => ({ key: dim, label: `${DIM_META[dim].emoji} ${DIM_META[dim].label}` })),
+    { key: 'settings', label: '⚙ 设置' },
   ]
 
   return createElement(
@@ -209,18 +210,20 @@ function PanelModal(props: { onClose: () => void }): ReactNode {
           ),
         ),
       ),
-      summary === null && error === null
-        ? createElement('div', { className: 'op-empty' }, '加载中…')
-        : summary === null
-          ? createElement('div', { className: 'op-empty' }, '数据暂不可用')
-          : createElement(
-            'div',
-            { className: 'op-body' },
-            tab === 'overview' ? createElement(OverviewBody, { summary, correct })
-              : tab === 'mood' ? createElement(MoodBody, { summary, correct, quickRecord })
-              : tab === 'finance' ? createElement(FinanceBody, { summary, mutate, correct, quickRecord })
-              : createElement(ActivityBody, { summary, dimension: tab, mutate, correct, quickRecord }),
-          ),
+      tab === 'settings'
+        ? createElement('div', { className: 'op-body' }, createElement(SettingsBody, null))
+        : summary === null && error === null
+          ? createElement('div', { className: 'op-empty' }, '加载中…')
+          : summary === null
+            ? createElement('div', { className: 'op-empty' }, '数据暂不可用')
+            : createElement(
+              'div',
+              { className: 'op-body' },
+              tab === 'overview' ? createElement(OverviewBody, { summary, correct })
+                : tab === 'mood' ? createElement(MoodBody, { summary, correct, quickRecord })
+                : tab === 'finance' ? createElement(FinanceBody, { summary, mutate, correct, quickRecord })
+                : createElement(ActivityBody, { summary, dimension: tab, mutate, correct, quickRecord }),
+            ),
     ),
   )
 }
@@ -515,6 +518,146 @@ function CategoryManager(props: { dimension: CategoryDim; list: string[]; mutate
         '添加',
       ),
     ),
+    error === null ? null : createElement('div', { className: 'op-cat-error' }, error),
+  ))
+}
+
+// ─── ⚙ 设置（定时任务，D7：面板里由用户设置，保存即生效） ───
+
+interface ScheduleForm {
+  distillTime: string | null
+  dailyBriefingTime: string | null
+  weeklyBriefingTime: string | null
+  weeklyBriefingDay: number
+}
+
+const WEEK_DAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as const
+
+function SettingsBody(): ReactNode {
+  const [form, setForm] = useState<ScheduleForm | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const lastTimes = useRef<Partial<Record<'distillTime' | 'dailyBriefingTime' | 'weeklyBriefingTime', string>>>({})
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const response = await fetch('openprism/schedule', { cache: 'no-store' })
+        const data = (await response.json()) as { schedule: ScheduleForm; description: string }
+        if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+        if (!cancelled) {
+          setForm(data.schedule)
+          for (const key of ['distillTime', 'dailyBriefingTime', 'weeklyBriefingTime'] as const) {
+            if (data.schedule[key] !== null) lastTimes.current[key] = data.schedule[key] as string
+          }
+          setMessage(`当前：${data.description}`)
+        }
+      } catch (cause) {
+        if (!cancelled) setLoadError(cause instanceof Error ? cause.message : String(cause))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  async function save(): Promise<void> {
+    if (form === null) return
+    setBusy(true)
+    setError(null)
+    try {
+      const response = await fetch('openprism/schedule', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+      const data = (await response.json()) as { schedule?: ScheduleForm; description?: string; error?: string }
+      if (!response.ok) throw new Error(data.error ?? `HTTP ${String(response.status)}`)
+      if (data.schedule !== undefined) {
+        setForm(data.schedule)
+        for (const key of ['distillTime', 'dailyBriefingTime', 'weeklyBriefingTime'] as const) {
+          if (data.schedule[key] !== null) lastTimes.current[key] = data.schedule[key] as string
+        }
+      }
+      setMessage(`已保存，立即生效：${data.description ?? ''}`)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (form === null) {
+    return section('定时任务', createElement('div', { className: 'op-empty' }, loadError ?? '加载中…'))
+  }
+
+  const setTime = (key: 'distillTime' | 'dailyBriefingTime' | 'weeklyBriefingTime', value: string | null): void => {
+    setForm((f) => f === null ? f : { ...f, [key]: value })
+    if (value !== null) lastTimes.current[key] = value
+  }
+  const toggle = (key: 'distillTime' | 'dailyBriefingTime' | 'weeklyBriefingTime', checked: boolean, fallback: string): void => {
+    setForm((f) => f === null ? f : { ...f, [key]: checked ? (lastTimes.current[key] ?? fallback) : null })
+  }
+  const row = (label: string, hint: string, key: 'distillTime' | 'dailyBriefingTime' | 'weeklyBriefingTime', fallback: string, extra?: ReactNode): ReactNode =>
+    createElement(
+      'div',
+      { key, className: 'op-sched-row' },
+      createElement(
+        'label',
+        { className: 'op-sched-toggle' },
+        createElement('input', {
+          type: 'checkbox',
+          checked: form[key] !== null,
+          onChange: (e: { currentTarget: { checked: boolean } }) => { toggle(key, e.currentTarget.checked, fallback) },
+        }),
+        createElement('span', { className: 'op-sched-label' }, label),
+      ),
+      createElement('input', {
+        className: 'op-sched-time',
+        type: 'time',
+        disabled: form[key] === null,
+        value: form[key] ?? fallback,
+        onChange: (e: { currentTarget: { value: string } }) => { setTime(key, e.currentTarget.value === '' ? null : e.currentTarget.value) },
+      }),
+      extra ?? null,
+      createElement('span', { className: 'op-sched-hint' }, hint),
+    )
+
+  return section('定时任务（保存即生效，无需重启）', createElement(
+    'div',
+    { className: 'op-sched' },
+    row('夜间提炼', '夜里批量整理白天采集的对话', 'distillTime', '03:00'),
+    row('每日简报', '清晨生成昨日回顾 + 目标与超支提醒；关闭则启动补跑一并停', 'dailyBriefingTime', '07:00'),
+    row(
+      '每周周报',
+      '本周 vs 上周对比 + 一段 AI 解读',
+      'weeklyBriefingTime',
+      '21:00',
+      createElement(
+        'select',
+        {
+          className: 'op-sched-day',
+          disabled: form.weeklyBriefingTime === null,
+          value: String(form.weeklyBriefingDay),
+          onChange: (e: { currentTarget: { value: string } }) => {
+            setForm((f) => f === null ? f : { ...f, weeklyBriefingDay: Number(e.currentTarget.value) })
+          },
+        },
+        WEEK_DAY_LABELS.map((label, day) => createElement('option', { key: String(day), value: String(day) }, label)),
+      ),
+    ),
+    createElement(
+      'div',
+      { className: 'op-add-row' },
+      createElement('span', { className: 'op-sched-note' }, '改动持久化保存，重启后依然有效'),
+      createElement(
+        'button',
+        { className: 'op-mini-btn primary op-form-btn', type: 'button', disabled: busy, onClick: () => { void save() } },
+        busy ? '…' : '保存',
+      ),
+    ),
+    message === null ? null : createElement('div', { className: 'op-sched-msg' }, message),
     error === null ? null : createElement('div', { className: 'op-cat-error' }, error),
   ))
 }
@@ -906,6 +1049,19 @@ function ensureStyle(): void {
   padding:10px 12px;border-radius:12px;background:rgba(127,127,127,.1);border:1px dashed rgba(127,127,127,.3)}
 .op-form .op-input{flex:1;min-width:90px}
 .op-form-btn{flex:none;opacity:1;padding:6px 14px}
+.op-sched{display:flex;flex-direction:column;gap:8px}
+.op-sched-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 12px;border-radius:10px;
+  background:rgba(127,127,127,.1);border:1px solid rgba(127,127,127,.16)}
+.op-sched-toggle{display:flex;align-items:center;gap:8px;flex:1;min-width:140px;font-size:12px;cursor:pointer}
+.op-sched-toggle input[type=checkbox]{accent-color:#818cf8;width:14px;height:14px;cursor:pointer}
+.op-sched-label{font-size:12px;opacity:.85}
+.op-sched-time,.op-sched-day{flex:none;width:104px;background:rgba(127,127,127,.15);
+  border:1px solid rgba(127,127,127,.3);border-radius:6px;color:inherit;font:inherit;font-size:12px;padding:4px 6px}
+.op-sched-time:disabled,.op-sched-day:disabled{opacity:.35}
+.op-sched-time:focus,.op-sched-day:focus{outline:none;border-color:#818cf8}
+.op-sched-hint{flex-basis:100%;font-size:11px;opacity:.5;margin-left:22px}
+.op-sched-note{flex:1;font-size:11px;opacity:.55}
+.op-sched-msg{font-size:11px;color:#34d399;padding:4px 6px}
 @media (max-width:640px){
   .op-modal-backdrop{padding:0;align-items:stretch}
   .op-modal{width:100vw;max-height:100vh;height:100vh;border-radius:0;border:none}

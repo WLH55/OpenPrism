@@ -2,14 +2,21 @@
  * 会话镜像器：订阅 `session/event`，把 openprism_* 工具调用镜像为全局事件日志的
  * `mirror` 事件（3.1：事件 = openprism_* 工具的 tool/call；会话日志是录入凭据）。
  *
- * - 事件 id 由 `mirrorEventId(sessionId, callId, kind)` 确定性派生——callId 由模型分配、
- *   落盘即冻结（dsh 源码核实），append 按 id 幂等，所以镜像器、resume 回填、rebuild
- *   三条路径对同一调用只会产出一条事件；
+ * 调用有两种会话日志形态，都要认（真机 2026-08-31 核实）：
+ * - **直接调用**：`tool/call`，data.name 即 openprism_*，arguments 是模型产出的原始
+ *   JSON 字符串；
+ * - **code 预设派发**（agent preset = code 时的常态）：模型调用 run_code，在代码里
+ *   `tools.openprism_*()` 派发--`tool/call` 的 name 是 run_code，真实凭据在完成事件
+ *   `tool/code-dispatch`（arguments 是已解析对象，isError 标记成败）；失败派发不落账。
+ *
+ * - 事件 id 由 `mirrorEventId(sessionId, callRef, kind)` 确定性派生（callRef = 直接
+ *   调用的 callId 或派发的 subCallId，两者都由 dsh 分配、落盘即冻结），append 按 id
+ *   幂等，所以镜像器、resume 回填、rebuild 三条路径对同一调用只会产出一条事件；
  * - 载荷经 normalizeRecordArgs 规范化，与工具 execute 的语义一致；模型参数非法时
  *   跳过（execute 会抛同样的错，见 tool/result）；
  * - 记录的 category 存「写入时机的解析结果」；未知分类随即追加 internal 建类事件
  *   （与 v0.3 resolveCategory 的自动建类语义一致）；
- * - resume 会话的种子不触发 session/event（dsh 源码核实）——`backfillSession` 用
+ * - resume 会话的种子不触发 session/event（dsh 源码核实）--`backfillSession` 用
  *   session.events() 回补历史（尽力而为，失败只 warn 不影响宿主）。
  *
  * @module openprism/mirror
@@ -68,6 +75,7 @@ export class Mirror {
 
   private handleEventLike(session: MirrorSessionLike, event: SessionEventLike): void {
     if (event.type === 'tool/call') this.mirrorToolCall(session, event)
+    else if (event.type === 'tool/code-dispatch') this.mirrorCodeDispatch(session, event)
     else if (event.type === 'user/message') this.captureUserMessage(session, event)
     else if (event.type === 'request/header') this.captureRoute(event)
   }
@@ -102,10 +110,6 @@ export class Mirror {
     if (!name || !callId) return
     const kind = RECORD_TOOL_NAMES[name]
     if (!kind) return
-    const sessionId = typeof session?.id === 'string' && session.id.length > 0 ? session.id : 'unknown-session'
-    const id = mirrorEventId(sessionId, callId, kind)
-    if (this.store.has(id)) return
-
     let raw: Record<string, unknown>
     try {
       const parsed = JSON.parse(typeof data.arguments === 'string' ? data.arguments : '{}') as unknown
@@ -114,6 +118,39 @@ export class Mirror {
     } catch {
       return
     }
+    this.appendRecordEvent(session, event, callId, kind, raw)
+  }
+
+  /**
+   * code 预设派发的镜像：模型经 run_code 间接调用 openprism_* 工具时，`tool/call`
+   * 的 name 是 run_code，真实凭据是完成事件 `tool/code-dispatch`。只认完成事件且
+   * isError !== true（失败的派发在 tool/code-dispatch 里带错误结果，不构成记录）；
+   * arguments 是 dsh 已解析绑定的对象（与 tool/call 的原始 JSON 字符串不同）。
+   */
+  private mirrorCodeDispatch(session: MirrorSessionLike, event: SessionEventLike): void {
+    const data = event.data as { name?: unknown; arguments?: unknown; subCallId?: unknown; isError?: unknown } | undefined
+    if (!data) return
+    if (data.isError === true) return
+    const name = typeof data.name === 'string' ? data.name : undefined
+    const subCallId = typeof data.subCallId === 'string' ? data.subCallId : undefined
+    if (!name || !subCallId) return
+    const kind = RECORD_TOOL_NAMES[name]
+    if (!kind) return
+    if (data.arguments === null || typeof data.arguments !== 'object' || Array.isArray(data.arguments)) return
+    this.appendRecordEvent(session, event, subCallId, kind, data.arguments as Record<string, unknown>)
+  }
+
+  /** 直接调用与 code 派发共用的落账尾巴：规范化 -> 确定性 id -> 幂等追加 -> 自动建类。 */
+  private appendRecordEvent(
+    session: MirrorSessionLike,
+    event: SessionEventLike,
+    callRef: string,
+    kind: 'expense' | 'mood' | 'activity',
+    raw: Record<string, unknown>,
+  ): void {
+    const sessionId = typeof session?.id === 'string' && session.id.length > 0 ? session.id : 'unknown-session'
+    const id = mirrorEventId(sessionId, callRef, kind)
+    if (this.store.has(id)) return
     const normalized = normalizeRecordArgs(kind, raw)
     if (!normalized.ok) return // 非法参数：execute 会抛同样的错并出现在 tool/result
 
