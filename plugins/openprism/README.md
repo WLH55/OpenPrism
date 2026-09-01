@@ -16,7 +16,7 @@
 
 | 组成 | dsh 原生扩展点 | 说明 |
 |---|---|---|
-| `openprism` 事件镜像器 | `ctx.on('session/event')` | 订阅会话事件流：openprism_* 工具调用以确定性 id 落库（凭据在会话日志里）；用户消息进采集日志（always-record）；捕获主对话模型路由 |
+| `openprism` 事件镜像器 | `ctx.on('session/event')` | 订阅会话事件流：openprism_* 工具调用（直接 `tool/call` 与 code 预设经 run_code 派发的 `tool/code-dispatch` 两种形态，失败派发不落账）以确定性 id 落库（凭据在会话日志里）；用户消息进采集日志（always-record）；捕获主对话模型路由 |
 | 录入工具 ×3 | `ctx.tools` | `openprism_record_expense` / `openprism_record_mood` / `openprism_record_activity`——记录事件由镜像器落库，工具负责校验/自动建类/即时汇总 |
 | `openprism_correct` 工具 | `ctx.tools` | 更正/删除任意记录（target 精确或 kind+维度最近匹配）；UI 端点同源 |
 | `openprism_set_goal` 工具 | `ctx.tools` | 目标/预算（支出上限、活动时长/次数、心情打卡）；重设即覆盖 |
@@ -55,6 +55,28 @@
 
 分类是数据不是代码：对话里说「分类用猫咪」未知分类自动建类；UI 可增删改名
 （改名链在折叠期解析、删除的记录归入兜底「其他」）。
+
+## 定时任务（面板 ⚙ 设置）
+
+夜间提炼 / 每日简报 / 周报的时刻在**面板的 ⚙ 设置页签**里由用户设置（D7：放定时任务、
+由用户自定义，不写死在代码里）：勾选启用 + 时间选择器 + 保存即热生效，无需重启；
+持久化在 `$DSH_HOME/openprism/schedule.json`，重启后依然有效。
+
+首次部署（schedule.json 不存在时）以宿主 profile `cordis.patch.yml` 里 openprism 行的
+`config` 块为引导值（headless 部署有用；全部可省略，缺省即默认 03:00 / 07:00 / 周日 21:00）：
+
+```yaml
+- id: openprism
+  name: openprism
+  config:
+    distillTime: '03:00'        # 夜间提炼时刻（HH:mm）；null / '' / 'off' 关闭
+    dailyBriefingTime: '07:00'  # 每日简报时刻；关闭则连启动补跑一并停
+    weeklyBriefingTime: '21:00' # 周报时刻
+    weeklyBriefingDay: 0        # 周报星期：0=周日 .. 6=周六
+```
+
+生效时刻表见启动日志 `openprism: 定时任务--…` 一行；面板保存过之后以 schedule.json
+为准，patch 的引导值不再起作用。
 
 ## 配置（环境变量）
 
@@ -107,8 +129,8 @@ pnpm -C plugins/openprism test         # vitest：领域层单测 + 假缝 E2E�
 - **工具描述里的分类清单是启动时快照**：运行中新建的分类不会回写到已注册工具的
   description（下次重启更新）；但自动建类保证新名称不会被拒绝，模型也可先调
   `openprism_panel` 看到实时清单。
-- **真机验证清单**（假缝 E2E 已覆盖逻辑，以下待真实 dsh 环境复核）：
-  1. dsh `session/event` 对 user/message 原文与 request/header 路由的暴露（源码已核实类型）；
+- **真机验证清单**（假缝 E2E 已覆盖逻辑，以下按真机复核进展更新）：
+  1. ~~dsh `session/event` 对 user/message 原文与 request/header 路由的暴露~~ ✅ 2026-08-31 真机核实：user/message 采集与 request/header 路由捕获均工作；**发现 code 预设下模型经 `run_code` 间接派发工具**（`tool/call` 的 name 是 run_code，真实凭据在完成事件 `tool/code-dispatch`，arguments 为已解析对象、带 isError）--镜像器与 rebuild 已支持两种形态，失败派发不落账；
   2. `ctx.llm.stream` 提炼调用的 BlockAssembler 组装（源码范本 session-title-llm 一致）；
   3. 微信投递：im-bridge 需 fork 暴露 HTTP 缝（或任选 webhook 通道先行）；
   4. Chatlog：需本机运行 chatlog 服务并解密微信数据。

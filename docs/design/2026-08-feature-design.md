@@ -145,6 +145,12 @@ Q0–Q9 的设计已在 `dev` 分支全部实现（批次 0-6，57 项测试全�
 - 生成分工：数据部分折叠 + 模板（确定性、零 token），仅解读段落过 LLM；词云类文本分析也在这层现算，不建索引；
 - 产物存储：`reports/YYYY-MM/` 按月 markdown——简报是可随时重算的派生物，不进全局日志（ADR 0002 的「唯一持久层」只管面板数据）；
 - 投递：微信推送为主（im-bridge；缺跨插件服务缝——fork 或等上游，实现期再定），dsh 会话内同时可见；超支/目标达成提醒搭每日简报的车，不做独立推送通道。
+- 调度（2026-08-31 补确认）：三个定时任务（提炼/日报/周报）的时刻经插件 config 自定义、不写死在代码里
+- 面板设置（2026-08-31 再补确认）：调度配置升级为**面板 ⚙ 设置页签**——schedule.json
+  持久化 + GET/POST /openprism/schedule 端点，保存即热生效无需重启；patch config 降级为
+  schedule.json 缺席时的引导值（headless 部署用）。
+  （`cordis.patch.yml` 的 openprism 行 config 块；默认 03:00 / 07:00 / 周日 21:00，null 关闭，
+  weeklyBriefingDay 定星期）；dsh-schedule 是模型侧会话提醒、jobs 缝是后台任务运行时，均非本需求的用户面。
 
 ## D8 连接器（Q8，2026-08-31 已确认）
 
@@ -205,6 +211,11 @@ Q0–Q9 的设计已在 `dev` 分支全部实现（批次 0-6，57 项测试全�
 
 ## 实现前核实清单（2026-08-31 汇总）
 
-- [ ] dsh `tool/call` 事件是否带稳定 id/序号——4.1 更正引用 id 确定性派生的前提
-- [ ] dsh `session/event` 是否向插件暴露用户消息原文——5.1 采集挂点
+- [x] dsh `tool/call` 事件是否带稳定 id/序号——4.1 更正引用 id 确定性派生的前提
+  （2026-08-31 真机核实：带 callId；且发现 code 预设下模型经 `run_code` 派发工具，凭据在完成事件
+  `tool/code-dispatch`（`subCallId` 确定性、arguments 为已解析对象、isError 标记成败）——
+  镜像器与 rebuild 已同时支持两种形态，失败派发不落账，见 mirror.ts 头注）
+- [x] dsh `session/event` 是否向插件暴露用户消息原文——5.1 采集挂点
+  （2026-08-31 真机核实：user/message 原文与 request/header 路由均可达，采集与路由捕获工作正常）
 - [ ] dsh jobs 缝的注册方式与语义——5.3 夜间批量与 Q7 定时简报的挂点
+  （注：当前实现用 setTimeout 自调度兜底，jobs 缝接入仍是优化项）

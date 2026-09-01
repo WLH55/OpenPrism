@@ -3,6 +3,9 @@
  * `mirror` 事件；`source ≠ mirror` 的事件原样保留（3.3）。事件 id 确定性派生，
  * 重复执行与增量运行都幂等（已存在的 id 自动跳过）。
  *
+ * 调用凭据有两种形态（与镜像器一致，见 mirror.ts）：直接调用 `tool/call` 与
+ * code 预设派发的完成事件 `tool/code-dispatch`（isError=true 的失败派发跳过）。
+ *
  * @module openprism/rebuild
  */
 
@@ -25,9 +28,35 @@ export interface RebuildResult {
 }
 
 /**
- * 重放所有会话日志中的 openprism_* tool/call。记录类调用复用 Mirror（确定性 id、
- * 幂等）；openprism_correct 调用经 applyCorrection 重放（语义幂等：已删除目标被
- * 拒、重复同补丁无副作用，可能引入冗余更正事件——rebuild 是灾备路径，可接受）。
+ * 从会话事件提取 openprism_* 调用凭据（直接调用与 code 派发两种形态）。
+ * 返回 undefined 表示该事件不是 openprism_* 调用、参数不可解析、或派发失败。
+ */
+function extractInvocation(event: SessionEventLike): { name: string; raw: Record<string, unknown> } | undefined {
+  if (event?.type !== 'tool/call' && event?.type !== 'tool/code-dispatch') return undefined
+  const data = event.data as { name?: unknown; arguments?: unknown; isError?: unknown } | undefined
+  if (!data || typeof data.name !== 'string') return undefined
+  if (!data.name.startsWith('openprism_')) return undefined
+  if (event.type === 'tool/code-dispatch' && data.isError === true) return undefined
+  let raw: Record<string, unknown> | undefined
+  if (typeof data.arguments === 'string') {
+    try {
+      const parsed = JSON.parse(data.arguments) as unknown
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>
+    } catch {
+      // 参数不是合法 JSON：与镜像器的跳过语义一致
+    }
+  } else if (data.arguments !== null && typeof data.arguments === 'object' && !Array.isArray(data.arguments)) {
+    raw = data.arguments as Record<string, unknown>
+  }
+  if (raw === undefined) return undefined
+  return { name: data.name, raw }
+}
+
+/**
+ * 重放所有会话日志中的 openprism_* 调用（tool/call 直接调用 + tool/code-dispatch
+ * code 派发）。记录类调用复用 Mirror（确定性 id、幂等）；openprism_correct 调用经
+ * applyCorrection 重放（语义幂等：已删除目标被拒、重复同补丁无副作用，可能引入冗余
+ * 更正事件--rebuild 是灾备路径，可接受）。
  */
 export async function rebuildFromSessions(store: import('./store.js').EventStore, source: SessionLogSource): Promise<RebuildResult> {
   const mirror = new Mirror(store)
@@ -36,13 +65,11 @@ export async function rebuildFromSessions(store: import('./store.js').EventStore
   for await (const entry of source.entries()) {
     scannedSessions += 1
     for (const event of entry.events) {
-      if (event?.type !== 'tool/call') continue
-      const data = event.data as { name?: unknown; arguments?: unknown } | undefined
-      if (!data || typeof data.name !== 'string') continue
+      const invocation = extractInvocation(event)
+      if (invocation === undefined) continue
       try {
-        if (data.name === 'openprism_correct') {
-          const raw = JSON.parse(typeof data.arguments === 'string' ? data.arguments : '{}') as Record<string, unknown>
-          const request = parseCorrectionRequest(raw)
+        if (invocation.name === 'openprism_correct') {
+          const request = parseCorrectionRequest(invocation.raw)
           if (!('error' in request)) {
             await applyCorrection(store, request, { source: 'internal', sessionId: entry.sessionId, recordedAt: event.time })
           }
@@ -50,7 +77,7 @@ export async function rebuildFromSessions(store: import('./store.js').EventStore
           mirror.handleSessionEvent({ id: entry.sessionId }, event)
         }
       } catch (error) {
-        console.warn(`openprism: rebuild 跳过一条调用（${data.name}）：${String(error)}`)
+        console.warn(`openprism: rebuild 跳过一条调用（${invocation.name}）：${String(error)}`)
       }
     }
     // 批内异步 append 全部落定后再继续（mirror 内部 fire-and-forget）
