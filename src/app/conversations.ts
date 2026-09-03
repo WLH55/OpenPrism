@@ -15,6 +15,7 @@ import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt, defaultAssistantPrompt, extractAgentName } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, skillIndexFile, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, syncInjectionBlock } from "./memory";
+import { createTaskTool } from "./tasks";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
 
@@ -40,6 +41,12 @@ export interface ConversationDeps {
   skills: SkillStoreLike;
   mcps: McpRegistry;
   memory: MemoryStoreLike;
+  /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
+  tasks?: TaskStoreLike;
+}
+
+export interface TaskStoreLike {
+  create(uid: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
 /** 测试替身面（避免循环依赖具体类） */
@@ -135,23 +142,35 @@ export class ConversationStore {
     await rename(tmp, file);
   }
 
-  /** 池化装配：同 (uid, cid) 恒同一 Agent 实例；并发调用共享同一次装配 */
-  async agent(uid: string, cid: string): Promise<Agent> {
-    const key = `${uid}:${cid}`;
+  /** 池化装配：同 key 恒同一 Agent 实例；并发调用共享同一次装配 */
+  private async pooled(key: string, assemble: () => Promise<Agent>): Promise<Agent> {
     const cached = this.pool.get(key);
     if (cached) return cached;
     const pending = this.assembling.get(key);
     if (pending) return pending;
-    const assembling = this.assemble(uid, cid).finally(() => this.assembling.delete(key));
-    this.assembling.set(key, assembling);
-    const agent = await assembling;
+    const creating = assemble().finally(() => this.assembling.delete(key));
+    this.assembling.set(key, creating);
+    const agent = await creating;
     this.pool.set(key, agent);
     return agent;
   }
 
+  async agent(uid: string, cid: string): Promise<Agent> {
+    return this.pooled(`${uid}:${cid}`, () =>
+      this.assemble(uid, join(this.deps.paths.convDir(uid, cid), "session.jsonl"), () => this.readMetaSync(uid, cid)),
+    );
+  }
+
+  /** 任务专属持久会话（D6.2）：与聊天回合同权装配；伙伴 = task.agentId（快照），人设正文仍每步热读 */
+  async taskAgent(uid: string, taskId: string, agentId: string | undefined): Promise<Agent> {
+    const meta: ConversationMeta = { switches: [], ...(agentId !== undefined ? { agentId } : {}) };
+    return this.pooled(`${uid}:task:${taskId}`, () =>
+      this.assemble(uid, join(this.deps.paths.userDir(uid), "tasks", taskId, "session.jsonl"), () => meta),
+    );
+  }
+
   /** 当前伙伴的同步视图（systemPrompt 每步重取 & 账本 actor 都要同步拿） */
-  private syncCurrentAgent(uid: string, cid: string): { agentId?: string; name: string; persona?: string; binding: AgentBinding } {
-    const meta = this.readMetaSync(uid, cid);
+  private syncCurrentAgent(uid: string, meta: ConversationMeta): { agentId?: string; name: string; persona?: string; binding: AgentBinding } {
     if (!meta.agentId) return { name: "助手", binding: { skills: [], mcps: [] } };
     let persona: string | undefined;
     try {
@@ -201,29 +220,16 @@ export class ConversationStore {
     return metas;
   }
 
-  /** systemPrompt 闭包（同步）：人设 + 记忆注入 + 技能目录，每步重读盘（改动下一步生效） */
-  private composePrompt(uid: string, cid: string): string {
-    const current = this.syncCurrentAgent(uid, cid);
-    const memoryBlock = syncInjectionBlock(this.deps.paths, uid);
-    const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
-    const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
-    return composeAssistantPrompt({
-      persona: current.persona,
-      ...(merged !== "" ? { memoryBlock: merged } : {}),
-      now: this.deps.now,
-      tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? -new Date().getTimezoneOffset(),
-    });
-  }
 
-  private async assemble(uid: string, cid: string): Promise<Agent> {
-    const { env, fileIO, paths, now } = this.deps;
+  private async assemble(uid: string, sessionPath: string, metaOf: () => ConversationMeta): Promise<Agent> {
+    const { env, fileIO, now } = this.deps;
     const config = await this.deps.modelConfigFor(uid);
     if (!config) throw new ModelNotConfiguredError();
-    const sessionLog = await JsonlSessionLog.open(fileIO, join(paths.convDir(uid, cid), "session.jsonl"), now);
+    const sessionLog = await JsonlSessionLog.open(fileIO, sessionPath, now);
     const ledger = await this.deps.ledgerFor(uid);
 
     // 装配期快照绑定（工具集）；systemPrompt 每步重读（人设/记忆/目录热更）
-    const meta = await this.metaFor(uid, cid);
+    const meta = metaOf();
     let binding: AgentBinding = { skills: [], mcps: [] };
     if (meta.agentId) {
       const agents = await this.deps.agents.list(uid);
@@ -234,8 +240,8 @@ export class ConversationStore {
       ledger,
       now,
       actor: () => {
-        const agentNow = this.syncCurrentAgent(uid, cid);
-        return { conversationId: cid, agentName: agentNow.name };
+        const agentNow = this.syncCurrentAgentWithMeta(uid, metaOf());
+        return { conversationId: this.conversationIdOf(sessionPath, uid), agentName: agentNow.name };
       },
     }).filter((tool) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name));
 
@@ -244,6 +250,9 @@ export class ConversationStore {
       tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid }));
     }
     tools.push(createSavePreferenceTool({ store: this.deps.memory as unknown as import("./memory").MemoryStore, uid, now }));
+    if (this.deps.tasks) {
+      tools.push(createTaskTool({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid }));
+    }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));
     }
@@ -253,9 +262,33 @@ export class ConversationStore {
       sessionLog,
       adapter: this.deps.adapterFactory(uid, config),
       model: { provider: "byok", model: config.model },
-      systemPrompt: () => this.composePrompt(uid, cid),
+      systemPrompt: () => this.composePromptWithMeta(uid, metaOf()),
       tools,
       maxStepsPerTurn: 24,
+    });
+  }
+
+  /** 账本 actor 的会话归属：任务会话取 taskId，聊天会话取 cid（sessionPath 的最后一级目录名） */
+  private conversationIdOf(sessionPath: string, uid: string): string {
+    const relative = sessionPath.slice(join(this.deps.paths.userDir(uid)).length + 1);
+    const parts = relative.split(/[\\/]/);
+    return parts.length >= 3 && parts[0] === "tasks" ? parts[1]! : parts[0] === "conversations" ? parts[1]! : relative;
+  }
+
+  private syncCurrentAgentWithMeta(uid: string, meta: ConversationMeta): { agentId?: string; name: string; persona?: string; binding: AgentBinding } {
+    return this.syncCurrentAgent(uid, meta);
+  }
+
+  private composePromptWithMeta(uid: string, meta: ConversationMeta): string {
+    const current = this.syncCurrentAgent(uid, meta);
+    const memoryBlock = syncInjectionBlock(this.deps.paths, uid);
+    const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
+    const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
+    return composeAssistantPrompt({
+      persona: current.persona,
+      ...(merged !== "" ? { memoryBlock: merged } : {}),
+      now: this.deps.now,
+      tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? -new Date().getTimezoneOffset(),
     });
   }
 

@@ -179,3 +179,52 @@ export const api2 = {
   switchAgent: (cid: string, agentId: string) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/agent`, { method: "PUT", body: JSON.stringify({ agentId }) }),
 };
+
+// ── 批次 3：定时任务 / 通知 ──────────────────────────────
+export interface TaskTriggerLoose {
+  kind: "once" | "daily" | "weekly" | "monthly" | "yearly" | "cron";
+  at?: number;
+  time?: string;
+  days?: number[];
+  day?: number;
+  month?: number;
+  expr?: string;
+}
+export interface TaskLoose {
+  id: string;
+  title: string;
+  instruction: string;
+  trigger: TaskTriggerLoose;
+  enabled: boolean;
+  agentId?: string;
+  lastRunTs?: number;
+}
+export interface TaskRunLoose {
+  ts: number;
+  status: "ran" | "skipped" | "failed";
+  detail?: string;
+}
+export interface NotificationLoose {
+  seq: number;
+  ts: number;
+  kind: string;
+  taskId?: string;
+  text: string;
+  readTs?: number;
+}
+
+export const api3 = {
+  listTasks: () => request<TaskLoose[]>("/api/tasks"),
+  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string }) =>
+    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
+  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title">> & { trigger?: TaskTriggerLoose }) =>
+    request<TaskLoose>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
+  runTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}/run`, { method: "POST" }),
+  taskRuns: (id: string) => request<TaskRunLoose[]>(`/api/tasks/${id}/runs`),
+
+  listNotifications: (unreadOnly = false) =>
+    request<NotificationLoose[]>(`/api/notifications${unreadOnly ? "?unread=1" : ""}`),
+  markAllRead: () => request<{ ok: boolean }>("/api/notifications/read", { method: "POST", body: JSON.stringify({ all: true }) }),
+  markRead: (seq: number) => request<{ ok: boolean }>("/api/notifications/read", { method: "POST", body: JSON.stringify({ seq }) }),
+};
