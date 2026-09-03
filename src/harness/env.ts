@@ -18,7 +18,8 @@ export interface EnvFetchResponse {
   headers: { get(name: string): string | null };
   json(): Promise<unknown>;
   text(): Promise<string>;
-  body?: EnvReadableStream;
+  /** 真实 fetch 的 body 可能为 null（204、无 body 响应等） */
+  body?: EnvReadableStream | null;
 }
 
 export type EnvFetch = (input: string, init?: EnvFetchRequest) => Promise<EnvFetchResponse>;
