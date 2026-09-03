@@ -8,9 +8,11 @@ import { Agents } from "./pages/Agents";
 import { Skills } from "./pages/Skills";
 import { Memory } from "./pages/Memory";
 import { Tasks } from "./pages/Tasks";
+import { Panels } from "./pages/Panels";
+import { Progress } from "./pages/Progress";
 import { Bell } from "./pages/Bell";
 
-type View = "chat" | "today" | "agents" | "skills" | "memory" | "tasks" | "settings";
+type View = "chat" | "today" | "panels" | "progress" | "agents" | "skills" | "memory" | "tasks" | "settings";
 
 export function App() {
   const [username, setUsername] = useState<string | null>(null);
@@ -34,6 +36,8 @@ export function App() {
   const tabs: { key: View; label: string }[] = [
     { key: "chat", label: "对话" },
     { key: "today", label: "今天" },
+    { key: "panels", label: "盘面" },
+    { key: "progress", label: "成长" },
     { key: "agents", label: "伙伴" },
     { key: "skills", label: "技能" },
     { key: "memory", label: "记忆" },
@@ -85,6 +89,8 @@ export function App() {
       </header>
       {view === "chat" && <Chat key="chat" />}
       {view === "today" && <Today key="today" />}
+      {view === "panels" && <Panels key="panels" />}
+      {view === "progress" && <Progress key="progress" />}
       {view === "agents" && <Agents key="agents" />}
       {view === "skills" && <Skills key="skills" />}
       {view === "memory" && <Memory key="memory" />}

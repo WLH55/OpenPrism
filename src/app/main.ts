@@ -27,7 +27,9 @@ async function main(): Promise<void> {
   const paths = appPaths(dataRoot);
   const masterKey = await loadOrCreateMasterKey(dataRoot);
   const users = await loadUsers(nodeFileIO, paths.usersFile);
-  const sessions = new SessionStore(() => Date.now());
+  const usersByUid = new Map([...users.values()].map((u) => [u.uid, u]));
+  // 会话持久化（批次4 硬化：重启不掉线）
+  const sessions = await SessionStore.load({ fileIO: nodeFileIO, file: join(dataRoot, "sessions.jsonl") }, () => Date.now());
 
   // 账本实例缓存：同 uid 恒同一 Ledger（串行队列在实例内）
   const ledgers = new Map<string, Promise<Ledger>>();
@@ -110,6 +112,7 @@ async function main(): Promise<void> {
     paths,
     masterKey,
     users,
+    usersByUid,
     sessions,
     conversations,
     ledgerFor,

@@ -54,6 +54,7 @@ export function Chat() {
   const [stream, setStream] = useState<{ reasoning: string; text: string } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [showReasoning, setShowReasoning] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -166,7 +167,7 @@ export function Chat() {
 
   return (
     <div className="chat-layout">
-      <aside className="conv-list">
+      <aside className={`conv-list${drawerOpen ? " drawer-open" : ""}`}>
         <button className="btn ghost small" style={{ width: "100%", marginBottom: 8 }} onClick={newConversation}>
           ＋ 新对话
         </button>
@@ -188,6 +189,9 @@ export function Chat() {
           </div>
         )}
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface)" }}>
+          <button className="btn ghost small" style={{ display: "none" }} data-drawer-toggle onClick={() => setDrawerOpen(!drawerOpen)}>
+            会话
+          </button>
           <span className="muted">当前伙伴</span>
           <select
             className="input"

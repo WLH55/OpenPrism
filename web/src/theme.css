@@ -143,6 +143,8 @@ body {
 @media (max-width: 720px) {
   .quick-form { grid-template-columns: 1fr 1fr; }
   .conv-list { display: none; }
+  .conv-list.drawer-open { display: block; position: absolute; z-index: 20; top: 53px; bottom: 0; left: 0; }
+  [data-drawer-toggle] { display: inline-block !important; }
   .stat-grid { grid-template-columns: repeat(3, 1fr); }
 }
 .section-title { font-size: 14px; font-weight: 600; margin: 20px 0 8px; }
