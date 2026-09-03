@@ -6,10 +6,15 @@
   "description": "OpenPrism harness：完整复刻 dsh harness 能力的纯 TypeScript 库（机制照抄，架构不抄）",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev:server": "tsx watch src/app/main.ts",
+    "dev:web": "pnpm --dir web dev",
+    "build:web": "pnpm --dir web build",
+    "start": "tsx src/app/main.ts"
   },
   "devDependencies": {
     "@types/node": "^26.4.1",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.2",
     "vitest": "^3.2.0"
   }
