@@ -30,6 +30,8 @@ export interface LlmCallOptions {
   signal?: AbortSignal;
   /** 流式文本增量：只走活体事件流，不落日志（设计 §9） */
   onTextDelta?(delta: string): void;
+  /** 思维链增量（reasoning 模型）：同 text-delta，只展示不回传 */
+  onReasoningDelta?(delta: string): void;
 }
 
 export interface LlmAdapter {

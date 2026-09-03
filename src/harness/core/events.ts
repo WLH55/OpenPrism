@@ -6,6 +6,7 @@ import type { TurnEndReason } from "../session/events";
 export type AgentLiveEvent =
   | { type: "status"; status: "idle" | "running" }
   | { type: "text-delta"; text: string }
+  | { type: "reasoning-delta"; text: string }
   | { type: "assistant"; message: AssistantMessage; usage?: Usage }
   | { type: "tool-call"; id: string; name: string; args: unknown }
   | { type: "tool-result"; id: string; isError: boolean; content: ContentBlock[]; code?: string }

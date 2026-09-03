@@ -73,6 +73,8 @@ kick()    外层：while (turn())——Inbox 有待处理就开新 Turn
 
 OpenAI 兼容协议（覆盖 DeepSeek/GLM/Qwen/Moonshot/OpenRouter）：SSE 流式（`expo/fetch` 风格的注入 fetch，工具调用按 index 跨 chunk 累积、带状态 TextDecoder 防中文截断）+ 非流式；usage 从 `usage` chunk 归一（`prompt_tokens` 减去缓存命中为未缓存输入）。
 
+**思维链透传**（真实冒烟后补，2026-09-03）：reasoning 模型输出的思考过程（`reasoning_content`/`reasoning` 字段）经 adapter 捕获——增量走 `onReasoningDelta` 活体事件、全文随 assistant 消息落日志。**只展示不回传**：wire 映射剔除、压力计量不计、abort 部分保留时与正文一起留存。
+
 ## 5. 上下文管理（context/）
 
 ### 5.1 token 计量（双轨）
@@ -176,7 +178,7 @@ Agent = {
   cancel(opts?)                        // 默认清 Inbox
   whenIdle(): Promise<void>
   compact(): Promise<void>             // 手动压缩（要求 idle）
-  subscribe(cb): () => void            // 活体事件流（text-delta 不落日志，只走这里）
+  subscribe(cb): () => void            // 活体事件流（text-delta / reasoning-delta 不落日志，只走这里）
   status: 'idle' | 'running'
 }
 ```

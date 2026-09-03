@@ -207,17 +207,26 @@ export function createAgent(config: AgentConfig): Agent {
       }
 
       let partialText = "";
+      let partialReasoning = "";
       let response: LlmResponse;
       try {
         response = await withRetry(
-          () =>
-            config.adapter.complete(request, {
+          () => {
+            // 每次尝试重置部分累积：失败尝试的增量不混入 abort 保留
+            partialText = "";
+            partialReasoning = "";
+            return config.adapter.complete(request, {
               signal: abort.signal,
               onTextDelta: (delta) => {
                 partialText += delta;
                 emit({ type: "text-delta", text: delta });
               },
-            }),
+              onReasoningDelta: (delta) => {
+                partialReasoning += delta;
+                emit({ type: "reasoning-delta", text: delta });
+              },
+            });
+          },
           {
             policy: retryPolicy,
             usedRetries: retryBudgetUsed(log.readAll(), request.provider, request.model),
@@ -237,11 +246,12 @@ export function createAgent(config: AgentConfig): Agent {
       } catch (failure) {
         const normalized = isLlmFailure(failure) ? failure : null;
         if (normalized?.code === "ABORTED" || abort.signal.aborted) {
-          // abort 保留部分输出：已收到的内容组装为 interrupted 消息落日志
-          if (partialText) {
+          // abort 保留部分输出：已收到的内容（含思维链）组装为 interrupted 消息落日志
+          if (partialText || partialReasoning) {
             const partial: AssistantMessage = {
               role: "assistant",
-              content: [{ type: "text", text: partialText }],
+              content: partialText ? [{ type: "text", text: partialText }] : [],
+              ...(partialReasoning ? { reasoning: partialReasoning } : {}),
               interrupted: true,
             };
             await log.append({ type: "assistant/message", message: partial });
