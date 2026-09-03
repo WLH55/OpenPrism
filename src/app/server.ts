@@ -4,7 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { FileIO, PlatformEnv } from "../harness/index";
+import type { FileIO, LlmAdapter, PlatformEnv } from "../harness/index";
 import { createOpenAICompatAdapter } from "../harness/index";
 import type { AppPaths } from "./store";
 import { ensureUserSandbox } from "./store";
@@ -13,6 +13,10 @@ import { open, readModelConfig, seal, writeModelConfig, type ModelConfig } from 
 import type { Ledger } from "./ledger";
 import { todayView } from "./fold";
 import { ModelNotConfiguredError, type ConversationStore } from "./conversations";
+import type { AgentStore, AgentBinding } from "./agents";
+import type { SkillStore } from "./skills";
+import type { McpRegistry } from "./mcp";
+import { MEMORY_SLOTS, type MemorySlot, type MemoryStore } from "./memory";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -27,6 +31,12 @@ export interface ServerDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** 连接测试：默认用当前配置发一次 1-token 非流式请求；测试注入 fake（零网络） */
   modelTester?(uid: string, config: ModelConfig | null): Promise<void>;
+  /** 记忆凝练用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（consolidate 返回 409）；测试注入 mock */
+  adapterFor?(uid: string): Promise<{ adapter: LlmAdapter; model: string } | null>;
+  agents: AgentStore;
+  skills: SkillStore;
+  mcps: McpRegistry;
+  memory: MemoryStore;
   staticDir?: string;
 }
 
@@ -298,6 +308,161 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       });
       return;
     }
+
+    // 会话伙伴绑定/切换（D4.2）
+    if (sub === "/meta" && method === "GET") {
+      return sendJson(res, 200, await deps.conversations.metaFor(uid, cid));
+    }
+    if (sub === "/agent" && method === "PUT") {
+      const body = (await readBody(req)) as { agentId?: string };
+      try {
+        await deps.conversations.switchAgent(uid, cid, String(body.agentId ?? ""));
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendError(res, 404, String((error as Error).message));
+      }
+    }
+  }
+
+  // ── 智能体（三段配置） ─────────────────────────────────
+  if (path === "/api/agents" && (method === "GET" || method === "POST")) {
+    if (method === "GET") return sendJson(res, 200, await deps.agents.list(uid));
+    const body = (await readBody(req)) as { persona?: string; binding?: AgentBinding };
+    const persona = String(body.persona ?? "");
+    if (persona.trim() === "") return sendError(res, 400, "persona 必填（markdown 自由书写）");
+    const entry = await deps.agents.create(uid, {
+      persona,
+      ...(body.binding ? { binding: body.binding } : {}),
+    });
+    return sendJson(res, 200, entry);
+  }
+  const agentMatch = /^\/api\/agents\/([^/]+)(\/[^/]*)?$/.exec(path);
+  if (agentMatch) {
+    const aid = decodeURIComponent(agentMatch[1]!);
+    const sub = agentMatch[2] ?? "";
+    const wrap = (error: unknown): void => sendError(res, 404, String((error as Error).message));
+    try {
+      if (sub === "" && method === "GET") {
+        return sendJson(res, 200, { ...(await deps.agents.list(uid)).find((a) => a.id === aid), persona: await deps.agents.persona(uid, aid) });
+      }
+      if (sub === "" && method === "DELETE") {
+        await deps.agents.remove(uid, aid);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/persona" && method === "PUT") {
+        const body = (await readBody(req)) as { markdown?: string };
+        return sendJson(res, 200, await deps.agents.updatePersona(uid, aid, String(body.markdown ?? "")));
+      }
+      if (sub === "/binding" && method === "PUT") {
+        const body = (await readBody(req)) as { binding?: AgentBinding };
+        const binding = body.binding;
+        if (!binding || !Array.isArray(binding.skills) || !Array.isArray(binding.mcps)) {
+          return sendError(res, 400, "binding 需要 skills/mcps 数组");
+        }
+        await deps.agents.updateBinding(uid, aid, binding);
+        return sendJson(res, 200, { ok: true });
+      }
+    } catch (error) {
+      return wrap(error);
+    }
+  }
+
+  // ── 技能 ───────────────────────────────────────────────
+  if (path === "/api/skills" && (method === "GET" || method === "POST")) {
+    if (method === "GET") return sendJson(res, 200, await deps.skills.list(uid));
+    const body = (await readBody(req)) as { content?: string };
+    try {
+      return sendJson(res, 200, await deps.skills.create(uid, String(body.content ?? "")));
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  const skillMatch = /^\/api\/skills\/([^/]+)(\/[^/]*)?$/.exec(path);
+  if (skillMatch) {
+    const sid = decodeURIComponent(skillMatch[1]!);
+    const sub = skillMatch[2] ?? "";
+    try {
+      if (sub === "/body" && method === "GET") return sendJson(res, 200, { body: await deps.skills.body(uid, sid) });
+      if (sub === "" && method === "DELETE") {
+        await deps.skills.remove(uid, sid);
+        return sendJson(res, 200, { ok: true });
+      }
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
+    }
+  }
+
+  // ── MCP ────────────────────────────────────────────────
+  if (path === "/api/mcps" && (method === "GET" || method === "POST")) {
+    if (method === "GET") return sendJson(res, 200, await deps.mcps.list(uid));
+    const body = (await readBody(req)) as { name?: string; url?: string; headers?: Record<string, string> };
+    try {
+      return sendJson(res, 200, await deps.mcps.add(uid, {
+        name: String(body.name ?? "").trim() || "MCP",
+        url: String(body.url ?? ""),
+        ...(body.headers ? { headers: body.headers } : {}),
+      }));
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  const mcpMatch = /^\/api\/mcps\/([^/]+)(\/[^/]*)?$/.exec(path);
+  if (mcpMatch) {
+    const mid = decodeURIComponent(mcpMatch[1]!);
+    const sub = mcpMatch[2] ?? "";
+    try {
+      if (sub === "/tools" && method === "POST") {
+        const tools = await deps.mcps.toolsFor(uid, mid);
+        return sendJson(res, 200, { tools: tools.map((t) => t.name) });
+      }
+      if (sub === "" && method === "DELETE") {
+        await deps.mcps.remove(uid, mid);
+        return sendJson(res, 200, { ok: true });
+      }
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
+    }
+  }
+
+  // ── 长期记忆 ───────────────────────────────────────────
+  if (path === "/api/memory" && method === "GET") {
+    const [slots, meta] = await Promise.all([deps.memory.read(uid), deps.memory.meta(uid)]);
+    return sendJson(res, 200, { slots, meta });
+  }
+  const memorySlotMatch = /^\/api\/memory\/([a-z]+)$/.exec(path);
+  if (memorySlotMatch && method === "PUT") {
+    const slot = memorySlotMatch[1]! as MemorySlot;
+    if (!(MEMORY_SLOTS as readonly string[]).includes(slot)) return sendError(res, 400, `slot 只能是 ${MEMORY_SLOTS.join(" / ")}`);
+    const body = (await readBody(req)) as { markdown?: string };
+    await deps.memory.writeSlot(uid, slot, String(body.markdown ?? ""));
+    return sendJson(res, 200, { ok: true });
+  }
+  if (path === "/api/memory/consolidate" && method === "POST") {
+    const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
+    if (!built) return sendError(res, 409, "model_not_configured");
+    // 会话文本采集：全部会话的 user/assistant 文本，取尾部 40 条
+    const texts: string[] = [];
+    for (const entry of await deps.conversations.list(uid)) {
+      const lines = await deps.fileIO.readAll(join(deps.paths.convDir(uid, entry.id), "session.jsonl"));
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line) as { type: string; message?: { role: string; content: { type: string; text?: string }[] } };
+          if (event.type === "user/message" || event.type === "assistant/message") {
+            const text = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+            if (text.trim() !== "") texts.push(`${event.message?.role === "user" ? "用户" : "助手"}：${text}`);
+          }
+        } catch {
+          // 坏行
+        }
+      }
+    }
+    const result = await deps.memory.consolidate({
+      uid,
+      adapter: built.adapter,
+      model: built.model,
+      sessionTexts: texts.slice(-40),
+    });
+    return sendJson(res, 200, result);
   }
 
   // ── 账本直写（ui 来源） ────────────────────────────────

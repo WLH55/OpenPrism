@@ -4,8 +4,11 @@ import { Login } from "./pages/Login";
 import { Chat } from "./pages/Chat";
 import { Today } from "./pages/Today";
 import { Settings } from "./pages/Settings";
+import { Agents } from "./pages/Agents";
+import { Skills } from "./pages/Skills";
+import { Memory } from "./pages/Memory";
 
-type View = "chat" | "today" | "settings";
+type View = "chat" | "today" | "agents" | "skills" | "memory" | "settings";
 
 export function App() {
   const [username, setUsername] = useState<string | null>(null);
@@ -29,6 +32,9 @@ export function App() {
   const tabs: { key: View; label: string }[] = [
     { key: "chat", label: "对话" },
     { key: "today", label: "今天" },
+    { key: "agents", label: "伙伴" },
+    { key: "skills", label: "技能" },
+    { key: "memory", label: "记忆" },
     { key: "settings", label: "设置" },
   ];
 
@@ -75,6 +81,9 @@ export function App() {
       </header>
       {view === "chat" && <Chat key="chat" />}
       {view === "today" && <Today key="today" />}
+      {view === "agents" && <Agents key="agents" />}
+      {view === "skills" && <Skills key="skills" />}
+      {view === "memory" && <Memory key="memory" />}
       {view === "settings" && <Settings key="settings" />}
     </>
   );

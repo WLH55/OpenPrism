@@ -3,13 +3,17 @@
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { nodeEnv, nodeFileIO } from "./env";
 import { appPaths } from "./store";
 import { loadUsers, SessionStore } from "./auth";
-import { loadOrCreateMasterKey, open, readModelConfig, type ModelConfig } from "./secretbox";
+import { loadOrCreateMasterKey, open, readModelConfig } from "./secretbox";
 import { Ledger } from "./ledger";
 import { ConversationStore } from "./conversations";
+import { AgentStore } from "./agents";
+import { SkillStore } from "./skills";
+import { McpRegistry } from "./mcp";
+import { MemoryStore } from "./memory";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 
@@ -51,6 +55,11 @@ async function main(): Promise<void> {
     },
   });
 
+  const agents = new AgentStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => Date.now() });
+
   const conversations = new ConversationStore({
     env: nodeEnv,
     fileIO: nodeFileIO,
@@ -59,7 +68,21 @@ async function main(): Promise<void> {
     modelConfigFor,
     adapterFactory,
     now: () => Date.now(),
+    agents,
+    skills,
+    mcps,
+    memory,
   });
+
+  // 记忆凝练 adapter：现读用户 BYOK 配置
+  const adapterFor = async (uid: string) => {
+    const config = await modelConfigFor(uid);
+    if (!config || !config.keyEnc) return null;
+    return {
+      adapter: createOpenAICompatAdapter(nodeEnv, { baseURL: config.baseURL, apiKey: open(masterKey, config.keyEnc) }),
+      model: config.model,
+    };
+  };
 
   const staticDir = resolve("web/dist");
   const server = createAppServer({
@@ -71,11 +94,50 @@ async function main(): Promise<void> {
     sessions,
     conversations,
     ledgerFor,
+    adapterFor,
+    agents,
+    skills,
+    mcps,
+    memory,
     ...(existsSync(staticDir) ? { staticDir } : {}),
   });
 
   await new Promise<void>((resolveListen) => server.listen(port, "0.0.0.0", resolveListen));
   process.stdout.write(`[openprism] listening on http://127.0.0.1:${port} (data: ${dataRoot}${existsSync(staticDir) ? ", static: web/dist" : ""})\n`);
+
+  // 自动凝练（5.1 本土化：夜间/懒——启动惰性检查）：lastRun 超 20h 且有会话 → 后台跑一次
+  void (async () => {
+    for (const username of users.keys()) {
+      const user = users.get(username)!;
+      const meta = await memory.meta(user.uid);
+      const stale = meta.lastRunTs === undefined || Date.now() - meta.lastRunTs > 20 * 3600 * 1000;
+      if (!stale) continue;
+      const hasConversations = (await conversations.list(user.uid)).length > 0;
+      if (!hasConversations) continue;
+      const built = await adapterFor(user.uid);
+      if (!built) continue;
+      const texts: string[] = [];
+      for (const entry of await conversations.list(user.uid)) {
+        for (const line of await nodeFileIO.readAll(join(paths.convDir(user.uid, entry.id), "session.jsonl"))) {
+          try {
+            const event = JSON.parse(line) as { type: string; message?: { role: string; content: { type: string; text?: string }[] } };
+            if (event.type === "user/message" || event.type === "assistant/message") {
+              const text = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+              if (text.trim() !== "") texts.push(`${event.message?.role === "user" ? "用户" : "助手"}：${text}`);
+            }
+          } catch {
+            // 坏行
+          }
+        }
+      }
+      try {
+        const result = await memory.consolidate({ uid: user.uid, adapter: built.adapter, model: built.model, sessionTexts: texts.slice(-40) });
+        process.stdout.write(`[openprism] memory consolidate ${user.username}: changed=${result.changed}\n`);
+      } catch (error) {
+        process.stdout.write(`[openprism] memory consolidate ${user.username} failed: ${String((error as Error).message)}\n`);
+      }
+    }
+  })();
 
   process.on("SIGINT", () => {
     server.close(() => process.exit(0));
