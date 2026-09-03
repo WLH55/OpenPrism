@@ -1,6 +1,6 @@
 # OpenPrism Harness 设计文档
 
-日期：2026-09-02 ｜ 状态：已终审，H1–H5 全部实现（src/harness/，72 测试全绿）
+日期：2026-09-02 ｜ 状态：已终审，H1–H5 全部实现（src/harness/，79 测试全绿，真实厂商冒烟通过）
 前置决策：[ADR 0005（harness 先行）](../adr/0005-harness-first-foundation.md)、[ADR 0006（复刻范围）](../adr/0006-replication-scope.md)
 术语：以根目录 [CONTEXT.md](../../CONTEXT.md) 为准。
 
