@@ -188,6 +188,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { ok: true });
   }
 
+  // 静态资源（web/dist）：登录页本身无需登录；认证门只管 /api/*
+  if (method === "GET" && !path.startsWith("/api") && (await serveStatic(deps, res, path))) return;
+
   // ── 认证（无需登录） ───────────────────────────────────
   if (method === "POST" && path === "/api/auth/register") {
     const body = (await readBody(req)) as { username?: string; password?: string };
@@ -682,9 +685,6 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const ledger = await deps.ledgerFor(uid);
     return sendJson(res, 200, categoryView(ledger.readAll(), { category: name, period, now: deps.env.now(), tzOffsetMinutes: -new Date().getTimezoneOffset() }));
   }
-
-  // ── 静态资源（web/dist） ───────────────────────────────
-  if (method === "GET" && (await serveStatic(deps, res, path))) return;
 
   sendError(res, 404, "not found");
 }
