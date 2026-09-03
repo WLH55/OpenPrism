@@ -25,7 +25,7 @@ _Avoid_: 消息列表、待办
 _Avoid_: 聊天记录、历史文件
 
 **LlmFailure**:
-所有厂商错误归一化后的中立错误事实，携带稳定 code（AUTH / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT / EMPTY_RESPONSE / CONTEXT_WINDOW_EXCEEDED / ABORTED）。全链路只认 code，不解析文案。
+所有厂商错误归一化后的中立错误事实，携带稳定 code（AUTH / QUOTA / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT / EMPTY_RESPONSE / CONTEXT_WINDOW_EXCEEDED / INVALID_REQUEST / ABORTED）。全链路只认 code，不解析文案。
 _Avoid_: 异常、错误消息（指这个词表时）
 
 **isError**:
@@ -67,3 +67,7 @@ _Avoid_: 速率限制、配额
 **重试预算（Retry Budget）**:
 可重试失败的有限计数，持久化于 Session Log，崩溃重启不重置；成功响应即清零。
 _Avoid_: 重试次数（内存计数意）
+
+**思维链（Reasoning）**:
+reasoning 模型在正文之前输出的思考过程，随 assistant 消息落日志、经活体流增量下发；只用于展示，绝不回传模型（wire 映射剔除、压力计量不计）。
+_Avoid_: 思考过程、reasoning_content（厂商字段名）

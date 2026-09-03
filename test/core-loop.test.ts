@@ -273,6 +273,50 @@ describe("循环层：错误与恢复", () => {
   });
 });
 
+describe("循环层：思维链", () => {
+  it("reasoning 增量只走活体流；完整思维链随 assistant 消息落日志", async () => {
+    const live: AgentLiveEvent[] = [];
+    const { agent, log } = makeAgent([{ kind: "text", text: "答案", reasoning: "先想一步再答" }]);
+    agent.subscribe((event) => live.push(event));
+    agent.followup("问");
+    await agent.whenIdle();
+    const reasoning = live
+      .filter((event) => event.type === "reasoning-delta")
+      .map((event) => (event as { text: string }).text)
+      .join("");
+    expect(reasoning).toBe("先想一步再答");
+    const assistantEvent = eventsOf(log).find(
+      (event) => event.type === "assistant/message",
+    ) as Extract<SessionEvent, { type: "assistant/message" }>;
+    expect(assistantEvent.message.reasoning).toBe("先想一步再答");
+  });
+
+  it("abort 保留部分输出含思维链", async () => {
+    const started = deferred<void>();
+    const hang = {
+      kind: "fn" as const,
+      fn: (_request: unknown, options?: LlmCallOptions): Promise<LlmResponse> =>
+        new Promise((_resolve, reject) => {
+          started.resolve();
+          options?.onReasoningDelta?.("想了一半");
+          options?.onTextDelta?.("答了一半");
+          options?.signal?.addEventListener("abort", () => reject(llmFailure("ABORTED", "x")));
+        }),
+    };
+    const { agent, log } = makeAgent([hang]);
+    agent.followup("问");
+    await started.promise;
+    agent.cancel();
+    await agent.whenIdle();
+    const partial = eventsOf(log).find(
+      (event) => event.type === "assistant/message",
+    ) as Extract<SessionEvent, { type: "assistant/message" }>;
+    expect(partial.message.interrupted).toBe(true);
+    expect(partial.message.reasoning).toBe("想了一半");
+    expect((partial.message.content[0] as { text: string }).text).toBe("答了一半");
+  });
+});
+
 describe("循环层：turn-stopping 与请求组装", () => {
   it("onTurnStopping 在自然停止前、turn/end 落日志前调用；aborted 不调用", async () => {
     const order: string[] = [];

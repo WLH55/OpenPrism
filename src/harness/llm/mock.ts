@@ -5,11 +5,12 @@ import type { LlmAdapter, LlmCallOptions, LlmRequest, LlmResponse } from "./adap
 import { llmFailure } from "./errors";
 
 export type MockScriptStep =
-  | { kind: "text"; text: string; usage?: Partial<Usage>; finishReason?: string }
+  | { kind: "text"; text: string; reasoning?: string; usage?: Partial<Usage>; finishReason?: string }
   | {
       kind: "tool-calls";
       calls: { id?: string; name: string; arguments?: unknown }[];
       text?: string;
+      reasoning?: string;
       usage?: Partial<Usage>;
       finishReason?: string;
     }
@@ -36,7 +37,12 @@ export function createMockLlmAdapter(script: MockScriptStep[]): MockLlmAdapter {
       if (step.kind === "fn") return step.fn(request, options);
 
       const text = step.kind === "text" ? step.text : (step.text ?? "");
-      // 文本分两段派发 delta，模拟流式
+      const reasoning = step.kind === "text" ? step.reasoning : (step.reasoning ?? "");
+      // 思维链先流（reasoning 模型的真实顺序），文本分两段派发 delta，模拟流式
+      if (reasoning) {
+        options?.onReasoningDelta?.(reasoning.slice(0, Math.ceil(reasoning.length / 2)));
+        options?.onReasoningDelta?.(reasoning.slice(Math.ceil(reasoning.length / 2)));
+      }
       if (text) {
         const mid = Math.ceil([...text].length / 2);
         const cps = [...text];
@@ -58,6 +64,7 @@ export function createMockLlmAdapter(script: MockScriptStep[]): MockLlmAdapter {
       const message: AssistantMessage = {
         role: "assistant",
         content: [...(text ? [{ type: "text" as const, text }] : []), ...calls],
+        ...(reasoning ? { reasoning } : {}),
       };
       const usage = step.usage
         ? {

@@ -153,6 +153,61 @@ describe("SSE 流式", () => {
     expect(response.finishReason).toBe("tool_calls");
   });
 
+  it("思维链：流式 reasoning_content 增量累积与回调；回传请求的 wire 映射剔除思维链", async () => {
+    let call = 0;
+    let secondBody: Record<string, unknown> | undefined;
+    const reasoningDeltas: string[] = [];
+    const sse = [
+      'data: {"choices":[{"delta":{"reasoning_content":"让我想想"}}]}',
+      'data: {"choices":[{"delta":{"reasoning_content":"怎么回答"}}]}',
+      'data: {"choices":[{"delta":{"content":"答案是 42"}}]}',
+      'data: {"choices":[{"finish_reason":"stop"}]}',
+      'data: [DONE]',
+      "",
+    ].join("\n\n");
+    const adapter = createOpenAICompatAdapter(
+      envWith(async (_url, init) => {
+        call += 1;
+        if (call === 1) return sseResponse(sse, 11); // 切片切开中文，验证增量解码
+        secondBody = JSON.parse(init!.body as string);
+        return sseResponse('data: {"choices":[{"delta":{"content":"好"}}]}\n\ndata: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+      }),
+      { baseURL: "https://x/v1", apiKey: "k" },
+    );
+    const request: LlmRequest = {
+      provider: "p",
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: [{ type: "text", text: "q" }] }],
+    };
+    const response = await adapter.complete(request, {
+      onReasoningDelta: (delta) => reasoningDeltas.push(delta),
+    });
+    expect(reasoningDeltas.join("")).toBe("让我想想怎么回答");
+    expect(response.message.reasoning).toBe("让我想想怎么回答");
+    expect((response.message.content[0] as { text: string }).text).toBe("答案是 42");
+
+    // 第二轮：带思维链的 assistant 消息回传，wire 上不得出现任何思维链字段
+    const messages: import("../src/harness/types").Message[] = [
+      request.messages[0]!,
+      response.message,
+      { role: "user", content: [{ type: "text", text: "再问" }] },
+    ];
+    await adapter.complete({ ...request, messages });
+    const wire = JSON.stringify(secondBody);
+    expect(wire).not.toContain("reasoning");
+    expect(wire).not.toContain("让我想想");
+  });
+
+  it("非流式 reasoning_content / reasoning 字段捕获", async () => {
+    const adapter = createOpenAICompatAdapter(
+      envWith(async () => jsonResponse({ choices: [{ message: { content: "答", reasoning_content: "推理" }, finish_reason: "stop" }] })),
+      { baseURL: "https://x/v1", apiKey: "k", stream: false },
+    );
+    const response = await adapter.complete({ provider: "p", model: "m", system: "", messages: [{ role: "user", content: [{ type: "text", text: "q" }] }] });
+    expect(response.message.reasoning).toBe("推理");
+  });
+
   it("多字节中文按单字节切片后重组无损", async () => {
     const sse = 'data: {"choices":[{"delta":{"content":"你好吗"}}]}\n\ndata: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
     const collected: string[] = [];

@@ -23,6 +23,8 @@ export interface UserMessage {
 export interface AssistantMessage {
   role: "assistant";
   content: ContentBlock[];
+  /** 思维链（reasoning 模型输出）：只展示不回传——wire 映射剔除、压力计量不计 */
+  reasoning?: string;
   /** 流被中止时已收到的部分内容（设计 §3 abort 保留部分输出） */
   interrupted?: boolean;
 }

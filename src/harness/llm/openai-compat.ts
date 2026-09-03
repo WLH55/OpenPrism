@@ -79,11 +79,11 @@ function parseArgumentsString(raw: string | undefined): unknown {
   }
 }
 
-function assembleAssistant(text: string, toolCalls: ToolCallBlock[]): AssistantMessage {
+function assembleAssistant(text: string, toolCalls: ToolCallBlock[], reasoning = ""): AssistantMessage {
   const content: AssistantMessage["content"] = [];
   if (text) content.push({ type: "text", text });
   content.push(...toolCalls);
-  return { role: "assistant", content };
+  return { role: "assistant", content, ...(reasoning ? { reasoning } : {}) };
 }
 
 function parseRetryAfterMs(header: string | null): number | undefined {
@@ -180,6 +180,12 @@ function parseNonStream(json: any): LlmResponse {
   const choice = json?.choices?.[0];
   const message = choice?.message ?? {};
   const text = typeof message.content === "string" ? message.content : "";
+  const reasoning =
+    typeof message.reasoning_content === "string"
+      ? message.reasoning_content
+      : typeof message.reasoning === "string"
+        ? message.reasoning
+        : "";
   const toolCalls: ToolCallBlock[] = (message.tool_calls ?? []).map((call: any, index: number) => ({
     type: "tool_call" as const,
     id: typeof call?.id === "string" ? call.id : `call-${index}`,
@@ -190,7 +196,7 @@ function parseNonStream(json: any): LlmResponse {
     throw llmFailure("EMPTY_RESPONSE", "completion finished with no content");
   }
   return {
-    message: assembleAssistant(text, toolCalls),
+    message: assembleAssistant(text, toolCalls, reasoning),
     usage: normalizeUsage(json?.usage),
     finishReason: typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined,
   };
@@ -207,6 +213,7 @@ async function readStream(
   const decoder = new IncrementalUtf8Decoder();
   let buffer = "";
   let text = "";
+  let reasoningText = "";
   let finishReason: string | undefined;
   let usage: Usage | undefined;
   const toolAcc = new Map<number, { id: string; name: string; args: string }>();
@@ -230,6 +237,17 @@ async function readStream(
     if (parsed.usage) usage = normalizeUsage(parsed.usage);
     const delta = parsed.choices?.[0]?.delta;
     if (delta) {
+      // 思维链增量（DeepSeek 字段 reasoning_content；部分兼容厂商叫 reasoning）
+      const reasoningDelta =
+        typeof delta.reasoning_content === "string"
+          ? delta.reasoning_content
+          : typeof delta.reasoning === "string"
+            ? delta.reasoning
+            : undefined;
+      if (reasoningDelta && reasoningDelta.length > 0) {
+        reasoningText += reasoningDelta;
+        options?.onReasoningDelta?.(reasoningDelta);
+      }
       if (typeof delta.content === "string" && delta.content.length > 0) {
         text += delta.content;
         options?.onTextDelta?.(delta.content);
@@ -322,7 +340,7 @@ async function readStream(
   }
 
   return {
-    message: assembleAssistant(text, toolCalls),
+    message: assembleAssistant(text, toolCalls, reasoningText),
     usage,
     finishReason,
   };
