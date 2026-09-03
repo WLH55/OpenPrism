@@ -386,6 +386,60 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
   });
 });
 
+
+describe("HTTP API 批次4（盘面/成长/合并归档/硬化）", () => {
+  it("安全头常在", async () => {
+    const res = await fetch(`${baseUrl}/api/health`);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+  });
+
+  it("盘面：目录/分类页/进步页/合并/归档/取消归档", async () => {
+    await fetch(`${baseUrl}/api/flows`, { ...json({ category: "盘面运动", value: 30 }), headers: { "Content-Type": "application/json", cookie } });
+    await fetch(`${baseUrl}/api/flows`, { ...json({ category: "盘面餐饮", value: 28 }), headers: { "Content-Type": "application/json", cookie } });
+    const panels = (await (await fetch(`${baseUrl}/api/panels`, { headers: { cookie } })).json()) as { categories: { category: string; count: number }[] };
+    const names = panels.categories.map((c) => c.category);
+    expect(names).toContain("盘面运动");
+    expect(names).toContain("盘面餐饮");
+
+    const category = (await (await fetch(`${baseUrl}/api/panels/category/盘面运动?period=week`, { headers: { cookie } })).json()) as { count: number; daily: unknown[] };
+    expect(category.count).toBe(1);
+    expect(category.daily).toHaveLength(30);
+
+    const progress = (await (await fetch(`${baseUrl}/api/panels/progress`, { headers: { cookie } })).json()) as { streakDays: number; trend14: unknown[] };
+    expect(progress.streakDays).toBeGreaterThanOrEqual(1);
+    expect(progress.trend14).toHaveLength(14);
+
+    // 合并：盘面运动 → 盘面餐饮
+    await fetch(`${baseUrl}/api/panels/merge`, { ...json({ from: "盘面运动", to: "盘面餐饮" }), headers: { "Content-Type": "application/json", cookie } });
+    const afterMerge = (await (await fetch(`${baseUrl}/api/panels`, { headers: { cookie } })).json()) as { categories: { category: string; count: number }[] };
+    expect(afterMerge.categories.map((c) => c.category)).not.toContain("盘面运动");
+    expect(afterMerge.categories.find((c) => c.category === "盘面餐饮")!.count).toBeGreaterThanOrEqual(2);
+
+    // 归档/取消
+    await fetch(`${baseUrl}/api/panels/archive`, { ...json({ name: "盘面餐饮" }), headers: { "Content-Type": "application/json", cookie } });
+    const archived = (await (await fetch(`${baseUrl}/api/panels`, { headers: { cookie } })).json()) as { categories: { category: string }[]; archived: string[] };
+    expect(archived.categories.map((c) => c.category)).not.toContain("盘面餐饮");
+    expect(archived.archived).toContain("盘面餐饮");
+    await fetch(`${baseUrl}/api/panels/unarchive`, { ...json({ name: "盘面餐饮" }), headers: { "Content-Type": "application/json", cookie } });
+    const restored = (await (await fetch(`${baseUrl}/api/panels`, { headers: { cookie } })).json()) as { categories: { category: string }[] };
+    expect(restored.categories.map((c) => c.category)).toContain("盘面餐饮");
+  });
+
+  it("认证限速：同 IP+用户名 1 分钟超 10 次尝试 → 429", async () => {
+    let saw429 = false;
+    for (let i = 0; i < 12; i++) {
+      const res = await fetch(`${baseUrl}/api/auth/login`, json({ username: "ratelimit-target", password: "wrong-password" }));
+      if (res.status === 429) {
+        saw429 = true;
+        break;
+      }
+    }
+    expect(saw429).toBe(true);
+  });
+});
+
   it("模型配置：PUT 后 GET 只回 hasKey，永不回 Key；测试连接走注入 adapter", async () => {
     const put = await fetch(`${baseUrl}/api/model`, {
       method: "PUT",

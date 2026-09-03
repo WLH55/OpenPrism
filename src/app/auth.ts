@@ -2,6 +2,8 @@
 // 会话令牌 = 内存 Map + 注入时钟（自部署单进程语义；重启即全员下线，可接受）。
 
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import type { FileIO } from "../harness/index";
 
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
@@ -58,17 +60,57 @@ export async function appendUser(fileIO: FileIO, usersFile: string, user: UserRe
   await fileIO.appendLine(usersFile, JSON.stringify(user));
 }
 
+export interface SessionPersist {
+  fileIO: FileIO;
+  file: string;
+}
+
+interface SessionEventRow {
+  op: "issue" | "revoke";
+  token: string;
+  uid?: string;
+  expiresAt?: number;
+}
+
 export class SessionStore {
   private sessions = new Map<string, { uid: string; expiresAt: number }>();
 
   constructor(
     private now: () => number,
     private ttlMs: number = 30 * 24 * 60 * 60 * 1000,
+    private persist?: SessionPersist,
   ) {}
+
+  /** 重放事件行恢复（批次4：重启不掉线）；坏行跳过 */
+  static async load(persist: SessionPersist, now: () => number, ttlMs?: number): Promise<SessionStore> {
+    const store = new SessionStore(now, ttlMs, persist);
+    for (const line of await persist.fileIO.readAll(persist.file)) {
+      try {
+        const row = JSON.parse(line) as SessionEventRow;
+        if (row?.op === "issue" && row.token && row.uid !== undefined && row.expiresAt !== undefined) {
+          store.sessions.set(row.token, { uid: row.uid, expiresAt: row.expiresAt });
+        } else if (row?.op === "revoke" && row.token) {
+          store.sessions.delete(row.token);
+        }
+      } catch {
+        // 坏行
+      }
+    }
+    return store;
+  }
+
+  private writeEvent(row: SessionEventRow): void {
+    if (!this.persist) return;
+    // 同步落盘：issue/revoke 是同步 API，持久化不能留竞态窗口（重启前一瞬的签发不丢）
+    mkdirSync(dirname(this.persist.file), { recursive: true });
+    appendFileSync(this.persist.file, JSON.stringify(row) + "\n", "utf8");
+  }
 
   issue(uid: string): string {
     const token = randomBytes(24).toString("hex"); // 48 hex 字符
-    this.sessions.set(token, { uid, expiresAt: this.now() + this.ttlMs });
+    const expiresAt = this.now() + this.ttlMs;
+    this.sessions.set(token, { uid, expiresAt });
+    this.writeEvent({ op: "issue", token, uid, expiresAt });
     return token;
   }
 
@@ -85,5 +127,6 @@ export class SessionStore {
 
   revoke(token: string): void {
     this.sessions.delete(token);
+    this.writeEvent({ op: "revoke", token });
   }
 }

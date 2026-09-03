@@ -95,3 +95,19 @@ describe("SessionStore", () => {
     expect(s.verify(undefined)).toBeNull();
   });
 });
+
+describe("SessionStore 持久化（批次4：重启不掉线）", () => {
+  it("issue/revoke 落事件行；load 重放恢复（撤销的仍撤销）", async () => {
+    const file = join(root, "sessions.jsonl");
+    let now = 0;
+    const s1 = new SessionStore(() => now, 1000, { fileIO: nodeFileIO, file });
+    const keep = s1.issue("u1");
+    const gone = s1.issue("u2");
+    s1.revoke(gone);
+    now = 500; // 时间前进但仍在 TTL 内
+    const s2 = await SessionStore.load({ fileIO: nodeFileIO, file }, () => now);
+    expect(s2.verify(keep)).toBe("u1");
+    expect(s2.verify(gone)).toBeNull();
+  });
+});
+

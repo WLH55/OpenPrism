@@ -228,3 +228,31 @@ export const api3 = {
   markAllRead: () => request<{ ok: boolean }>("/api/notifications/read", { method: "POST", body: JSON.stringify({ all: true }) }),
   markRead: (seq: number) => request<{ ok: boolean }>("/api/notifications/read", { method: "POST", body: JSON.stringify({ seq }) }),
 };
+
+// ── 批次 4：盘面 / 成长 ──────────────────────────────────
+export interface CategoryStatLoose { category: string; lastTs: number; count: number; }
+export interface CategoryPeriodLoose {
+  period: "today" | "week" | "month" | "year";
+  category: string;
+  count: number;
+  total: number;
+  daily: { date: string; count: number; total: number }[];
+  flows: TodayFlowView[];
+}
+export interface ProgressLoose {
+  streakDays: number;
+  completion: { done: number; total: number; rate: number };
+  weekOverWeek: { category: string; thisWeek: number; lastWeek: number; deltaPct: number | null }[];
+  trend14: { date: string; count: number }[];
+}
+
+export const api4 = {
+  panels: () => request<{ categories: CategoryStatLoose[]; archived: string[] }>("/api/panels"),
+  categoryPanel: (name: string, period: string) =>
+    request<CategoryPeriodLoose>(`/api/panels/category/${encodeURIComponent(name)}?period=${period}`),
+  progress: () => request<ProgressLoose>("/api/panels/progress"),
+  mergeCategory: (from: string, to: string) =>
+    request<{ moved: number }>("/api/panels/merge", { method: "POST", body: JSON.stringify({ from, to }) }),
+  archiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/archive", { method: "POST", body: JSON.stringify({ name }) }),
+  unarchiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/unarchive", { method: "POST", body: JSON.stringify({ name }) }),
+};

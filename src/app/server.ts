@@ -11,7 +11,7 @@ import { ensureUserSandbox } from "./store";
 import { appendUser, hashPassword, SessionStore, verifyPassword, type UserRecord } from "./auth";
 import { open, readModelConfig, seal, writeModelConfig, type ModelConfig } from "./secretbox";
 import type { Ledger } from "./ledger";
-import { todayView } from "./fold";
+import { categoryView, listCategories, progressView, todayView } from "./fold";
 import { ModelNotConfiguredError, type ConversationStore } from "./conversations";
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
@@ -25,6 +25,8 @@ export interface ServerDeps {
   masterKey: Buffer;
   /** 启动时载入、注册时追加的共享用户表（键 = username） */
   users: Map<string, UserRecord>;
+  /** uid 二级索引（可选；认证查询免线性扫描） */
+  usersByUid?: Map<string, UserRecord>;
   sessions: SessionStore;
   conversations: ConversationStore;
   /** 惰性打开该用户账本（today/flows/void/checkin 与会话装配共用同一实例缓存，由宿主实现） */
@@ -145,16 +147,39 @@ async function defaultModelTester(deps: ServerDeps, uid: string, config: ModelCo
   });
 }
 
+function setSecurityHeaders(res: ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+}
+
+/** 认证限速：每 IP+用户名 60s 窗口 10 次（内存态，单进程自部署/小公网够用） */
+class AuthRateLimiter {
+  private hits = new Map<string, { count: number; resetAt: number }>();
+  constructor(private limit = 10, private windowMs = 60_000) {}
+  take(key: string, now: number): boolean {
+    const entry = this.hits.get(key);
+    if (!entry || now >= entry.resetAt) {
+      this.hits.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    entry.count += 1;
+    return entry.count <= this.limit;
+  }
+}
+
 export function createAppServer(deps: ServerDeps): Server {
+  const limiter = new AuthRateLimiter();
   return createServer((req, res) => {
-    handle(deps, req, res).catch((error) => {
+    setSecurityHeaders(res);
+    handle(deps, req, res, limiter).catch((error) => {
       if (!res.headersSent) sendError(res, 500, String((error as Error)?.message ?? error));
       else res.end();
     });
   });
 }
 
-async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerResponse, limiter: AuthRateLimiter): Promise<void> {
   const url = new URL(req.url ?? "/", "http://local");
   const path = url.pathname;
   const method = req.method ?? "GET";
@@ -167,6 +192,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (method === "POST" && path === "/api/auth/register") {
     const body = (await readBody(req)) as { username?: string; password?: string };
     const username = String(body.username ?? "").trim();
+    if (!limiter.take(`${req.socket.remoteAddress ?? "?"}|${username}`, deps.env.now())) {
+      return sendError(res, 429, "尝试太频繁，一分钟后再试");
+    }
     const password = String(body.password ?? "");
     if (username.length < 2 || username.length > 32 || /\s/.test(username)) {
       return sendError(res, 400, "username 需要 2-32 个字符且不含空白");
@@ -177,6 +205,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const user: UserRecord = { uid, username, password: await hashPassword(password), createdTs: deps.env.now() };
     await appendUser(deps.fileIO, deps.paths.usersFile, user);
     deps.users.set(username, user);
+    deps.usersByUid?.set(uid, user);
     await ensureUserSandbox(deps.paths, uid);
     await deps.ledgerFor(uid); // 注册即建账本文件
     const token = deps.sessions.issue(uid);
@@ -185,7 +214,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   if (method === "POST" && path === "/api/auth/login") {
     const body = (await readBody(req)) as { username?: string; password?: string };
-    const user = deps.users.get(String(body.username ?? ""));
+    const usernameKey = String(body.username ?? "");
+    if (!limiter.take(`${req.socket.remoteAddress ?? "?"}|${usernameKey}`, deps.env.now())) {
+      return sendError(res, 429, "尝试太频繁，一分钟后再试");
+    }
+    const user = deps.users.get(usernameKey);
     if (!user || !(await verifyPassword(String(body.password ?? ""), user.password))) {
       return sendError(res, 401, "用户名或密码错误");
     }
@@ -201,7 +234,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── 登录门 ─────────────────────────────────────────────
   const uid = deps.sessions.verify(cookieToken(req));
-  const user = uid ? [...deps.users.values()].find((u) => u.uid === uid) : undefined;
+  const user = uid ? (deps.usersByUid?.get(uid) ?? [...deps.users.values()].find((u) => u.uid === uid)) : undefined;
   if (!uid || !user) return sendError(res, 401, "unauthorized");
 
   if (method === "GET" && path === "/api/auth/me") {
@@ -574,6 +607,80 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const body = (await readBody(req)) as { seq?: number; all?: boolean };
     await deps.notifications.markRead(uid, body.all === true ? "all" : Number(body.seq));
     return sendJson(res, 200, { ok: true });
+  }
+
+
+  // ── 盘面/成长（D7/D11.3，确定性折叠） ──────────────────
+  const archiveFile = () => join(deps.paths.userDir(uid), "archives.json");
+  const readArchived = async (): Promise<string[]> => {
+    const lines = await deps.fileIO.readAll(archiveFile());
+    if (lines.length === 0) return [];
+    try {
+      const parsed = JSON.parse(lines[lines.length - 1]!) as string[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const writeArchived = async (list: string[]): Promise<void> => {
+    const { mkdir, writeFile, rename } = await import("node:fs/promises");
+    const file = archiveFile();
+    await mkdir(join(file, ".."), { recursive: true });
+    await writeFile(file + ".tmp", JSON.stringify(list), "utf8");
+    await rename(file + ".tmp", file);
+  };
+
+  if (path === "/api/panels" && method === "GET") {
+    const ledger = await deps.ledgerFor(uid);
+    return sendJson(res, 200, {
+      categories: listCategories(ledger.readAll(), await readArchived()),
+      archived: await readArchived(),
+    });
+  }
+  if (path === "/api/panels/progress" && method === "GET") {
+    const ledger = await deps.ledgerFor(uid);
+    return sendJson(res, 200, progressView(ledger.readAll(), deps.env.now(), -new Date().getTimezoneOffset()));
+  }
+  if (path === "/api/panels/merge" && method === "POST") {
+    const body = (await readBody(req)) as { from?: string; to?: string };
+    const from = String(body.from ?? "").trim();
+    const to = String(body.to ?? "").trim();
+    if (from === "" || to === "" || from === to) return sendError(res, 400, "from/to 必填且不同");
+    const ledger = await deps.ledgerFor(uid);
+    const flows = ledger.activeRecords().filter((r) => r.kind === "event" && (r as { category: string }).category === from);
+    for (const record of flows) {
+      const flow = record as import("./ledger").FlowRecord;
+      await ledger.append({ kind: "void", source: "ui", targetSeq: flow.seq, reason: `合并到「${to}」` });
+      await ledger.append({
+        kind: "event",
+        source: "ui",
+        time: flow.time,
+        category: to,
+        ...(flow.note !== undefined ? { note: flow.note } : {}),
+        ...(flow.value !== undefined ? { value: flow.value } : {}),
+        ...(flow.unit !== undefined ? { unit: flow.unit } : {}),
+      });
+    }
+    return sendJson(res, 200, { moved: flows.length });
+  }
+  if ((path === "/api/panels/archive" || path === "/api/panels/unarchive") && method === "POST") {
+    const body = (await readBody(req)) as { name?: string };
+    const name = String(body.name ?? "").trim();
+    if (name === "") return sendError(res, 400, "name 必填");
+    const current = await readArchived();
+    const next = path.endsWith("/archive")
+      ? current.includes(name) ? current : [...current, name]
+      : current.filter((n) => n !== name);
+    await writeArchived(next);
+    return sendJson(res, 200, { archived: next });
+  }
+  const panelCategory = /^\/api\/panels\/category\/([^/]+)$/.exec(path);
+  if (panelCategory && method === "GET") {
+    const name = decodeURIComponent(panelCategory[1]!);
+    const periodParam = url.searchParams.get("period") ?? "week";
+    const period = (["today", "week", "month", "year"] as const).find((p) => p === periodParam) ?? "week";
+    const ledger = await deps.ledgerFor(uid);
+    return sendJson(res, 200, categoryView(ledger.readAll(), { category: name, period, now: deps.env.now(), tzOffsetMinutes: -new Date().getTimezoneOffset() }));
   }
 
   // ── 静态资源（web/dist） ───────────────────────────────
