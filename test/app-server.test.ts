@@ -10,6 +10,10 @@ import { appPaths, type AppPaths } from "../src/app/store";
 import { SessionStore, type UserRecord } from "../src/app/auth";
 import { Ledger } from "../src/app/ledger";
 import { ConversationStore } from "../src/app/conversations";
+import { AgentStore } from "../src/app/agents";
+import { SkillStore } from "../src/app/skills";
+import { McpRegistry } from "../src/app/mcp";
+import { MemoryStore } from "../src/app/memory";
 import { createAppServer } from "../src/app/server";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { sleep } from "./helpers";
@@ -46,17 +50,25 @@ beforeAll(async () => {
       calls: [{ name: "record_flow", arguments: { category: "餐饮", value: 28, unit: "¥", note: "午餐" } }],
     },
     { kind: "text", text: "记好了，午餐 28。" },
-    { kind: "text", text: "在的。" },
+    { kind: "text", text: "<!-- slot: recent -->\n测试期记忆已凝练。" }, // consolidate 用（排在聊天步骤之后）
   ]);
 
+  const agents = new AgentStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `aid-${Math.random().toString(36).slice(2, 8)}` });
+  const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
+  const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "mc-x" });
+  const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => 5000 });
   const conversations = new ConversationStore({
     env: nodeEnv,
     fileIO: nodeFileIO,
     paths,
-    ledgerFor: async (uid) => await ledgerFor(uid),
+    ledgerFor,
     modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
     adapterFactory: () => adapter as LlmAdapter,
     now: () => Date.now(),
+    agents,
+    skills,
+    mcps,
+    memory,
   });
 
   const server = createAppServer({
@@ -69,6 +81,11 @@ beforeAll(async () => {
     conversations,
     ledgerFor,
     modelTester: async () => {}, // 零网络：注入 fake 测试器
+    adapterFor: async () => ({ adapter, model: "mock-1" }), // consolidate 也走同一 mock 脚本（末位步骤）
+    agents,
+    skills,
+    mcps,
+    memory,
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
@@ -197,6 +214,116 @@ describe("HTTP API", () => {
     });
     expect(missing.status).toBe(404);
   });
+
+
+describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
+  it("agents：创建→列表→详情→改人设（名字重推导）→改绑定→删除", async () => {
+    const created = (await (await fetch(`${baseUrl}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ persona: "# 教练\n盯训练。" }),
+    })).json()) as { id: string; name: string };
+    expect(created.name).toBe("教练");
+    expect((await (await fetch(`${baseUrl}/api/agents`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(1);
+    const detail = (await (await fetch(`${baseUrl}/api/agents/${created.id}`, { headers: { cookie } })).json()) as { persona: string };
+    expect(detail.persona).toContain("盯训练");
+    const renamed = (await (await fetch(`${baseUrl}/api/agents/${created.id}/persona`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ markdown: "# 学姐\n温柔。" }),
+    })).json()) as { name: string };
+    expect(renamed.name).toBe("学姐");
+    const bound = await fetch(`${baseUrl}/api/agents/${created.id}/binding`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ binding: { tools: ["query_ledger"], skills: [], mcps: [] } }),
+    });
+    expect(bound.status).toBe(200);
+    expect(await (await fetch(`${baseUrl}/api/agents/${created.id}`, { method: "DELETE", headers: { cookie } })).json()).toMatchObject({ ok: true });
+    expect((await (await fetch(`${baseUrl}/api/agents`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(0);
+  });
+
+  it("skills：坏内容 400；好内容安装/列表/正文/删除", async () => {
+    const bad = await fetch(`${baseUrl}/api/skills`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ content: "没有 frontmatter" }),
+    });
+    expect(bad.status).toBe(400);
+    const good = (await (await fetch(`${baseUrl}/api/skills`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ content: "---\nname: 测试技能\ndescription: 测试用\n---\n\n# 正文\n内容" }),
+    })).json()) as { id: string; name: string };
+    expect(good.name).toBe("测试技能");
+    const body = (await (await fetch(`${baseUrl}/api/skills/${good.id}/body`, { headers: { cookie } })).json()) as { body: string };
+    expect(body.body).toContain("# 正文");
+    await fetch(`${baseUrl}/api/skills/${good.id}`, { method: "DELETE", headers: { cookie } });
+    expect((await (await fetch(`${baseUrl}/api/skills`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(0);
+  });
+
+  it("mcps：非法 URL 400；未知 id 404", async () => {
+    const bad = await fetch(`${baseUrl}/api/mcps`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ name: "x", url: "ftp://bad" }),
+    });
+    expect(bad.status).toBe(400);
+    const missing = await fetch(`${baseUrl}/api/mcps/mc-nope/tools`, { method: "POST", headers: { cookie } });
+    expect(missing.status).toBe(404);
+    const delMissing = await fetch(`${baseUrl}/api/mcps/mc-nope`, { method: "DELETE", headers: { cookie } });
+    expect(delMissing.status).toBe(404);
+  });
+
+  it("memory：空槽 → PUT slot → consolidate（注入 adapter，changed=true）→ 槽位落盘", async () => {
+    const before = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as { slots: Record<string, string>; meta: { runs: number } };
+    expect(before.slots.profile ?? "").toBe("");
+    expect(before.meta.runs).toBe(0);
+    expect((await fetch(`${baseUrl}/api/memory/profile`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ markdown: "工程师" }),
+    })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/memory/badslot`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ markdown: "x" }),
+    })).status).toBe(400);
+    const consolidated = (await (await fetch(`${baseUrl}/api/memory/consolidate`, { method: "POST", headers: { cookie } })).json()) as { changed: boolean };
+    expect(consolidated.changed).toBe(true);
+    const after = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as { slots: Record<string, string>; meta: { runs: number } };
+    expect(after.slots.recent).toContain("测试期记忆已凝练");
+    expect(after.meta.runs).toBe(1);
+  });
+
+  it("会话 meta/切换：默认空 → 切到教练 → meta 生效；未知 404", async () => {
+    const agent = (await (await fetch(`${baseUrl}/api/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ persona: "# 教练\n盯。" }),
+    })).json()) as { id: string };
+    const conv = (await (await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: "{}",
+    })).json()) as { id: string };
+    const meta0 = (await (await fetch(`${baseUrl}/api/conversations/${conv.id}/meta`, { headers: { cookie } })).json()) as { switches: unknown[] };
+    expect(meta0.switches).toEqual([]);
+    expect((await fetch(`${baseUrl}/api/conversations/${conv.id}/agent`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ agentId: agent.id }),
+    })).status).toBe(200);
+    const meta1 = (await (await fetch(`${baseUrl}/api/conversations/${conv.id}/meta`, { headers: { cookie } })).json()) as { agentId?: string; switches: unknown[] };
+    expect(meta1.agentId).toBe(agent.id);
+    expect(meta1.switches).toHaveLength(1);
+    expect((await fetch(`${baseUrl}/api/conversations/${conv.id}/agent`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ agentId: "aid-nope" }),
+    })).status).toBe(404);
+  });
+});
 
   it("模型配置：PUT 后 GET 只回 hasKey，永不回 Key；测试连接走注入 adapter", async () => {
     const put = await fetch(`${baseUrl}/api/model`, {

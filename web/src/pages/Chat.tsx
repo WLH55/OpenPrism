@@ -1,15 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, openConversationStream, type ConversationEntry, type LiveEventLoose, type SessionEventLoose } from "../api";
+import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type SessionEventLoose } from "../api";
 
-/** 渲染项：从会话日志事件折叠出的 UI 气泡/回执 */
+/** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
   | { kind: "user"; key: string; text: string }
   | { kind: "assistant"; key: string; text: string; reasoning: string }
-  | { kind: "receipt"; key: string; name: string; ok: boolean; text: string };
+  | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
+  | { kind: "switch"; key: string; label: string };
 
-function foldEvents(events: SessionEventLoose[]): RenderItem[] {
+function foldEvents(events: SessionEventLoose[], switches: { ts: number; agentId: string }[] = [], agentName: (id: string) => string): RenderItem[] {
   const items: RenderItem[] = [];
   for (const event of events) {
+    // 切换分割线：插到第一条晚于切换时刻的事件前（D4.2 消息归属可视）
+    for (const sw of switches) {
+      if ((event.ts ?? 0) >= sw.ts && !items.some((i) => i.kind === "switch" && i.key === `sw-${sw.ts}`)) {
+        items.push({ kind: "switch", key: `sw-${sw.ts}`, label: `${agentName(sw.agentId)} 加入对话` });
+      }
+    }
     if (event.type === "user/message") {
       const text = (event.message?.content ?? []).map((b) => b.text ?? "").join("");
       items.push({ kind: "user", key: `u${event.seq}`, text });
@@ -40,6 +47,8 @@ function foldEvents(events: SessionEventLoose[]): RenderItem[] {
 export function Chat() {
   const [conversations, setConversations] = useState<ConversationEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentLoose[]>([]);
+  const [currentAgentId, setCurrentAgentId] = useState<string | undefined>(undefined);
   const [items, setItems] = useState<RenderItem[]>([]);
   // 流式中的增量（turn 结束后以日志为准清空）
   const [stream, setStream] = useState<{ reasoning: string; text: string } | null>(null);
@@ -50,15 +59,31 @@ export function Chat() {
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
 
+  const agentName = useCallback(
+    (id: string): string => agents.find((a) => a.id === id)?.name ?? "新伙伴",
+    [agents],
+  );
+
   const reloadConversations = useCallback(async () => {
     const list = await api.listConversations();
     setConversations(list);
     return list;
   }, []);
 
-  const loadEvents = useCallback(async (cid: string) => {
-    const events = await api.conversationEvents(cid);
-    setItems(foldEvents(events));
+  const loadEvents = useCallback(
+    async (cid: string) => {
+      const [events, meta] = await Promise.all([api.conversationEvents(cid), api2.convMeta(cid).catch(() => ({ switches: [] as { ts: number; agentId: string }[] }) as ConversationMetaLoose)]);
+      setItems(foldEvents(events, meta.switches, agentName));
+      setCurrentAgentId(meta.agentId);
+    },
+    [agentName],
+  );
+
+  useEffect(() => {
+    void api2
+      .listAgents()
+      .then(setAgents)
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -162,9 +187,46 @@ export function Chat() {
             {banner}
           </div>
         )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface)" }}>
+          <span className="muted">当前伙伴</span>
+          <select
+            className="input"
+            style={{ width: "auto", padding: "4px 10px" }}
+            value={currentAgentId ?? ""}
+            onChange={async (e) => {
+              const value = e.target.value;
+              if (!activeId) return;
+              try {
+                if (value === "") {
+                  // 切回默认助手：后端 meta.agentId 置空语义暂以"新建默认会话代替"——直接不处理
+                  return;
+                }
+                await api2.switchAgent(activeId, value);
+                setCurrentAgentId(value);
+                await loadEvents(activeId);
+              } catch (err) {
+                setBanner(`切换失败：${(err as Error).message}`);
+              }
+            }}
+          >
+            <option value="">默认助手</option>
+            {agents.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.name}
+              </option>
+            ))}
+          </select>
+          <span className="muted" style={{ fontSize: 12 }}>
+            切换后下一条消息由新伙伴接话，历史不丢
+          </span>
+        </div>
         <div className="chat-scroll" ref={scrollRef}>
           {items.map((item) =>
-            item.kind === "user" ? (
+            item.kind === "switch" ? (
+              <div key={item.key} style={{ alignSelf: "center", fontSize: 12, color: "var(--ink-3)", borderTop: "1px dashed var(--line)", paddingTop: 6, width: "100%", textAlign: "center" }}>
+                {item.label}
+              </div>
+            ) : item.kind === "user" ? (
               <div key={item.key} className="bubble-user">
                 {item.text}
               </div>

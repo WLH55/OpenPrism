@@ -119,3 +119,63 @@ export function openConversationStream(cid: string, onEvent: (event: LiveEventLo
   };
   return () => source.close();
 }
+
+// ── 批次 2：伙伴 / 技能 / MCP / 记忆 ────────────────────
+export interface AgentBindingLoose {
+  tools?: string[];
+  skills: string[];
+  mcps: string[];
+}
+export interface AgentLoose {
+  id: string;
+  name: string;
+  createdTs: number;
+  binding: AgentBindingLoose;
+  persona?: string;
+}
+export interface SkillLoose {
+  id: string;
+  name: string;
+  description: string;
+  whenToUse?: string;
+}
+export interface McpLoose {
+  id: string;
+  name: string;
+  url: string;
+}
+export interface ConversationMetaLoose {
+  agentId?: string;
+  switches: { ts: number; agentId: string }[];
+}
+
+export const api2 = {
+  listAgents: () => request<AgentLoose[]>("/api/agents"),
+  createAgent: (persona: string, binding?: AgentBindingLoose) =>
+    request<AgentLoose>("/api/agents", { method: "POST", body: JSON.stringify({ persona, ...(binding ? { binding } : {}) }) }),
+  getAgent: (id: string) => request<AgentLoose & { persona: string }>(`/api/agents/${id}`),
+  updatePersona: (id: string, markdown: string) =>
+    request<{ name: string }>(`/api/agents/${id}/persona`, { method: "PUT", body: JSON.stringify({ markdown }) }),
+  updateBinding: (id: string, binding: AgentBindingLoose) =>
+    request<{ ok: boolean }>(`/api/agents/${id}/binding`, { method: "PUT", body: JSON.stringify({ binding }) }),
+  deleteAgent: (id: string) => request<{ ok: boolean }>(`/api/agents/${id}`, { method: "DELETE" }),
+
+  listSkills: () => request<SkillLoose[]>("/api/skills"),
+  installSkill: (content: string) => request<SkillLoose>("/api/skills", { method: "POST", body: JSON.stringify({ content }) }),
+  skillBody: (id: string) => request<{ body: string }>(`/api/skills/${id}/body`),
+  deleteSkill: (id: string) => request<{ ok: boolean }>(`/api/skills/${id}`, { method: "DELETE" }),
+
+  listMcps: () => request<McpLoose[]>("/api/mcps"),
+  addMcp: (name: string, url: string) => request<McpLoose>("/api/mcps", { method: "POST", body: JSON.stringify({ name, url }) }),
+  deleteMcp: (id: string) => request<{ ok: boolean }>(`/api/mcps/${id}`, { method: "DELETE" }),
+  mcpTools: (id: string) => request<{ tools: string[] }>(`/api/mcps/${id}/tools`, { method: "POST" }),
+
+  getMemory: () => request<{ slots: Record<string, string>; meta: { lastRunTs?: number; runs: number } }>("/api/memory"),
+  putMemorySlot: (slot: string, markdown: string) =>
+    request<{ ok: boolean }>(`/api/memory/${slot}`, { method: "PUT", body: JSON.stringify({ markdown }) }),
+  consolidateMemory: () => request<{ changed: boolean }>("/api/memory/consolidate", { method: "POST" }),
+
+  convMeta: (cid: string) => request<ConversationMetaLoose>(`/api/conversations/${cid}/meta`),
+  switchAgent: (cid: string, agentId: string) =>
+    request<{ ok: boolean }>(`/api/conversations/${cid}/agent`, { method: "PUT", body: JSON.stringify({ agentId }) }),
+};
