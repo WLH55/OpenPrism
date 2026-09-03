@@ -37,6 +37,10 @@ export interface ServerDeps {
   skills: SkillStore;
   mcps: McpRegistry;
   memory: MemoryStore;
+  tasks: import("./tasks").TaskStore;
+  notifications: import("./notify").NotificationStore;
+  /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
+  taskRunner(uid: string, task: import("./tasks").TaskDef): Promise<void>;
   staticDir?: string;
 }
 
@@ -516,6 +520,60 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       done: body.done ?? true,
     });
     return sendJson(res, 200, { ok: true, ts: record.ts });
+  }
+
+
+  // ── 定时任务（D6） ─────────────────────────────────────
+  if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
+    if (method === "GET") return sendJson(res, 200, await deps.tasks.list(uid));
+    const body = (await readBody(req)) as Record<string, unknown>;
+    try {
+      const task = await deps.tasks.create(uid, body as never);
+      return sendJson(res, 200, task);
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  const taskMatch = /^\/api\/tasks\/([^/]+)(\/[^/]*)?$/.exec(path);
+  if (taskMatch) {
+    const tid = decodeURIComponent(taskMatch[1]!);
+    const sub = taskMatch[2] ?? "";
+    try {
+      if (sub === "" && method === "PUT") {
+        const body = (await readBody(req)) as Record<string, unknown>;
+        return sendJson(res, 200, await deps.tasks.update(uid, tid, body as never));
+      }
+      if (sub === "" && method === "DELETE") {
+        await deps.tasks.remove(uid, tid);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/runs" && method === "GET") {
+        return sendJson(res, 200, await deps.tasks.runs(uid, tid));
+      }
+      if (sub === "/run" && method === "POST") {
+        const task = await deps.tasks.get(uid, tid);
+        if (!task) return sendError(res, 404, "task 不存在");
+        void deps.taskRunner(uid, task).then(
+          async () => deps.tasks.recordRun(uid, tid, { ts: deps.env.now(), status: "ran" }),
+          async (error) =>
+            deps.tasks.recordRun(uid, tid, { ts: deps.env.now(), status: "failed", detail: String((error as Error).message).slice(0, 200) }),
+        );
+        return sendJson(res, 202, { ok: true });
+      }
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
+    }
+  }
+
+  // ── 通知（D9 首版站内） ────────────────────────────────
+  if (path === "/api/notifications" && method === "GET") {
+    const unreadOnly = url.searchParams.get("unread") === "1";
+    return sendJson(res, 200, await deps.notifications.list(uid, { unreadOnly }));
+  }
+  if (path === "/api/notifications/read" && method === "POST") {
+    const body = (await readBody(req)) as { seq?: number; all?: boolean };
+    await deps.notifications.markRead(uid, body.all === true ? "all" : Number(body.seq));
+    return sendJson(res, 200, { ok: true });
   }
 
   // ── 静态资源（web/dist） ───────────────────────────────

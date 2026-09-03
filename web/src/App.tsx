@@ -7,8 +7,10 @@ import { Settings } from "./pages/Settings";
 import { Agents } from "./pages/Agents";
 import { Skills } from "./pages/Skills";
 import { Memory } from "./pages/Memory";
+import { Tasks } from "./pages/Tasks";
+import { Bell } from "./pages/Bell";
 
-type View = "chat" | "today" | "agents" | "skills" | "memory" | "settings";
+type View = "chat" | "today" | "agents" | "skills" | "memory" | "tasks" | "settings";
 
 export function App() {
   const [username, setUsername] = useState<string | null>(null);
@@ -35,6 +37,7 @@ export function App() {
     { key: "agents", label: "伙伴" },
     { key: "skills", label: "技能" },
     { key: "memory", label: "记忆" },
+    { key: "tasks", label: "提醒" },
     { key: "settings", label: "设置" },
   ];
 
@@ -54,6 +57,7 @@ export function App() {
           ))}
         </nav>
         <span className="spacer" />
+        <Bell />
         <span className="muted">{username}</span>
         <button
           className="btn ghost small"
@@ -84,6 +88,7 @@ export function App() {
       {view === "agents" && <Agents key="agents" />}
       {view === "skills" && <Skills key="skills" />}
       {view === "memory" && <Memory key="memory" />}
+      {view === "tasks" && <Tasks key="tasks" />}
       {view === "settings" && <Settings key="settings" />}
     </>
   );

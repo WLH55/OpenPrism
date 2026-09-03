@@ -14,6 +14,8 @@ import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
+import { Scheduler, TaskStore, type TaskDef } from "./tasks";
+import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 
@@ -59,6 +61,8 @@ async function main(): Promise<void> {
   const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => Date.now() });
+  const tasks = new TaskStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const notifications = new NotificationStore({ fileIO: nodeFileIO, paths, now: () => Date.now() });
 
   const conversations = new ConversationStore({
     env: nodeEnv,
@@ -72,7 +76,22 @@ async function main(): Promise<void> {
     skills,
     mcps,
     memory,
+    tasks,
   });
+
+  // 任务执行体（调度/手动共用）：离线回合跑进任务专属会话，收口后把助手文本落站内通知
+  const taskRunner = async (uidRun: string, task: TaskDef): Promise<void> => {
+    const agent = await conversations.taskAgent(uidRun, task.id, task.agentId);
+    agent.followup(task.instruction);
+    await agent.whenIdle();
+    const events = agent.sessionLog.readAll();
+    const last = [...events].reverse().find((e) => e.type === "assistant/message");
+    const text =
+      last && last.type === "assistant/message"
+        ? last.message.content.filter((b) => b.type === "text").map((b) => (b as { text?: string }).text ?? "").join("")
+        : "（任务已执行，无文本输出）";
+    await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: text.slice(0, 500) });
+  };
 
   // 记忆凝练 adapter：现读用户 BYOK 配置
   const adapterFor = async (uid: string) => {
@@ -99,7 +118,24 @@ async function main(): Promise<void> {
     skills,
     mcps,
     memory,
+    tasks,
+    notifications,
+    taskRunner,
     ...(existsSync(staticDir) ? { staticDir } : {}),
+  });
+
+  const scheduler = new Scheduler({
+    uids: () => [...users.values()].map((u) => u.uid),
+    tasks,
+    runTask: taskRunner,
+    now: () => Date.now(),
+    logger: (line) => process.stdout.write(`${line}
+`),
+  });
+  scheduler.start();
+  process.on("SIGINT", () => {
+    scheduler.stop();
+    server.close(() => process.exit(0));
   });
 
   await new Promise<void>((resolveListen) => server.listen(port, "0.0.0.0", resolveListen));
@@ -139,9 +175,6 @@ async function main(): Promise<void> {
     }
   })();
 
-  process.on("SIGINT", () => {
-    server.close(() => process.exit(0));
-  });
 }
 
 void main();

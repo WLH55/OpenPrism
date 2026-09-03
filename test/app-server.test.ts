@@ -14,6 +14,9 @@ import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
 import { MemoryStore } from "../src/app/memory";
+import { TaskStore } from "../src/app/tasks";
+import { NotificationStore } from "../src/app/notify";
+import type { TaskDef } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { sleep } from "./helpers";
@@ -57,6 +60,8 @@ beforeAll(async () => {
   const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
   const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "mc-x" });
   const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => 5000 });
+  const tasks = new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+  const notifications = new NotificationStore({ fileIO: nodeFileIO, paths, now: () => 5000 });
   const conversations = new ConversationStore({
     env: nodeEnv,
     fileIO: nodeFileIO,
@@ -86,6 +91,11 @@ beforeAll(async () => {
     skills,
     mcps,
     memory,
+    tasks,
+    notifications,
+    taskRunner: async (uidRun, task: TaskDef) => {
+      await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（手动）${task.instruction}` });
+    },
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
@@ -322,6 +332,57 @@ describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
       headers: { "Content-Type": "application/json", cookie },
       body: JSON.stringify({ agentId: "aid-nope" }),
     })).status).toBe(404);
+  });
+});
+
+
+describe("HTTP API 批次3（定时任务/通知）", () => {
+  it("tasks：创建（坏 trigger 400）→列表→启停→手动跑→运行历史", async () => {
+    const bad = await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ title: "x", instruction: "y", trigger: { kind: "daily", time: "99:00" } }),
+    });
+    expect(bad.status).toBe(400);
+    const created = (await (await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ title: "睡觉提醒", instruction: "提醒睡觉", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: 480 }),
+    })).json()) as { id: string };
+    expect((await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(1);
+    expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ enabled: false }),
+    })).status).toBe(200);
+    const run = await fetch(`${baseUrl}/api/tasks/${created.id}/run`, { method: "POST", headers: { cookie } });
+    expect(run.status).toBe(202);
+    let runs: { status: string }[] = [];
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      runs = (await (await fetch(`${baseUrl}/api/tasks/${created.id}/runs`, { headers: { cookie } })).json()) as { status: string }[];
+      if (runs.length > 0) break;
+    }
+    expect(runs.at(-1)).toMatchObject({ status: "ran" });
+    expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
+    expect((await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(0);
+  });
+
+  it("notifications：手动跑产出未读→全部已读", async () => {
+    let unreadBefore: unknown[] = [];
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      unreadBefore = (await (await fetch(`${baseUrl}/api/notifications?unread=1`, { headers: { cookie } })).json()) as unknown[];
+      if (unreadBefore.length > 0) break;
+    }
+    expect(unreadBefore.length).toBeGreaterThanOrEqual(1);
+    expect((await fetch(`${baseUrl}/api/notifications/read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ all: true }),
+    })).status).toBe(200);
+    const unreadAfter = (await (await fetch(`${baseUrl}/api/notifications?unread=1`, { headers: { cookie } })).json()) as unknown[];
+    expect(unreadAfter).toHaveLength(0);
   });
 });
 

@@ -12,6 +12,7 @@ import { ConversationStore, ModelNotConfiguredError } from "../src/app/conversat
 import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
+import { TaskStore } from "../src/app/tasks";
 import { MemoryStore } from "../src/app/memory";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import type { ModelConfig } from "../src/app/secretbox";
@@ -53,6 +54,7 @@ function makeDeps(paths: AppPaths, adapter: LlmAdapter, modelConfig: ModelConfig
     skills: new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `skid-${Math.random().toString(36).slice(2, 8)}` }),
     mcps: new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "mc-1" }),
     memory: new MemoryStore({ fileIO: nodeFileIO, paths, now: () => 5000 }),
+    tasks: new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` }),
   };
 }
 
@@ -66,7 +68,7 @@ describe("ConversationStore（批次1 回归）", () => {
       { kind: "text", text: "记好了。" },
     ]);
     const deps = makeDeps(paths, adapter as LlmAdapter);
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const ledger = await deps.base.ledgerFor(UID);
 
     const entry = await store.create(UID, "记账测试");
@@ -87,7 +89,7 @@ describe("ConversationStore（批次1 回归）", () => {
   it("未配置模型 → ModelNotConfiguredError", async () => {
     const paths = appPaths(join(root, "d-b"));
     const deps = makeDeps(paths, textAdapter(), null);
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
     await expect(store.agent(UID, entry.id)).rejects.toBeInstanceOf(ModelNotConfiguredError);
   });
@@ -98,13 +100,13 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     const paths = appPaths(join(root, "d-c"));
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(paths, mock.adapter as LlmAdapter);
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
     await store.send(UID, entry.id, "hi");
     await (await store.agent(UID, entry.id)).whenIdle();
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
-    expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual(["checkin_plan", "create_plan", "query_ledger", "record_flow", "save_preference"]);
+    expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual(["checkin_plan", "create_plan", "create_task", "query_ledger", "record_flow", "save_preference"]);
   });
 
   it("切换伙伴：systemPrompt 换人设下一步生效；切换历史落 meta；账本 actor 随当前伙伴", async () => {
@@ -112,7 +114,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(paths, mock.adapter as LlmAdapter);
     const coach = await deps.agents.create(UID, { persona: "# 教练\n盯训练，语气硬朗。" });
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
 
     await store.send(UID, entry.id, "第一句（默认助手）");
@@ -148,13 +150,13 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
       persona: "# 分析师\n只查不写。",
       binding: { tools: ["query_ledger"], skills: [skill.id], mcps: [] },
     });
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
     await store.switchAgent(UID, entry.id, analyst.id);
     await store.send(UID, entry.id, "帮我看看");
     await (await store.agent(UID, entry.id)).whenIdle();
     const names = mock.requests[0]!.tools!.map((t) => t.name).sort();
-    expect(names).toEqual(["load_skill", "query_ledger", "save_preference"]);
+    expect(names).toEqual(["create_task", "load_skill", "query_ledger", "save_preference"]);
     expect(mock.requests[0]!.system).toContain("健身复盘");
     expect(mock.requests[0]!.system).toContain("健身话题");
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
@@ -165,7 +167,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(paths, mock.adapter as LlmAdapter);
     await deps.memory.writeSlot(UID, "profile", "软件工程师[^1]，重复利。\n\n[^1]: chat:abc");
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
     await store.send(UID, entry.id, "hi");
     await (await store.agent(UID, entry.id)).whenIdle();
@@ -176,8 +178,24 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
   it("切换到不存在的伙伴 → 抛错", async () => {
     const paths = appPaths(join(root, "d-g"));
     const deps = makeDeps(paths, textAdapter());
-    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
     const entry = await store.create(UID);
     await expect(store.switchAgent(UID, entry.id, "aid-nope")).rejects.toThrow();
+  });
+});
+
+describe("ConversationStore（批次3：任务会话）", () => {
+  it("taskAgent：独立于聊天会话池；followup 落任务会话日志；不进会话列表", async () => {
+    const paths = appPaths(join(root, "d-t1"));
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "到点了，去睡觉" }] } }) }]);
+    const deps = makeDeps(paths, mock.adapter as LlmAdapter);
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks });
+    const agent = await store.taskAgent(UID, "tid-99", undefined);
+    agent.followup("23:00 了，提醒睡觉");
+    await agent.whenIdle();
+    const events = agent.sessionLog.readAll();
+    expect(events.map((e) => e.type)).toContain("turn/end");
+    expect((await store.list(UID))).toHaveLength(0); // 任务会话不混入聊天列表
+    expect(await store.taskAgent(UID, "tid-99", undefined)).toBe(agent); // 池化
   });
 });
