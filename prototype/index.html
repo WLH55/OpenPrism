@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPrism · 原型</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        bg: 'var(--bg)',
+        surface: 'var(--surface)',
+        surface2: 'var(--surface-2)',
+        line: 'var(--line)',
+        ink: 'var(--ink)',
+        ink2: 'var(--ink-2)',
+        ink3: 'var(--ink-3)',
+        accent: 'var(--accent)',
+        accent2: 'var(--accent-2)',
+        accent3: 'var(--accent-3)',
+        warm: 'var(--warm)',
+        warm2: 'var(--warm-2)'
+      },
+      fontFamily: {
+        sans: ['-apple-system', 'BlinkMacSystemFont', '"PingFang SC"', '"Microsoft YaHei"', '"Noto Sans SC"', 'sans-serif']
+      }
+    }
+  }
+}
+</script>
+<style>
+  /* ── 主题 token ───────────────────────────────
+     白天 = 深林墨绿·成长（墨绿 + 金）
+     黑夜 = 森林夜色（苔绿 + 琥珀铜）            */
+  :root {
+    color-scheme: light;
+    --bg: #f6f4ee;
+    --surface: #ffffff;
+    --surface-2: #eceae2;
+    --line: #e4e1d7;
+    --ink: #2b2a26;
+    --ink-2: #6f6b60;
+    --ink-3: #a49e90;
+    --accent: #2f6b4f;
+    --accent-2: #24523c;
+    --accent-3: #e4efe9;
+    --warm: #b98a3e;
+    --warm-2: #f3ead8;
+  }
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0e1410;          /* 带绿调的近黑，森林夜色，非纯黑 */
+    --surface: #171e18;     /* 墨绿灰表面 */
+    --surface-2: #1e2620;   /* 气泡/输入框等更亮表面 */
+    --line: #2a332c;        /* 分隔线，去饱和绿灰 */
+    --ink: #e7ebe5;         /* 暖白正文，4.5:1+ */
+    --ink-2: #a4ada2;       /* 次级文字，去饱和 */
+    --ink-3: #6d7569;       /* 三级/占位 */
+    --accent: #7fb08f;      /* 苔绿/鼠尾草绿，去饱和，图标与强调文字 */
+    --accent-2: #3d6b52;    /* 深墨绿，按钮填充，配白字 */
+    --accent-3: #1c2a20;    /* 强调色低透明底，选中/hover */
+    --warm: #c99a5b;        /* 琥珀铜，数据高光 */
+    --warm-2: #2b231a;      /* 暖色低透明底 */
+  }
+
+  body { font-variant-numeric: tabular-nums; }
+  .num { font-variant-numeric: tabular-nums; }
+  .page { display: none; }
+  .page.active { display: block; }
+  /* 非聊天页可滚动；聊天页固定视口高内部滚动 */
+  .page.active:not([data-page="chat"]) { overflow-y: auto; height: 100%; }
+  .prism { display: inline-block; vertical-align: -0.1em; }
+
+  /* 热力图强度分级（0=无记录 → 4=最热，颜色深浅 = 当日记录数） */
+  .heat-0 { background: var(--surface-2); }
+  .heat-1 { background: color-mix(in srgb, var(--cat, var(--accent)) 30%, var(--surface-2)); }
+  .heat-2 { background: color-mix(in srgb, var(--cat, var(--accent)) 60%, var(--surface-2)); }
+  .heat-3 { background: var(--cat, var(--accent)); }
+  .heat-4 { background: var(--warm); }
+  #heatmap {
+    display: grid;
+    grid-auto-flow: column;          /* 每列 = 一周，自上而下填 7 天 */
+    grid-template-rows: repeat(7, 12px);  /* 定死 7 行 */
+    grid-auto-columns: 12px;         /* 定死列宽，格子是固定小方块，不随容器撑开 */
+    gap: 4px;
+  }
+
+  /* 主题切换图标显隐 */
+  [data-theme="dark"] .icon-sun { display: block; }
+  [data-theme="dark"] .icon-moon { display: none; }
+  .icon-sun { display: none; }
+  .icon-moon { display: block; }
+</style>
+<script>
+  // 防闪烁：渲染前定主题（localStorage > 系统偏好）
+  (function () {
+    var t;
+    try { t = localStorage.getItem('op-theme'); } catch (e) {}
+    if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body class="bg-bg text-ink antialiased">
+
+<!-- ============ 应用壳：左侧纵向菜单 + 内容区 ============ -->
+<div class="flex h-screen overflow-hidden">
+
+  <!-- 左侧纵向菜单（固定） -->
+  <aside id="sidebar" class="flex w-60 shrink-0 flex-col border-r border-line bg-surface2">
+    <!-- 品牌 -->
+    <div class="flex items-center gap-2 px-4 py-5">
+      <svg class="prism h-6 w-6" viewBox="0 0 24 24" fill="none">
+        <path d="M12 3 L20 18 H4 Z" fill="var(--accent)"/>
+        <path d="M12 3 L16.5 12" stroke="var(--warm)" stroke-width="1.2"/>
+        <path d="M12 3 L7.5 12" stroke="var(--ink-3)" stroke-width="1.2" opacity="0.5"/>
+      </svg>
+      <span class="text-lg font-semibold tracking-tight text-ink">OpenPrism</span>
+    </div>
+
+    <!-- 主导航 -->
+    <nav class="space-y-1 px-3" id="proto-nav">
+      <button data-page="chat" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        对话
+      </button>
+      <button data-page="today" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+        今天
+      </button>
+      <button data-page="category" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
+        盘面
+      </button>
+      <button data-page="progress" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 7l-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/></svg>
+        成长
+      </button>
+
+      <div class="mx-3 my-2 border-t border-line"></div>
+      <button data-page="agents" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 4h8M2 14h2M20 14h2M9 13v2M15 13v2"/></svg>
+        伙伴
+      </button>
+      <button data-page="task" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[15px] text-ink2 transition hover:bg-surface">
+        <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+        提醒
+      </button>
+    </nav>
+
+    <!-- 会话记录（按时间倒序） -->
+    <div class="mx-3 my-2 border-t border-line"></div>
+    <div class="flex min-h-0 flex-1 flex-col px-3">
+      <div class="flex items-center justify-between px-2 pb-1">
+        <span class="text-[10px] uppercase tracking-wide text-ink3">最近对话</span>
+        <button id="new-chat-btn" class="flex items-center gap-1 text-xs text-accent transition hover:text-accent2">
+          <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-7-7v14"/></svg>
+          新对话
+        </button>
+      </div>
+      <div class="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2" id="chat-list">
+        <div class="rounded-lg bg-accent3 px-3 py-2.5">
+          <div class="flex items-center gap-2">
+            <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent text-[10px] font-semibold text-white">庄</span>
+            <span class="truncate text-[14px] font-medium text-ink">学姐陪我复盘今天</span>
+          </div>
+          <p class="mt-0.5 truncate text-xs text-ink2">记好了。背练得怎么样？</p>
+        </div>
+        <div class="rounded-lg px-3 py-2.5 transition hover:bg-surface">
+          <div class="flex items-center gap-2">
+            <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-warm2 text-[10px] font-semibold text-warm">教</span>
+            <span class="truncate text-[14px] text-ink">今晚睡前拉伸</span>
+          </div>
+          <p class="mt-0.5 truncate text-xs text-ink2">今晚睡前提醒我拉伸</p>
+        </div>
+        <div class="rounded-lg px-3 py-2.5 transition hover:bg-surface">
+          <div class="flex items-center gap-2">
+            <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent3 text-[10px] font-semibold text-accent">庄</span>
+            <span class="truncate text-[14px] text-ink">周计划复盘</span>
+          </div>
+          <p class="mt-0.5 truncate text-xs text-ink2">这周计划完成了多少？</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 左下角：个人头像下拉 -->
+    <div class="relative px-3 pb-4" id="avatar-wrap">
+      <button id="avatar-btn" class="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition hover:bg-surface">
+        <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent3 text-sm font-semibold text-accent">文</span>
+        <span class="min-w-0 flex-1">
+          <span class="block truncate text-[15px] font-medium text-ink">陈文龙</span>
+          <span class="block text-xs text-ink3">Lathan</span>
+        </span>
+        <svg class="h-4 w-4 shrink-0 text-ink3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+
+      <!-- 下拉菜单 -->
+      <div id="avatar-menu" class="absolute bottom-full left-3 right-3 mb-2 hidden overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+        <div class="px-3 py-2.5 text-xs text-ink3">设置</div>
+        <button data-page="task" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          提醒
+        </button>
+        <button data-page="skills" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 6.5a3 3 0 0 0-2-2M14.5 17.5a3 3 0 0 0 2-2M6.5 14.5a3 3 0 0 0 2 2M6.5 6.5a3 3 0 0 0 2-2M10.5 4.5v3M10.5 16.5v3M4.5 10.5h3M16.5 10.5h3"/><path d="M12 8v8M8 12h8"/></svg>
+          技能 / MCP
+        </button>
+        <button data-page="memory" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 5 17.5v-11A2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 19 17.5v-11A2.5 2.5 0 0 0 14.5 2z"/></svg>
+          长期记忆
+        </button>
+        <button data-page="model" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 8l2 2"/></svg>
+          模型接入
+        </button>
+        <button data-page="notify" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+          通知通道
+        </button>
+        <div class="mx-3 my-1 border-t border-line"></div>
+        <button id="theme-toggle" class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-ink transition hover:bg-surface2">
+          <svg class="icon-moon h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+          <svg class="icon-sun h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.3 11.3 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.3-11.3 1.4-1.4"/></svg>
+          主题
+        </button>
+        <button class="flex w-full items-center gap-2.5 px-3 py-2.5 text-[14px] text-warm transition hover:bg-surface2">
+          <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+          退出登录
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 内容区 -->
+  <main class="flex min-h-0 min-w-0 flex-1 flex-col">
+    <!-- 页1：登录（独立全屏，登录后才进入主布局） -->
+    <section class="page active" data-page="login">
+      <div class="flex flex-1 items-center justify-center px-4 py-12">
+    <div class="w-full max-w-sm">
+      <div class="mb-8 text-center">
+        <div class="mb-4 flex items-center justify-center gap-2">
+          <svg class="prism h-7 w-7" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3 L20 18 H4 Z" fill="var(--accent)"/>
+            <path d="M12 3 L16.5 12" stroke="var(--warm)" stroke-width="1.2"/>
+            <path d="M12 3 L7.5 12" stroke="var(--ink-3)" stroke-width="1.2" opacity="0.5"/>
+          </svg>
+          <span class="text-2xl font-semibold tracking-tight">OpenPrism</span>
+        </div>
+        <p class="text-sm text-ink2">一个你，折射出生活的每一个维度</p>
+      </div>
+
+      <div class="mb-6 grid grid-cols-2 rounded-lg bg-surface2 p-1 text-sm">
+        <button id="tab-login" class="rounded-md bg-surface py-2 font-medium text-ink shadow-sm">登录</button>
+        <button id="tab-register" class="rounded-md py-2 text-ink3 transition hover:text-ink">注册</button>
+      </div>
+
+      <form class="space-y-4" id="auth-form">
+        <div id="confirm-field" class="hidden">
+          <label class="mb-1.5 block text-sm font-medium text-ink" for="confirm">确认密码</label>
+          <input id="confirm" type="password" autocomplete="new-password"
+            class="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+            placeholder="再输一遍">
+        </div>
+        <div>
+          <label class="mb-1.5 block text-sm font-medium text-ink" for="user">用户名</label>
+          <input id="user" type="text" autocomplete="username"
+            class="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+            placeholder="你的名字">
+        </div>
+        <div>
+          <label class="mb-1.5 block text-sm font-medium text-ink" for="pass">密码</label>
+          <input id="pass" type="password" autocomplete="current-password"
+            class="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+            placeholder="••••••••">
+        </div>
+        <button type="button" id="auth-submit"
+          class="w-full rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99]">
+          登录
+        </button>
+      </form>
+
+      <p class="mt-6 text-center text-xs text-ink3">
+        数据只存在你自己的设备上 · 模型 Key 由你自己配置
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页 2：聊天 ============ -->
+<section class="page h-full" data-page="chat">
+  <div class="flex h-full min-h-0 flex-1 overflow-hidden">
+    <!-- 聊天主区 -->
+    <main class="flex min-w-0 flex-1 flex-col bg-surface">
+      <header class="relative flex items-center justify-between border-b border-line px-4 py-3">
+        <button id="chat-partner-btn" class="flex items-center gap-2 rounded-lg px-1.5 py-1 transition hover:bg-surface2">
+          <div class="flex h-8 w-8 items-center justify-center rounded-full bg-accent3 text-sm font-semibold text-accent">庄</div>
+          <div class="text-left">
+            <div class="flex items-center gap-1 text-sm font-semibold text-ink"><span id="chat-partner-name">庄丽洪 · 学姐</span>
+              <svg class="h-3.5 w-3.5 text-ink3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </div>
+            <div class="text-xs text-ink3">陪你谈心 · 也盯着你进步</div>
+          </div>
+        </button>
+        <div class="flex items-center gap-2">
+          <label class="flex cursor-pointer items-center gap-2 text-xs text-ink2">
+            <span>思维链</span>
+            <span class="relative inline-block h-5 w-9">
+              <input type="checkbox" class="peer sr-only" checked>
+              <span class="absolute inset-0 rounded-full bg-ink3/40 transition peer-checked:bg-accent2"></span>
+              <span class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-surface shadow transition peer-checked:translate-x-4"></span>
+            </span>
+          </label>
+          <button id="chat-partner-toggle" class="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2">
+            <svg class="h-4 w-4 text-ink2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            切换伙伴
+          </button>
+        </div>
+
+        <!-- 伙伴切换下拉 -->
+        <div id="partner-picker" class="absolute right-4 top-full z-20 mt-1 hidden w-64 overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+          <div class="px-3 py-2.5 text-xs text-ink3">切换伙伴</div>
+          <button data-partner="庄" class="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2">
+            <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent3 text-sm font-semibold text-accent">庄</span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-[14px] font-medium text-ink">庄丽洪 · 学姐</span>
+              <span class="block text-xs text-ink3">陪你谈心</span>
+            </span>
+            <span class="h-2 w-2 shrink-0 rounded-full bg-accent"></span>
+          </button>
+          <button data-partner="教" class="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2">
+            <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-warm2 text-sm font-semibold text-warm">教</span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-[14px] font-medium text-ink">教练</span>
+              <span class="block text-xs text-ink3">盯着你的训练</span>
+            </span>
+          </button>
+        </div>
+      </header>
+
+      <div class="flex-1 space-y-5 overflow-y-auto px-4 py-5">
+        <!-- 助手 + 思维链 -->
+        <div class="flex max-w-[85%] flex-col gap-1.5">
+          <details class="group">
+            <summary class="cursor-pointer list-none text-xs text-ink3 transition hover:text-ink">思考过程 · 点击展开</summary>
+            <div class="mt-1.5 rounded-lg border-l-2 border-accent bg-accent3/60 px-3 py-2 text-xs leading-relaxed text-ink2">
+              用户昨晚 23:10 入睡，比昨天早 40 分钟，作息在改善。今天的计划有晨跑、读书、早睡三项，晨跑已完成。用学姐的语气先肯定，再温和追问力量训练的质量，不要堆数据。
+            </div>
+          </details>
+          <div class="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+            早安文龙。昨晚 23:10 睡的，比昨天早了 40 分钟，作息越来越稳了。<br>
+            今天的三件事我都替你记着：晨跑、读书、早睡。晨跑你已经打卡了，很棒。
+          </div>
+        </div>
+
+        <!-- 用户 -->
+        <div class="flex justify-end">
+          <div class="max-w-[85%] rounded-2xl rounded-tr-md bg-accent2 px-4 py-3 text-[15px] leading-relaxed text-white">
+            中午和同事吃了碗面 28 块，下午去健身房练了背。
+          </div>
+        </div>
+
+        <!-- 工具回执 -->
+        <div class="flex gap-2.5">
+          <div class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent3 text-accent">
+            <svg class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 0 1 0 1.4l-8 8a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.4L8 12.6l7.3-7.3a1 1 0 0 1 1.4 0Z" clip-rule="evenodd"/></svg>
+          </div>
+          <div class="rounded-xl border border-line bg-accent3/50 px-3 py-2 text-sm">
+            <div class="font-medium text-ink">已记一笔支出</div>
+            <div class="num text-ink2">午餐 <span class="font-medium text-ink">¥28</span> · 分类「餐饮」 · 14:05</div>
+          </div>
+        </div>
+
+        <!-- 助手回复 -->
+        <div class="flex max-w-[85%] flex-col gap-1.5">
+          <div class="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+            记好了，午餐 28。练背这个月第 9 次了，挺稳的。动作有没有做到力竭？下次可以试试把划船重量再加 2.5。
+          </div>
+        </div>
+      </div>
+
+      <footer class="border-t border-line px-4 py-3">
+        <div class="flex items-end gap-2">
+          <textarea rows="1" placeholder="说点什么，或随手记一笔…"
+            class="max-h-32 flex-1 resize-none rounded-xl border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"></textarea>
+          <button class="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">发送</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+</section>
+
+<!-- ============ 页 3：今天 ============ -->
+<section class="page" data-page="today">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5 flex items-end justify-between">
+      <div>
+        <div class="text-xs text-ink3">2026 年 9 月 3 日 · 星期四</div>
+        <h1 class="text-2xl font-semibold tracking-tight text-ink">今天</h1>
+      </div>
+      <button class="rounded-lg bg-accent2 px-3.5 py-2 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">＋ 快速记录</button>
+    </header>
+
+    <div class="mb-5 grid grid-cols-3 gap-3">
+      <div class="rounded-xl border border-line bg-surface px-4 py-3">
+        <div class="text-xs text-ink2">今日支出</div>
+        <div class="num mt-1 text-xl font-semibold text-ink">¥46</div>
+      </div>
+      <div class="rounded-xl border border-line bg-surface px-4 py-3">
+        <div class="text-xs text-ink2">计划完成</div>
+        <div class="num mt-1 text-xl font-semibold text-ink">1<span class="text-sm font-normal text-ink3">/3</span></div>
+      </div>
+      <div class="rounded-xl border border-line bg-surface px-4 py-3">
+        <div class="text-xs text-ink2">连续打卡</div>
+        <div class="num mt-1 text-xl font-semibold text-warm">12 天</div>
+      </div>
+    </div>
+
+    <section class="mb-6">
+      <h2 class="mb-2 text-sm font-semibold text-ink">今日计划</h2>
+      <div class="space-y-1.5">
+        <label class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="flex h-5 w-5 items-center justify-center rounded-full bg-accent2 text-white"><svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 0 1 0 1.4l-8 8a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.4L8 12.6l7.3-7.3a1 1 0 0 1 1.4 0Z" clip-rule="evenodd"/></svg></span>
+          <span class="flex-1 text-[15px] text-ink3 line-through">晨跑 30 分钟</span>
+          <span class="num text-xs text-ink3">已完成</span>
+        </label>
+        <label class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="h-5 w-5 rounded-full border-2 border-line"></span>
+          <span class="flex-1 text-[15px] text-ink">读书 20 页</span>
+          <span class="num text-xs text-warm">进行中</span>
+        </label>
+        <label class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="h-5 w-5 rounded-full border-2 border-line"></span>
+          <span class="flex-1 text-[15px] text-ink">23:00 前睡觉</span>
+          <span class="num text-xs text-ink3">未开始</span>
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="mb-2 text-sm font-semibold text-ink">今日记录</h2>
+      <div class="divide-y divide-line rounded-xl border border-line bg-surface">
+        <div class="flex items-center gap-3 px-4 py-3">
+          <span class="text-lg">🍜</span>
+          <div class="flex-1">
+            <div class="text-[15px] text-ink">午餐</div>
+            <div class="text-xs text-ink3">餐饮 · 14:05</div>
+          </div>
+          <span class="num text-[15px] font-medium text-ink">¥28</span>
+        </div>
+        <div class="flex items-center gap-3 px-4 py-3">
+          <span class="text-lg">☕</span>
+          <div class="flex-1">
+            <div class="text-[15px] text-ink">咖啡</div>
+            <div class="text-xs text-ink3">餐饮 · 08:40</div>
+          </div>
+          <span class="num text-[15px] font-medium text-ink">¥18</span>
+        </div>
+        <div class="flex items-center gap-3 px-4 py-3">
+          <span class="text-lg">🏃</span>
+          <div class="flex-1">
+            <div class="text-[15px] text-ink">晨跑</div>
+            <div class="text-xs text-ink3">运动 · 06:50</div>
+          </div>
+          <span class="num text-[15px] font-medium text-ink">30 分钟</span>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 4：分类页 ============ -->
+<section class="page" data-page="category" id="cat-panel">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <div class="text-xs text-ink3">记过的每一种生活，都会长出自己的一页</div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">盘面</h1>
+    </header>
+
+    <!-- 分类选择器：所有分类并排，色标区分，点选切换 -->
+    <div id="category-chips" class="mb-5 flex gap-2 overflow-x-auto pb-1"></div>
+
+    <!-- 周期切片 -->
+    <div class="mb-5 grid grid-cols-4 rounded-lg bg-surface2 p-1 text-sm">
+      <button class="rounded-md bg-surface py-1.5 font-medium text-ink shadow-sm">今日</button>
+      <button class="rounded-md py-1.5 text-ink3 transition hover:text-ink">本周</button>
+      <button class="rounded-md py-1.5 text-ink3 transition hover:text-ink">本月</button>
+      <button class="rounded-md py-1.5 text-ink3 transition hover:text-ink">今年</button>
+    </div>
+
+    <!-- 汇总卡（随分类切换） -->
+    <div id="cat-summary" class="mb-5 grid grid-cols-3 gap-3"></div>
+
+    <!-- 趋势图（SVG 折线） -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <div class="mb-3 flex items-baseline justify-between">
+        <h2 class="text-sm font-semibold text-ink">近 14 天趋势</h2>
+        <span class="num text-xs text-ink3">单位：次</span>
+      </div>
+      <svg viewBox="0 0 320 120" class="h-auto w-full" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--cat, var(--accent))" stop-opacity="0.28"/>
+            <stop offset="100%" stop-color="var(--cat, var(--accent))" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <!-- 网格线 -->
+        <g stroke="var(--line)" stroke-width="1">
+          <line x1="0" y1="30" x2="320" y2="30"/>
+          <line x1="0" y1="60" x2="320" y2="60"/>
+          <line x1="0" y1="90" x2="320" y2="90"/>
+        </g>
+        <!-- 面积 -->
+        <path d="M0,95 L23,80 L46,88 L69,66 L92,72 L115,52 L138,58 L161,40 L184,48 L207,30 L230,44 L253,26 L276,36 L299,18 L320,24 L320,120 L0,120 Z" fill="url(#areaFill)"/>
+        <!-- 折线 -->
+        <path d="M0,95 L23,80 L46,88 L69,66 L92,72 L115,52 L138,58 L161,40 L184,48 L207,30 L230,44 L253,26 L276,36 L299,18 L320,24" fill="none" stroke="var(--cat, var(--accent))" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+        <!-- 末点 -->
+        <circle cx="320" cy="24" r="4" fill="var(--cat, var(--accent))" stroke="var(--surface)" stroke-width="2"/>
+      </svg>
+    </section>
+
+    <!-- 热力图 -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <div class="mb-3 flex items-baseline justify-between">
+        <h2 class="text-sm font-semibold text-ink">近 30 天热力图</h2>
+        <span class="text-xs text-ink3">颜色深浅 = 当日记录数</span>
+      </div>
+      <div id="heatmap"></div>
+      <div class="mt-3 flex items-center justify-end gap-1.5 text-xs text-ink3">
+        <span>少</span>
+        <span class="heat-0 h-3 w-3 rounded-sm"></span>
+        <span class="heat-1 h-3 w-3 rounded-sm"></span>
+        <span class="heat-2 h-3 w-3 rounded-sm"></span>
+        <span class="heat-3 h-3 w-3 rounded-sm"></span>
+        <span class="heat-4 h-3 w-3 rounded-sm"></span>
+        <span>多</span>
+      </div>
+    </section>
+
+    <!-- 明细（随分类切换） -->
+    <section>
+      <h2 class="mb-2 text-sm font-semibold text-ink">本月记录</h2>
+      <div id="cat-detail" class="divide-y divide-line rounded-xl border border-line bg-surface"></div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 5：进步页 ============ -->
+<section class="page" data-page="progress">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <div class="text-xs text-ink3">复利向前 · 四个可计算的指标</div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">成长</h1>
+    </header>
+
+    <!-- 连续（streak） -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <div class="flex items-start justify-between">
+        <div>
+          <h2 class="text-sm font-semibold text-ink">连续打卡</h2>
+          <p class="mt-0.5 text-xs text-ink3">你保持记录的最长动力，断了就是"从零再来"</p>
+        </div>
+        <div class="text-right">
+          <div class="num text-3xl font-semibold text-warm">12</div>
+          <div class="text-xs text-ink3">天</div>
+        </div>
+      </div>
+      <!-- 7 天小火柴棍 -->
+      <div class="mt-4 flex items-end gap-2">
+        <div class="flex-1 text-center"><div class="mx-auto h-6 w-full max-w-8 rounded bg-accent3"></div><div class="mt-1 text-[10px] text-ink3">五</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-8 w-full max-w-8 rounded bg-accent3"></div><div class="mt-1 text-[10px] text-ink3">六</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-10 w-full max-w-8 rounded bg-accent3"></div><div class="mt-1 text-[10px] text-ink3">日</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-7 w-full max-w-8 rounded bg-accent"></div><div class="mt-1 text-[10px] text-ink3">一</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-9 w-full max-w-8 rounded bg-accent"></div><div class="mt-1 text-[10px] text-ink3">二</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-11 w-full max-w-8 rounded bg-accent"></div><div class="mt-1 text-[10px] text-ink3">三</div></div>
+        <div class="flex-1 text-center"><div class="mx-auto h-12 w-full max-w-8 rounded bg-warm"></div><div class="mt-1 text-[10px] text-ink3">今天</div></div>
+      </div>
+    </section>
+
+    <!-- 完成率（本期计划） -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <h2 class="text-sm font-semibold text-ink">本周计划完成率</h2>
+      <p class="mt-0.5 text-xs text-ink3">本周 8 项，完成 5 项</p>
+      <div class="mt-3 flex items-center gap-3">
+        <div class="h-3 flex-1 overflow-hidden rounded-full bg-surface2">
+          <div class="num h-full rounded-full bg-accent" style="width:62.5%"></div>
+        </div>
+        <span class="num text-sm font-semibold text-ink">62.5%</span>
+      </div>
+      <!-- 分类明细 -->
+      <div class="mt-4 space-y-2">
+        <div class="flex items-center gap-3 text-sm">
+          <span class="w-14 shrink-0 text-ink2">学习</span>
+          <div class="h-2 flex-1 overflow-hidden rounded-full bg-surface2"><div class="h-full rounded-full bg-accent" style="width:75%"></div></div>
+          <span class="num w-9 text-right text-ink3">3/4</span>
+        </div>
+        <div class="flex items-center gap-3 text-sm">
+          <span class="w-14 shrink-0 text-ink2">运动</span>
+          <div class="h-2 flex-1 overflow-hidden rounded-full bg-surface2"><div class="h-full rounded-full bg-accent" style="width:50%"></div></div>
+          <span class="num w-9 text-right text-ink3">2/4</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 趋势对照（本周 vs 上周） -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <h2 class="text-sm font-semibold text-ink">本周 vs 上周</h2>
+      <p class="mt-0.5 text-xs text-ink3">环比变化，向上 = 在变好</p>
+      <div class="mt-4 space-y-3">
+        <div class="flex items-center gap-3">
+          <span class="w-14 shrink-0 text-sm text-ink2">支出</span>
+          <div class="flex-1">
+            <div class="mb-1 flex justify-between text-xs text-ink3"><span>本周 ¥312</span><span>上周 ¥458</span></div>
+            <div class="flex h-2 gap-1"><div class="w-[41%] rounded-full bg-warm"></div><div class="w-[59%] rounded-full bg-surface2"></div></div>
+          </div>
+          <span class="num w-12 shrink-0 text-right text-sm font-medium text-warm">-32%</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="w-14 shrink-0 text-sm text-ink2">运动</span>
+          <div class="flex-1">
+            <div class="mb-1 flex justify-between text-xs text-ink3"><span>本周 6 次</span><span>上周 4 次</span></div>
+            <div class="flex h-2 gap-1"><div class="w-[60%] rounded-full bg-accent"></div><div class="w-[40%] rounded-full bg-surface2"></div></div>
+          </div>
+          <span class="num w-12 shrink-0 text-right text-sm font-medium text-accent">+50%</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="w-14 shrink-0 text-sm text-ink2">睡眠</span>
+          <div class="flex-1">
+            <div class="mb-1 flex justify-between text-xs text-ink3"><span>本周 6.8h</span><span>上周 6.2h</span></div>
+            <div class="flex h-2 gap-1"><div class="w-[52%] rounded-full bg-accent"></div><div class="w-[48%] rounded-full bg-surface2"></div></div>
+          </div>
+          <span class="num w-12 shrink-0 text-right text-sm font-medium text-accent">+10%</span>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 6：提醒 ============ -->
+<section class="page" data-page="task">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5 flex items-end justify-between">
+      <div>
+        <div class="text-xs text-ink3">到点，伙伴主动来找你</div>
+        <h1 class="text-2xl font-semibold tracking-tight text-ink">提醒</h1>
+      </div>
+      <button class="rounded-lg bg-accent2 px-3.5 py-2 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">＋ 新建任务</button>
+    </header>
+
+    <div class="mb-5 rounded-xl border border-line bg-surface px-4 py-3 text-sm text-ink2">
+      共 <span class="num font-semibold text-ink">12</span> 个任务 ·
+      <span class="text-accent">10 启用</span> / <span class="text-ink3">2 停用</span>
+    </div>
+
+    <!-- 每日任务 -->
+    <section class="mb-6">
+      <h2 class="mb-2 text-sm font-semibold text-ink">每日任务</h2>
+      <div class="space-y-1.5">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink">09:00</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink">morning-study-reminder</div>
+            <div class="truncate text-xs text-ink3">读取今日计划，把任务发给你</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink">22:00</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink">日报汇报</div>
+            <div class="truncate text-xs text-ink3">读取当日计划，引导你复盘</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink">23:00</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink">睡觉提醒</div>
+            <div class="truncate text-xs text-ink3">直接发送睡觉提醒</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 每周/每月 -->
+    <section class="mb-6">
+      <h2 class="mb-2 text-sm font-semibold text-ink">每周 / 每月</h2>
+      <div class="space-y-1.5">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink">周日 21:00</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink">周日复盘周计划</div>
+            <div class="truncate text-xs text-ink3">询问本周执行情况并记录</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink">每月1日 20:30</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink">月初询问月计划</div>
+            <div class="truncate text-xs text-ink3">询问新月目标并记录</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 已停用 -->
+    <section>
+      <h2 class="mb-2 text-sm font-semibold text-ink">已停用</h2>
+      <div class="space-y-1.5">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 opacity-70">
+          <span class="num w-12 shrink-0 text-sm font-medium text-ink3">—</span>
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-[15px] text-ink3">办护照 + Bitget 虚拟卡</div>
+            <div class="truncate text-xs text-ink3">一次性提醒（2026-06-20 已执行）</div>
+          </div>
+          <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-ink3/40"><span class="block h-4 w-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 7：伙伴列表 ============ -->
+<section class="page" data-page="agents">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5 flex items-end justify-between">
+      <div>
+        <div class="text-xs text-ink3">自定义人设 · 共享同一份对你的记忆</div>
+        <h1 class="text-2xl font-semibold tracking-tight text-ink">伙伴</h1>
+      </div>
+      <button class="rounded-lg bg-accent2 px-3.5 py-2 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">＋ 新建伙伴</button>
+    </header>
+
+    <div class="space-y-3">
+      <div class="rounded-xl border border-line bg-surface p-4">
+        <div class="flex items-center gap-3">
+          <div class="flex h-11 w-11 items-center justify-center rounded-full bg-accent3 text-lg font-semibold text-accent">庄</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] font-semibold text-ink">庄丽洪 · 学姐</div>
+            <div class="truncate text-xs text-ink3">陪你谈心 · 也盯着你进步</div>
+          </div>
+          <span class="rounded-full bg-accent3 px-2.5 py-1 text-xs text-accent">活跃</span>
+        </div>
+        <div class="mt-3 flex gap-2 text-xs text-ink3">
+          <span class="rounded-md bg-surface2 px-2 py-1">3 个会话</span>
+          <span class="rounded-md bg-surface2 px-2 py-1">4 个工具</span>
+          <span class="rounded-md bg-surface2 px-2 py-1">2 个技能</span>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-line bg-surface p-4">
+        <div class="flex items-center gap-3">
+          <div class="flex h-11 w-11 items-center justify-center rounded-full bg-warm2 text-lg font-semibold text-warm">教</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] font-semibold text-ink">教练</div>
+            <div class="truncate text-xs text-ink3">盯着你的训练和作息</div>
+          </div>
+          <span class="rounded-full bg-surface2 px-2.5 py-1 text-xs text-ink3">闲置</span>
+        </div>
+        <div class="mt-3 flex gap-2 text-xs text-ink3">
+          <span class="rounded-md bg-surface2 px-2 py-1">1 个会话</span>
+          <span class="rounded-md bg-surface2 px-2 py-1">3 个工具</span>
+          <span class="rounded-md bg-surface2 px-2 py-1">1 个 MCP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页 8：伙伴配置 ============ -->
+<section class="page" data-page="agent-edit">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <button class="mb-2 flex items-center gap-1 text-sm text-ink2 transition hover:text-ink">← 返回伙伴</button>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">编辑伙伴</h1>
+      <p class="mt-1 text-xs text-ink3">一个伙伴 = 人设卡 + 能力绑定 + 记忆注入，三段合成 system prompt</p>
+    </header>
+
+    <!-- ① 人设卡 -->
+    <section class="mb-5">
+      <div class="mb-2 flex items-baseline justify-between">
+        <h2 class="text-sm font-semibold text-ink">① 人设卡 <span class="text-ink3">· 自由 markdown</span></h2>
+        <span class="text-xs text-ink3">名称从一级标题推导</span>
+      </div>
+      <textarea rows="9" placeholder="# 庄丽洪&#10;&#10;身份：学姐 / 红颜知己&#10;设定：硅谷 AI 架构师，平时感性温暖，聊技术切换严谨模式…"
+        class="w-full resize-y rounded-xl border border-line bg-surface px-3 py-2.5 font-mono text-sm leading-relaxed text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"></textarea>
+    </section>
+
+    <!-- ② 能力绑定 -->
+    <section class="mb-5">
+      <h2 class="mb-2 text-sm font-semibold text-ink">② 能力绑定</h2>
+      <div class="rounded-xl border border-line bg-surface px-4 py-1">
+        <label class="flex items-center justify-between border-b border-line py-3">
+          <span class="text-[15px] text-ink">记账</span>
+          <span class="h-5 w-9"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </label>
+        <label class="flex items-center justify-between border-b border-line py-3">
+          <span class="text-[15px] text-ink">建计划</span>
+          <span class="h-5 w-9"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </label>
+        <label class="flex items-center justify-between border-b border-line py-3">
+          <span class="text-[15px] text-ink">打卡</span>
+          <span class="h-5 w-9"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </label>
+        <label class="flex items-center justify-between py-3">
+          <div>
+            <span class="text-[15px] text-ink">查询统计</span>
+            <span class="ml-2 text-xs text-ink3">读账本，只读</span>
+          </div>
+          <span class="h-5 w-9"><span class="block h-5 w-9 rounded-full bg-ink3/40"><span class="block h-4 w-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+        </label>
+      </div>
+      <div class="mt-2 flex gap-2">
+        <button class="rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink2 transition hover:text-ink">＋ 绑定技能</button>
+        <button class="rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink2 transition hover:text-ink">＋ 连接 MCP</button>
+      </div>
+    </section>
+
+    <!-- ③ 记忆注入 -->
+    <section class="mb-5">
+      <h2 class="mb-2 text-sm font-semibold text-ink">③ 记忆注入</h2>
+      <div class="flex items-center justify-between rounded-xl border border-line bg-surface px-4 py-3">
+        <div class="pr-4">
+          <div class="text-[15px] text-ink">共享长期记忆</div>
+          <div class="text-xs text-ink3">全局一份，所有伙伴读到同一个你</div>
+        </div>
+        <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+      </div>
+    </section>
+
+    <button class="w-full rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99]">保存</button>
+  </div>
+</section>
+
+<!-- ============ 页 9：技能 / MCP ============ -->
+<section class="page" data-page="skills">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <div class="text-xs text-ink3">标准格式 · 自带自装 · 无商店</div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">技能 / MCP</h1>
+    </header>
+
+    <div class="mb-5 grid grid-cols-2 rounded-lg bg-surface2 p-1 text-sm">
+      <button class="rounded-md bg-surface py-1.5 font-medium text-ink shadow-sm">技能 Skill</button>
+      <button class="rounded-md py-1.5 text-ink3 transition hover:text-ink">MCP 工具</button>
+    </div>
+
+    <!-- 安装入口 -->
+    <section class="mb-5 rounded-xl border border-line bg-surface p-4">
+      <label class="mb-1.5 block text-sm font-medium text-ink" for="skill-url">安装技能</label>
+      <div class="flex gap-2">
+        <input id="skill-url" type="text" placeholder="粘贴 git URL，或上传 SKILL.md"
+          class="min-w-0 flex-1 rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3">
+        <button class="shrink-0 rounded-lg bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">安装</button>
+      </div>
+      <p class="mt-2 text-xs text-ink3">安装时一次性确认风险：技能改提示词（低危）；MCP 外呼数据给第三方（中危）。</p>
+    </section>
+
+    <!-- 已装列表 -->
+    <section>
+      <h2 class="mb-2 text-sm font-semibold text-ink">已安装</h2>
+      <div class="space-y-1.5">
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-accent3 text-accent">S</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] text-ink">baoyu-post-to-wechat</div>
+            <div class="truncate text-xs text-ink3">公众号写作 + 去 AI 痕迹</div>
+          </div>
+          <span class="shrink-0 text-xs text-ink3">绑定 1 个伙伴</span>
+        </div>
+        <div class="flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3">
+          <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-warm2 text-warm">M</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] text-ink">tavily-search</div>
+            <div class="truncate text-xs text-ink3">联网搜索</div>
+          </div>
+          <span class="shrink-0 text-xs text-ink3">绑定 2 个伙伴</span>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 10：长期记忆 ============ -->
+<section class="page" data-page="memory">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5 flex items-end justify-between">
+      <div>
+        <div class="text-xs text-ink3">三层记忆 · 自动凝练 + 你可随时改</div>
+        <h1 class="text-2xl font-semibold tracking-tight text-ink">长期记忆</h1>
+      </div>
+      <button class="rounded-lg border border-line bg-surface px-3.5 py-2 text-sm text-ink2 transition hover:text-ink">手动重跑凝练</button>
+    </header>
+
+    <!-- 三个槽位 -->
+    <div class="space-y-3">
+      <section class="rounded-xl border border-line bg-surface p-4">
+        <div class="mb-2 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-ink">画像 profile</h2>
+          <button class="text-xs text-accent hover:underline">编辑</button>
+        </div>
+        <ul class="space-y-1.5 text-[15px] leading-relaxed text-ink">
+          <li class="flex gap-2"><span class="text-ink3">·</span>陈文龙，agent 开发工程师，Python（FastAPI/Django）<span class="num text-xs text-ink3">[来源: chat]</span></li>
+          <li class="flex gap-2"><span class="text-ink3">·</span>时区 Asia/Shanghai<span class="num text-xs text-ink3">[来源: chat]</span></li>
+          <li class="flex gap-2"><span class="text-ink3">·</span>互动偏好：用"我们"代替"你"<span class="num text-xs text-ink3">[来源: 显式偏好]</span></li>
+        </ul>
+      </section>
+
+      <section class="rounded-xl border border-line bg-surface p-4">
+        <div class="mb-2 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-ink">偏好 preferences</h2>
+          <button class="text-xs text-accent hover:underline">编辑</button>
+        </div>
+        <ul class="space-y-1.5 text-[15px] leading-relaxed text-ink">
+          <li class="flex gap-2"><span class="text-ink3">·</span>回答平实专业、去 AI 化，禁用煽情词<span class="num text-xs text-ink3">[来源: 显式偏好]</span></li>
+          <li class="flex gap-2"><span class="text-ink3">·</span>数据优先用表格<span class="num text-xs text-ink3">[来源: 显式偏好]</span></li>
+        </ul>
+      </section>
+
+      <section class="rounded-xl border border-line bg-surface p-4">
+        <div class="mb-2 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-ink">近期 recent</h2>
+          <button class="text-xs text-accent hover:underline">编辑</button>
+        </div>
+        <ul class="space-y-1.5 text-[15px] leading-relaxed text-ink">
+          <li class="flex gap-2"><span class="text-ink3">·</span>本周在坚持晨跑，作息在改善<span class="num text-xs text-ink3">[来源: 自动凝练]</span></li>
+        </ul>
+      </section>
+    </div>
+
+    <!-- 自动凝练 -->
+    <section class="mt-5 rounded-xl border border-line bg-surface px-4 py-3">
+      <div class="flex items-center justify-between">
+        <div class="pr-4">
+          <div class="text-[15px] text-ink">自动凝练</div>
+          <div class="text-xs text-ink3">夜间 / 会话压缩后，从会话日志提炼新记忆</div>
+        </div>
+        <span class="h-5 w-9 shrink-0"><span class="block h-5 w-9 rounded-full bg-accent2"><span class="block h-4 w-4 translate-x-4 rounded-full bg-white shadow" style="margin:2px"></span></span></span>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- ============ 页 11：模型接入 ============ -->
+<section class="page" data-page="model">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <div class="text-xs text-ink3">BYOK · 平台永不提供 Key</div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">模型接入</h1>
+    </header>
+
+    <div class="mb-5 flex gap-2.5 rounded-xl border border-accent3 bg-accent3/50 px-4 py-3">
+      <svg class="mt-0.5 h-4 w-4 shrink-0 text-accent" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm-.75-4.75a.75.75 0 0 0 1.5 0v-5a.75.75 0 0 0-1.5 0v5ZM10 6a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z" clip-rule="evenodd"/></svg>
+      <p class="text-sm leading-relaxed text-ink2">Key 由你自己提供，只发往你配置的 baseURL，永不进日志、永不上传。数据存在你自己的设备上。</p>
+    </div>
+
+    <form class="space-y-4">
+      <div>
+        <label class="mb-1.5 block text-sm font-medium text-ink" for="base-url">baseURL</label>
+        <input id="base-url" type="text" value="https://api.deepseek.com/"
+          class="w-full rounded-lg border border-line bg-surface px-3 py-2.5 font-mono text-[15px] text-ink outline-none transition focus:border-accent focus:ring-2 focus:ring-accent3">
+      </div>
+      <div>
+        <label class="mb-1.5 block text-sm font-medium text-ink" for="api-key">API Key</label>
+        <div class="flex gap-2">
+          <input id="api-key" type="password" value="sk-••••••••••••••••"
+            class="min-w-0 flex-1 rounded-lg border border-line bg-surface px-3 py-2.5 font-mono text-[15px] text-ink outline-none transition focus:border-accent focus:ring-2 focus:ring-accent3">
+          <button type="button" class="shrink-0 rounded-lg border border-line bg-surface px-3 py-2.5 text-sm text-ink2 transition hover:text-ink">显示</button>
+        </div>
+        <p class="mt-1.5 text-xs text-ink3">加密存储在你自己设备上，不上传任何地方。</p>
+      </div>
+      <div>
+        <label class="mb-1.5 block text-sm font-medium text-ink" for="model-name">模型</label>
+        <input id="model-name" type="text" value="deepseek-v4-flash"
+          class="w-full rounded-lg border border-line bg-surface px-3 py-2.5 font-mono text-[15px] text-ink outline-none transition focus:border-accent focus:ring-2 focus:ring-accent3">
+      </div>
+      <button type="button" class="w-full rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99]">测试连接</button>
+    </form>
+  </div>
+</section>
+
+<!-- ============ 页 12：通知通道 ============ -->
+<section class="page" data-page="notify">
+  <div class="mx-auto max-w-2xl px-4 py-6">
+    <header class="mb-5">
+      <div class="text-xs text-ink3">通道可插拔 · 收发对称</div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">通知通道</h1>
+    </header>
+
+    <div class="space-y-3">
+      <div class="rounded-xl border border-line bg-surface p-4">
+        <div class="flex items-center gap-3">
+          <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-accent3 text-accent">站</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] font-semibold text-ink">站内通知</div>
+            <div class="text-xs text-ink3">永远在线的兜底通道 · 页面打开即见</div>
+          </div>
+          <span class="rounded-full bg-accent3 px-2.5 py-1 text-xs text-accent">已启用</span>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-line bg-surface p-4">
+        <div class="flex items-center gap-3">
+          <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-warm2 text-warm">微</div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[15px] font-semibold text-ink">微信</div>
+            <div class="text-xs text-ink3">双向消息网关 · 回复直接进对应会话</div>
+          </div>
+          <span class="rounded-full bg-surface2 px-2.5 py-1 text-xs text-ink3">待接入</span>
+        </div>
+        <div class="mt-3 flex items-center justify-between border-t border-line pt-3">
+          <span class="text-sm text-ink2">绑定微信身份</span>
+          <button class="rounded-lg bg-accent2 px-3.5 py-2 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]">去绑定</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="mt-5 text-xs leading-relaxed text-ink3">微信桥选型待接入时专项调研（个人号直连无官方 API、有封号风险；公众号/企业微信/插件路都留待评估）。</p>
+  </div>
+</section>
+  </main>
+</div>
+
+<script>
+  const pages = document.querySelectorAll('.page');
+
+  // 统一页面路由：菜单项与头像下拉都能切
+  function showPage(name) {
+    pages.forEach(p => p.classList.toggle('active', p.dataset.page === name));
+    document.querySelectorAll('#proto-nav button[data-page]').forEach(b => {
+      const isActive = b.dataset.page === name;
+      b.classList.toggle('bg-surface', isActive);
+      b.classList.toggle('text-ink', isActive);
+      b.classList.toggle('text-ink2', !isActive);
+    });
+    document.querySelectorAll('#avatar-menu button[data-page]').forEach(b => {
+      b.classList.toggle('bg-surface2', b.dataset.page === name && name !== 'task');
+    });
+    closeAvatarMenu();
+    window.scrollTo(0, 0);
+  }
+
+  // 左侧主导航
+  document.getElementById('proto-nav').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-page]');
+    if (!btn) return;
+    showPage(btn.dataset.page);
+  });
+
+  // 头像下拉开合
+  const avatarBtn = document.getElementById('avatar-btn');
+  const avatarMenu = document.getElementById('avatar-menu');
+  function closeAvatarMenu() { avatarMenu.classList.add('hidden'); }
+  avatarBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    avatarMenu.classList.toggle('hidden');
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#avatar-wrap')) closeAvatarMenu();
+  });
+
+  // 明暗主题切换
+  document.getElementById('theme-toggle').addEventListener('click', (e) => {
+    const cur = document.documentElement.dataset.theme;
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('op-theme', next); } catch (err) {}
+  });
+
+  // 登录 / 注册切换
+  const tabLogin = document.getElementById('tab-login');
+  const tabRegister = document.getElementById('tab-register');
+  const confirmField = document.getElementById('confirm-field');
+  const authSubmit = document.getElementById('auth-submit');
+  const passInput = document.getElementById('pass');
+  function setAuthMode(mode) {
+    const isRegister = mode === 'register';
+    tabLogin.classList.toggle('bg-surface', !isRegister);
+    tabLogin.classList.toggle('text-ink', !isRegister);
+    tabLogin.classList.toggle('shadow-sm', !isRegister);
+    tabLogin.classList.toggle('text-ink3', isRegister);
+    tabRegister.classList.toggle('bg-surface', isRegister);
+    tabRegister.classList.toggle('text-ink', isRegister);
+    tabRegister.classList.toggle('shadow-sm', isRegister);
+    tabRegister.classList.toggle('text-ink3', !isRegister);
+    confirmField.classList.toggle('hidden', !isRegister);
+    authSubmit.textContent = isRegister ? '注册' : '登录';
+    passInput.autocomplete = isRegister ? 'new-password' : 'current-password';
+  }
+  tabLogin.addEventListener('click', () => setAuthMode('login'));
+  tabRegister.addEventListener('click', () => setAuthMode('register'));
+
+  // 登录态：未登录只显示登录页、隐藏侧栏；登录后进入主界面
+  const sidebar = document.getElementById('sidebar');
+  const authSubmitBtn = document.getElementById('auth-submit');
+  function enterMain() {
+    sidebar.style.display = 'flex';
+    showPage('chat');
+  }
+  // 初始：未登录态
+  sidebar.style.display = 'none';
+  showPage('login');
+  authSubmitBtn.addEventListener('click', () => { enterMain(); });
+
+  // 伙伴切换：顶部头像 + 显式"切换伙伴"按钮都能打开
+  const partnerBtn = document.getElementById('chat-partner-btn');
+  const partnerToggle = document.getElementById('chat-partner-toggle');
+  const partnerPicker = document.getElementById('partner-picker');
+  function togglePartnerPicker() {
+    partnerPicker.classList.toggle('hidden');
+  }
+  partnerBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePartnerPicker();
+  });
+  partnerToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePartnerPicker();
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#partner-picker') && !e.target.closest('#chat-partner-btn') && !e.target.closest('#chat-partner-toggle')) {
+      partnerPicker.classList.add('hidden');
+    }
+  });
+  partnerPicker.querySelectorAll('button[data-partner]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      // 更新顶部头像与名字
+      const avatar = btn.querySelector('.h-8.w-8').textContent.trim();
+      const name = btn.querySelector('span[class*="truncate"]').textContent.trim();
+      const desc = btn.querySelector('span.block.text-xs').textContent.trim();
+      const avatarEl = partnerBtn.querySelector('.h-8.w-8');
+      avatarEl.textContent = avatar;
+      avatarEl.className = btn.querySelector('.h-8.w-8').className;
+      document.getElementById('chat-partner-name').textContent = name;
+      partnerBtn.querySelector('.text-xs.text-ink3').textContent = desc;
+      partnerPicker.classList.add('hidden');
+    });
+  });
+
+  // "新对话"按钮：进入聊天页
+  const newChatBtn = document.getElementById('new-chat-btn');
+  newChatBtn.addEventListener('click', () => { showPage('chat'); });
+
+  // 盘面（分类即维度）：分类选择器 + 每个分类自己的盘面
+  const CATEGORIES = [
+    { id:'sport', name:'运动', color:'#2f6b4f',
+      stats:[['本月次数','9','次'],['累计时长','6.5','h'],['连续','4','天']],
+      items:[['夜跑','9 月 3 日 · 21:40','5 公里'],['练背','9 月 3 日 · 14:05','45 分钟'],['晨跑','9 月 3 日 · 06:50','30 分钟']] },
+    { id:'food', name:'餐饮', color:'#b98a3e',
+      stats:[['本月笔数','23','笔'],['本月支出','¥842',''],['连续记账','31','天']],
+      items:[['晚餐','9 月 3 日 · 19:20','¥46'],['午餐','9 月 3 日 · 12:05','¥28'],['咖啡','9 月 3 日 · 08:40','¥18']] },
+    { id:'study', name:'学习', color:'#2e7d6b',
+      stats:[['本月次数','12','次'],['累计时长','9','h'],['连续','6','天']],
+      items:[['刷题','9 月 3 日 · 20:30','1 小时'],['读论文','9 月 3 日 · 15:00','45 分钟'],['整理笔记','9 月 3 日 · 09:10','30 分钟']] },
+    { id:'sleep', name:'睡眠', color:'#64748b',
+      stats:[['本月均长','6.9','h'],['入睡中位','23:12',''],['连续早起','3','天']],
+      items:[['入睡','9 月 3 日 · 23:10','7.8 小时'],['入睡','9 月 2 日 · 23:30','7.2 小时'],['入睡','9 月 1 日 · 00:10','6.4 小时']] },
+    { id:'read', name:'阅读', color:'#8b6f4a',
+      stats:[['本月本数','4','本'],['累计时长','11','h'],['连续','8','天']],
+      items:[['《置身事内》','9 月 3 日 · 22:00','30 页'],['《纳瓦尔宝典》','9 月 2 日 · 21:40','25 页'],['《卡片笔记》','9 月 1 日 · 20:10','40 页']] }
+  ];
+  const catPanel = document.getElementById('cat-panel');
+  const catChips = document.getElementById('category-chips');
+  const catSummary = document.getElementById('cat-summary');
+  const catDetail = document.getElementById('cat-detail');
+  // 「全部」聚合盘面：不新增分类，只是把各分类并到一起看总账
+  const ALL = { id:'all', name:'全部', color:'var(--accent)' };
+  function renderCategory(id) {
+    const isAll = id === 'all';
+    const cat = isAll ? ALL : (CATEGORIES.find(c => c.id === id) || CATEGORIES[0]);
+    catPanel.style.setProperty('--cat', isAll ? 'var(--accent)' : cat.color);
+    catChips.querySelectorAll('button').forEach(b => {
+      const active = b.dataset.cat === cat.id;
+      b.style.background = active ? (isAll ? 'var(--accent-3)' : cat.color + '1f') : 'transparent';
+      b.style.borderColor = active ? (isAll ? 'var(--accent)' : cat.color) : 'var(--line)';
+      b.style.color = active ? 'var(--ink)' : 'var(--ink-2)';
+      b.style.fontWeight = active ? '600' : '400';
+    });
+    const stats = isAll
+      ? [['本月记录', '' + CATEGORIES.reduce((n, c) => n + c.items.length, 0), '笔'],
+         ['活跃分类', '' + CATEGORIES.length, '个'],
+         ['连续记录', '12', '天']]
+      : cat.stats;
+    catSummary.innerHTML = stats.map(s => {
+      const valColor = s[0].indexOf('连续') === 0 ? 'var(--warm)' : (isAll ? 'var(--accent)' : cat.color);
+      return `<div class="rounded-xl border border-line bg-surface px-4 py-3">
+        <div class="text-xs text-ink2">${s[0]}</div>
+        <div class="num mt-1 text-xl font-semibold" style="color:${valColor}">${s[1]}<span class="text-sm font-normal text-ink3">${s[2] ? ' ' + s[2] : ''}</span></div>
+      </div>`;
+    }).join('');
+    if (isAll) {
+      // 全部：跨分类合并，明细里带出「哪一分类」的色标
+      const merged = CATEGORIES.flatMap(c => c.items.map(it => ({ cat: c, it })));
+      catDetail.innerHTML = merged.map(x => `
+        <div class="flex items-center gap-3 px-4 py-3">
+          <span class="h-2.5 w-2.5 shrink-0 rounded-full" style="background:${x.cat.color}"></span>
+          <div class="flex-1">
+            <div class="text-[15px] text-ink">${x.it[0]}</div>
+            <div class="text-xs text-ink3">${x.cat.name} · ${x.it[1]}</div>
+          </div>
+          <span class="num text-[15px] font-medium text-ink">${x.it[2]}</span>
+        </div>`).join('');
+    } else {
+      catDetail.innerHTML = cat.items.map(it => `
+        <div class="flex items-center gap-3 px-4 py-3">
+          <span class="h-2.5 w-2.5 shrink-0 rounded-full" style="background:${cat.color}"></span>
+          <div class="flex-1">
+            <div class="text-[15px] text-ink">${it[0]}</div>
+            <div class="text-xs text-ink3">${it[1]}</div>
+          </div>
+          <span class="num text-[15px] font-medium text-ink">${it[2]}</span>
+        </div>`).join('');
+    }
+  }
+  catChips.innerHTML = [ALL, ...CATEGORIES].map(c => `
+    <button data-cat="${c.id}" class="flex shrink-0 items-center gap-2 rounded-full border px-3.5 py-2 text-sm transition"
+      style="border-color:var(--line); color:var(--ink-2)">
+      <span class="h-2.5 w-2.5 rounded-full" style="background:${c.color}"></span>
+      ${c.name}
+    </button>`).join('');
+  catChips.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-cat]');
+    if (btn) renderCategory(btn.dataset.cat);
+  });
+  renderCategory('all');
+
+  // 热力图：近 30 天 = 5 列（每周一列）× 7 行（周一到周日），最近一周在最右
+  (function renderHeatmap() {
+    const map = document.getElementById('heatmap');
+    // 伪随机但确定：用简单 LCG 让热度分布看起来自然
+    let seed = 7;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const cells = [];
+    for (let i = 0; i < 30; i++) {
+      const r = rnd();
+      // 近期（末尾）略偏热，营造"越来越勤"的观感
+      const boost = i / 30;
+      const v = r + boost * 0.6;
+      const lvl = v < 0.35 ? 0 : v < 0.55 ? 1 : v < 0.75 ? 2 : v < 0.92 ? 3 : 4;
+      const c = document.createElement('span');
+      c.className = 'heat-' + lvl + ' rounded-[3px]';
+      c.title = '第 ' + (30 - i) + ' 天前';
+      cells.push(c);
+    }
+    map.append(...cells);
+  })();
+</script>
+</body>
+</html>
