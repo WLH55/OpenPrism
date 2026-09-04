@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type SessionEventLoose } from "../api";
+import { CheckSolidIcon, ChevronDownIcon, SwitchPartnerIcon } from "../icons";
 
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
@@ -44,9 +45,17 @@ function foldEvents(events: SessionEventLoose[], switches: { ts: number; agentId
   return items;
 }
 
-export function Chat() {
-  const [conversations, setConversations] = useState<ConversationEntry[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+export function Chat({
+  conversations,
+  reloadConversations,
+  activeConvId,
+  setActiveConvId,
+}: {
+  conversations: ConversationEntry[];
+  reloadConversations: () => Promise<ConversationEntry[]>;
+  activeConvId: string | null;
+  setActiveConvId: (id: string | null) => void;
+}) {
   const [agents, setAgents] = useState<AgentLoose[]>([]);
   const [currentAgentId, setCurrentAgentId] = useState<string | undefined>(undefined);
   const [items, setItems] = useState<RenderItem[]>([]);
@@ -54,22 +63,18 @@ export function Chat() {
   const [stream, setStream] = useState<{ reasoning: string; text: string } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [drawerOpen, setDrawerOpen] = useState(false);
   const [showReasoning, setShowReasoning] = useState(true);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef<string | null>(null);
-  activeIdRef.current = activeId;
+  activeIdRef.current = activeConvId;
 
   const agentName = useCallback(
     (id: string): string => agents.find((a) => a.id === id)?.name ?? "新伙伴",
     [agents],
   );
-
-  const reloadConversations = useCallback(async () => {
-    const list = await api.listConversations();
-    setConversations(list);
-    return list;
-  }, []);
+  const currentAgent = agents.find((a) => a.id === currentAgentId);
 
   const loadEvents = useCallback(
     async (cid: string) => {
@@ -87,36 +92,26 @@ export function Chat() {
       .catch(() => undefined);
   }, []);
 
+  // 会话的确保与选中在壳子完成；此处只订阅当前会话
   useEffect(() => {
-    void (async () => {
-      let list = await reloadConversations();
-      if (list.length === 0) {
-        await api.createConversation();
-        list = await reloadConversations();
-      }
-      if (list[0]) setActiveId(list[0].id);
-    })().catch(() => setBanner("加载会话失败"));
-  }, [reloadConversations]);
-
-  useEffect(() => {
-    if (!activeId) return;
-    void loadEvents(activeId).catch(() => undefined);
-    const close = openConversationStream(activeId, (event: LiveEventLoose) => {
-      if (activeIdRef.current !== activeId) return;
+    if (!activeConvId) return;
+    void loadEvents(activeConvId).catch(() => undefined);
+    const close = openConversationStream(activeConvId, (event: LiveEventLoose) => {
+      if (activeIdRef.current !== activeConvId) return;
       if (event.type === "reasoning-delta") {
         setStream((s) => ({ reasoning: (s?.reasoning ?? "") + (event.text ?? ""), text: s?.text ?? "" }));
       } else if (event.type === "text-delta") {
-        setStream((s) => ({ reasoning: s?.reasoning ?? "", text: (s?.text ?? "") + (event.text ?? "") }));
+        setStream((s) => ({ reasoning: (s?.reasoning ?? ""), text: (s?.text ?? "") + (event.text ?? "") }));
       } else if (event.type === "assistant") {
         // 最终消息以日志为准，先把增量清掉；turn-end 时统一重放
         setStream(null);
       } else if (event.type === "turn-end" || event.type === "error" || event.type === "budget-exhausted") {
         setStream(null);
         if (event.type === "error" && event.error === "model_not_configured") {
-          setBanner("还没有配置模型——去「设置」页填 baseURL / API Key / 模型");
+          setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
         } else {
           setBanner(null);
-          void loadEvents(activeId).catch(() => undefined);
+          void loadEvents(activeConvId).catch(() => undefined);
         }
       } else if (event.type === "tool-call") {
         setItems((prev) => [
@@ -138,156 +133,215 @@ export function Chat() {
       }
     });
     return close;
-  }, [activeId, loadEvents]);
+  }, [activeConvId, loadEvents]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [items, stream]);
 
+  // 点外部收起伙伴下拉
+  useEffect(() => {
+    const onDoc = (event: MouseEvent) => {
+      if (!headerRef.current?.contains(event.target as Node)) setPickerOpen(false);
+    };
+    document.addEventListener("click", onDoc);
+    return () => document.removeEventListener("click", onDoc);
+  }, []);
+
   const send = async () => {
     const text = input.trim();
-    if (!text || !activeId) return;
+    if (!text || !activeConvId) return;
     setInput("");
     setItems((prev) => [...prev, { kind: "user", key: `local-${Date.now()}`, text }]);
     try {
-      await api.sendMessage(activeId, text);
+      await api.sendMessage(activeConvId, text);
     } catch (e) {
       const status = (e as { status?: number }).status;
-      if (status === 409) setBanner("还没有配置模型——去「设置」页填 baseURL / API Key / 模型");
+      if (status === 409) setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
       else setBanner(`发送失败：${(e as Error).message}`);
     }
   };
 
-  const newConversation = async () => {
-    const entry = await api.createConversation();
-    await reloadConversations();
-    setActiveId(entry.id);
-    setItems([]);
+  const pickPartner = async (id: string) => {
+    setPickerOpen(false);
+    if (!activeConvId || id === (currentAgentId ?? "")) return;
+    if (id === "") {
+      // 切回默认助手：后端 meta.agentId 置空语义暂缺——与旧实现一致 no-op
+      setBanner("会话中途切回默认助手暂不支持——请新建一个对话");
+      return;
+    }
+    try {
+      await api2.switchAgent(activeConvId, id);
+      setCurrentAgentId(id);
+      await loadEvents(activeConvId);
+    } catch (err) {
+      setBanner(`切换失败：${(err as Error).message}`);
+    }
   };
 
-  return (
-    <div className="chat-layout">
-      <aside className={`conv-list${drawerOpen ? " drawer-open" : ""}`}>
-        <button className="btn ghost small" style={{ width: "100%", marginBottom: 8 }} onClick={newConversation}>
-          ＋ 新对话
-        </button>
-        {conversations.map((conv) => (
-          <div
-            key={conv.id}
-            className={`conv-item${conv.id === activeId ? " active" : ""}`}
-            onClick={() => setActiveId(conv.id)}
-          >
-            <div className="t">{conv.title}</div>
-          </div>
-        ))}
-      </aside>
+  const partnerAvatar = (name: string, warm = false) => (
+    <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${warm ? "bg-warm2 text-warm" : "bg-accent3 text-accent"}`}>
+      {name.slice(0, 1)}
+    </span>
+  );
 
-      <main className="chat-main">
-        {banner && (
-          <div className="banner" style={{ marginTop: 10 }}>
-            {banner}
-          </div>
-        )}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", borderBottom: "1px solid var(--line)", background: "var(--surface)" }}>
-          <button className="btn ghost small" style={{ display: "none" }} data-drawer-toggle onClick={() => setDrawerOpen(!drawerOpen)}>
-            会话
-          </button>
-          <span className="muted">当前伙伴</span>
-          <select
-            className="input"
-            style={{ width: "auto", padding: "4px 10px" }}
-            value={currentAgentId ?? ""}
-            onChange={async (e) => {
-              const value = e.target.value;
-              if (!activeId) return;
-              try {
-                if (value === "") {
-                  // 切回默认助手：后端 meta.agentId 置空语义暂以"新建默认会话代替"——直接不处理
-                  return;
-                }
-                await api2.switchAgent(activeId, value);
-                setCurrentAgentId(value);
-                await loadEvents(activeId);
-              } catch (err) {
-                setBanner(`切换失败：${(err as Error).message}`);
-              }
-            }}
+  return (
+    <div className="flex h-full min-h-0 flex-1 overflow-hidden bg-surface">
+      {/* 聊天主区（会话列表在壳子左侧栏） */}
+      <main className="flex min-w-0 flex-1 flex-col">
+        {/* 头部：当前伙伴 + 思维链开关 + 切换伙伴 */}
+        <header className="relative flex items-center justify-between border-b border-line px-4 py-3" ref={headerRef}>
+          <button
+            className="flex items-center gap-2 rounded-lg px-1.5 py-1 transition hover:bg-surface2"
+            onClick={(e) => { e.stopPropagation(); setPickerOpen(!pickerOpen); }}
           >
-            <option value="">默认助手</option>
-            {agents.map((agent) => (
-              <option key={agent.id} value={agent.id}>
-                {agent.name}
-              </option>
-            ))}
-          </select>
-          <span className="muted" style={{ fontSize: 12 }}>
-            切换后下一条消息由新伙伴接话，历史不丢
-          </span>
-        </div>
-        <div className="chat-scroll" ref={scrollRef}>
+            {partnerAvatar(currentAgent?.name ?? "助")}
+            <div className="text-left">
+              <div className="flex items-center gap-1 text-sm font-semibold text-ink">
+                <span>{currentAgent?.name ?? "默认助手"}</span>
+                <ChevronDownIcon className="h-3.5 w-3.5 text-ink3" />
+              </div>
+              <div className="text-xs text-ink3">陪你谈心 · 也盯着你进步</div>
+            </div>
+          </button>
+          <div className="flex items-center gap-2">
+            <label className="flex cursor-pointer items-center gap-2 text-xs text-ink2">
+              <span>思维链</span>
+              <span className="relative inline-block h-5 w-9">
+                <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
+                <span className="absolute inset-0 rounded-full bg-ink3/40 transition peer-checked:bg-accent2" />
+                <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-surface shadow transition peer-checked:translate-x-4" />
+              </span>
+            </label>
+            <button
+              className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2"
+              onClick={(e) => { e.stopPropagation(); setPickerOpen(!pickerOpen); }}
+            >
+              <SwitchPartnerIcon className="h-4 w-4 text-ink2" />
+              切换伙伴
+            </button>
+          </div>
+
+          {/* 伙伴切换下拉 */}
+          {pickerOpen && (
+            <div className="absolute right-4 top-full z-20 mt-1 w-64 overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+              <div className="px-3 py-2.5 text-xs text-ink3">切换伙伴</div>
+              <button
+                className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2"
+                onClick={() => void pickPartner("")}
+              >
+                {partnerAvatar("助")}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[14px] font-medium text-ink">默认助手</span>
+                  <span className="block text-xs text-ink3">不带人设的基线伙伴</span>
+                </span>
+                {!currentAgentId && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
+              </button>
+              {agents.map((agent) => (
+                <button
+                  key={agent.id}
+                  className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2"
+                  onClick={() => void pickPartner(agent.id)}
+                >
+                  {partnerAvatar(agent.name, true)}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[14px] font-medium text-ink">{agent.name}</span>
+                    <span className="block text-xs text-ink3">自定义伙伴</span>
+                  </span>
+                  {currentAgentId === agent.id && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
+                </button>
+              ))}
+            </div>
+          )}
+        </header>
+
+        {banner && (
+          <div className="bg-warm2 px-4 py-2 text-sm text-warm">{banner}</div>
+        )}
+
+        {/* 消息流 */}
+        <div className="flex-1 space-y-5 overflow-y-auto px-4 py-5" ref={scrollRef}>
           {items.map((item) =>
             item.kind === "switch" ? (
-              <div key={item.key} style={{ alignSelf: "center", fontSize: 12, color: "var(--ink-3)", borderTop: "1px dashed var(--line)", paddingTop: 6, width: "100%", textAlign: "center" }}>
+              <div key={item.key} className="flex items-center gap-3 text-xs text-ink3">
+                <span className="h-px flex-1 bg-line" />
                 {item.label}
+                <span className="h-px flex-1 bg-line" />
               </div>
             ) : item.kind === "user" ? (
-              <div key={item.key} className="bubble-user">
-                {item.text}
+              <div key={item.key} className="flex justify-end">
+                <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-accent2 px-4 py-3 text-[15px] leading-relaxed text-white">
+                  {item.text}
+                </div>
               </div>
             ) : item.kind === "assistant" ? (
-              <div key={item.key} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div key={item.key} className="flex max-w-[85%] flex-col gap-1.5">
                 {showReasoning && item.reasoning !== "" && (
-                  <details className="reasoning">
-                    <summary>思考过程</summary>
-                    <div className="body">{item.reasoning}</div>
+                  <details className="group">
+                    <summary className="cursor-pointer list-none text-xs text-ink3 transition hover:text-ink">思考过程 · 点击展开</summary>
+                    <div className="mt-1.5 rounded-lg border-l-2 border-accent bg-accent3/60 px-3 py-2 text-xs leading-relaxed text-ink2">
+                      {item.reasoning}
+                    </div>
                   </details>
                 )}
-                <div className="bubble-assistant">{item.text}</div>
+                <div className="whitespace-pre-wrap rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+                  {item.text}
+                </div>
               </div>
             ) : (
-              <div key={item.key} className="receipt">
-                <span className={item.ok ? "ok" : "err"}>{item.ok ? "✓" : "✕"}</span>
-                <span>{item.name}</span>
-                <span style={{ opacity: 0.8 }}>{item.text}</span>
+              <div key={item.key} className="flex gap-2.5">
+                <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${item.ok ? "bg-accent3 text-accent" : "bg-warm2 text-warm"}`}>
+                  {item.ok ? <CheckSolidIcon className="h-4 w-4" /> : <span className="text-xs font-bold">✕</span>}
+                </div>
+                <div className="rounded-xl border border-line bg-accent3/50 px-3 py-2 text-sm">
+                  <div className="font-medium text-ink">{item.name}</div>
+                  <div className="text-ink2">{item.text}</div>
+                </div>
               </div>
             ),
           )}
 
           {stream && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div className="flex max-w-[85%] flex-col gap-1.5">
               {stream.reasoning !== "" && (
-                <details className="reasoning" open>
-                  <summary>思考中…</summary>
-                  <div className="body">{stream.reasoning}</div>
+                <details open className="group">
+                  <summary className="cursor-pointer list-none text-xs text-ink3">思考中…</summary>
+                  <div className="mt-1.5 rounded-lg border-l-2 border-accent bg-accent3/60 px-3 py-2 text-xs leading-relaxed text-ink2">
+                    {stream.reasoning}
+                  </div>
                 </details>
               )}
-              {stream.text !== "" && <div className="bubble-assistant">{stream.text}</div>}
+              {stream.text !== "" && (
+                <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">{stream.text}</div>
+              )}
             </div>
           )}
         </div>
 
-        <div className="chat-input">
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "var(--ink-2)" }}>
-            <input type="checkbox" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
-            思维链
-          </label>
-          <textarea
-            className="input"
-            rows={1}
-            placeholder="说点什么，或随手记一笔…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-          />
-          <button className="btn" onClick={send}>
-            发送
-          </button>
-        </div>
+        {/* 输入区 */}
+        <footer className="border-t border-line px-4 py-3">
+          <div className="flex items-end gap-2">
+            <textarea
+              rows={1}
+              placeholder="说点什么，或随手记一笔…"
+              className="max-h-32 flex-1 resize-none rounded-xl border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <button
+              className="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+              onClick={() => void send()}
+            >
+              发送
+            </button>
+          </div>
+        </footer>
       </main>
     </div>
   );
