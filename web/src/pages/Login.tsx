@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { api } from "../api";
+import { Prism } from "../icons";
 
+/** 登录/注册：居中品牌区 + 分段切换，结构照 prototype 页 1 */
 export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
@@ -30,50 +32,82 @@ export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }
   };
 
   return (
-    <div className="card login-card">
-      <h2 style={{ margin: "4px 0 2px" }}>OpenPrism</h2>
-      <p className="muted" style={{ margin: 0 }}>记录生活 · 监督进步 · 陪伴聊天</p>
+    <div className="w-full max-w-sm">
+      {/* 品牌区 */}
+      <div className="mb-8 text-center">
+        <div className="mb-4 flex items-center justify-center gap-2">
+          <Prism className="h-7 w-7" />
+          <span className="text-2xl font-semibold tracking-tight text-ink">OpenPrism</span>
+        </div>
+        <p className="text-sm text-ink2">一个你，折射出生活的每一个维度</p>
+      </div>
 
-      <div className="tabs" style={{ margin: "18px 0 4px", display: "flex", gap: 4 }}>
-        <button className={`tab${mode === "login" ? " active" : ""}`} onClick={() => setMode("login")}>
+      {/* 分段切换 */}
+      <div className="mb-6 grid grid-cols-2 rounded-lg bg-surface2 p-1 text-sm">
+        <button
+          onClick={() => setMode("login")}
+          className={`rounded-md py-2 transition ${mode === "login" ? "bg-surface font-medium text-ink shadow-sm" : "text-ink3 hover:text-ink"}`}
+        >
           登录
         </button>
-        <button className={`tab${mode === "register" ? " active" : ""}`} onClick={() => setMode("register")}>
+        <button
+          onClick={() => setMode("register")}
+          className={`rounded-md py-2 transition ${mode === "register" ? "bg-surface font-medium text-ink shadow-sm" : "text-ink3 hover:text-ink"}`}
+        >
           注册
         </button>
       </div>
 
-      <label className="label">用户名</label>
-      <input className="input" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" />
-      <label className="label">密码</label>
-      <input
-        className="input"
-        type="password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        autoComplete={mode === "login" ? "current-password" : "new-password"}
-        onKeyDown={(e) => e.key === "Enter" && submit()}
-      />
-      {mode === "register" && (
-        <>
-          <label className="label">确认密码</label>
+      <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
+        {mode === "register" && (
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="confirm">确认密码</label>
+            <input
+              id="confirm"
+              type="password"
+              autoComplete="new-password"
+              className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+              placeholder="再输一遍"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </div>
+        )}
+        <div>
+          <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="user">用户名</label>
           <input
-            className="input"
-            type="password"
-            value={confirm}
-            onChange={(e) => setConfirm(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && submit()}
+            id="user"
+            type="text"
+            autoComplete="username"
+            className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+            placeholder="你的名字"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
           />
-        </>
-      )}
+        </div>
+        <div>
+          <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="pass">密码</label>
+          <input
+            id="pass"
+            type="password"
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+            className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+            placeholder="••••••••"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </div>
+        {error && <p className="text-sm text-warm">{error}</p>}
+        <button
+          type="submit"
+          disabled={busy}
+          className="w-full rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99] disabled:opacity-60"
+        >
+          {busy ? "请稍候…" : mode === "login" ? "登录" : "注册"}
+        </button>
+      </form>
 
-      {error && <p className="hint-err" style={{ fontSize: 13.5 }}>{error}</p>}
-      <button className="btn" style={{ width: "100%", marginTop: 16 }} disabled={busy} onClick={submit}>
-        {busy ? "请稍候…" : mode === "login" ? "登录" : "注册"}
-      </button>
-      <p className="muted" style={{ marginTop: 14, lineHeight: 1.6 }}>
-        自部署 · 数据在你自己的设备上 · 模型 Key 由你提供（BYOK）
-      </p>
+      <p className="mt-6 text-center text-xs text-ink3">数据只存在你自己的设备上 · 模型 Key 由你自己配置</p>
     </div>
   );
 }
