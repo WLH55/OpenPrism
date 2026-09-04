@@ -87,17 +87,44 @@ describe("query_ledger", () => {
     expect(today.plans.length).toBe(1);
     const plans = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { title: string }[] };
     expect(plans.plans[0]!.title).toBe("读书");
-    const flows = (await by("query_ledger").execute({ what: "flows", category: "运动" }, ctx)) as { flows: { category: string }[] };
+    const flows = (await by("query_ledger").execute({ what: "flows", category: "运动" }, ctx)) as { flows: { seq: number; category: string }[] };
     expect(flows.flows.length).toBe(1);
     expect(flows.flows[0]!.category).toBe("运动");
+    expect(Number.isInteger(flows.flows[0]!.seq)).toBe(true); // seq 是 void_flow 的引用凭据
+  });
+});
+
+describe("void_flow / cancel_plan（作废回路，2026-09-04 补）", () => {
+  it("void_flow 按 seq 作废：折叠后不可见、审计层保留；坏 seq 抛错", async () => {
+    const { ledger, by } = await freshTools();
+    const flow = (await by("record_flow").execute({ category: "餐饮", value: 999 }, ctx)) as { seq: number; category: string };
+    await by("void_flow").execute({ seq: flow.seq, reason: "记错金额" }, ctx);
+    expect(ledger.activeRecords().some((r) => r.seq === flow.seq)).toBe(false); // 折叠剔除
+    expect(ledger.readAll().some((r) => r.kind === "void")).toBe(true); // 审计保留
+    const again = (await by("record_flow").execute({ category: "餐饮", value: 28 }, ctx)) as { seq: number };
+    await by("void_flow").execute({ seq: again.seq }, ctx); // 无 reason 也行
+    await expect(by("void_flow").execute({ seq: 999 }, ctx)).rejects.toThrow();
+    await expect(by("void_flow").execute({}, ctx)).rejects.toThrow();
+  });
+
+  it("cancel_plan 按 planId 作废：计划从视图消失；未知 planId 抛错", async () => {
+    const { ledger, by } = await freshTools();
+    const plan = (await by("create_plan").execute({ title: "读书", scope: "day" }, ctx)) as { planId: string };
+    const value = (await by("cancel_plan").execute({ planId: plan.planId }, ctx)) as { title: string };
+    expect(value.title).toBe("读书");
+    const plans = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: unknown[] };
+    expect(plans.plans).toHaveLength(0);
+    expect(ledger.readAll().some((r) => r.kind === "void")).toBe(true);
+    await expect(by("cancel_plan").execute({ planId: "plan-nope" }, ctx)).rejects.toThrow();
   });
 });
 
 describe("工具契约", () => {
-  it("四工具齐备；写工具 exclusive、查询 parallel", async () => {
+  it("六工具齐备；写工具 exclusive、查询 parallel", async () => {
     const { tools, by } = await freshTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["checkin_plan", "create_plan", "query_ledger", "record_flow"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["cancel_plan", "checkin_plan", "create_plan", "query_ledger", "record_flow", "void_flow"]);
     expect(by("record_flow").isConcurrencySafe?.({})).toBeFalsy();
+    expect(by("void_flow").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("query_ledger").isConcurrencySafe?.({})).toBe(true);
   });
 

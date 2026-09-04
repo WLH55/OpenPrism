@@ -356,10 +356,17 @@ export class Scheduler {
   }
 }
 
-// ── 模型工具（双入口之一：与智能体对话建任务，D6.4） ──
+// ── 模型工具（双入口之一：与智能体对话管理任务，D6.4；2026-09-04 补齐 CRUD） ──
 
-export function createTaskTool(deps: { store: TaskStore; uid: string }): ToolDefinition {
-  return {
+export interface TaskToolsDeps {
+  store: TaskStore;
+  uid: string;
+  /** nextDueAt 展示用（query_tasks）；缺省 0（once 任务原样回 at） */
+  now(): number;
+}
+
+export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
+  const createTask: ToolDefinition = {
     name: "create_task",
     description: "为用户创建一个定时任务（提醒/定时检查）。触发时刻用结构化字段，解析不了就问用户，不要猜。",
     parameters: {
@@ -389,4 +396,111 @@ export function createTaskTool(deps: { store: TaskStore; uid: string }): ToolDef
     },
     isConcurrencySafe: () => false,
   };
+
+  const queryTasks: ToolDefinition = {
+    name: "query_tasks",
+    description: "查用户的定时任务列表：id、标题、触发、启用态、下次到点。用户问「我有哪些提醒」「那个任务还在吗」就用它。",
+    parameters: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean", description: "只看启用（true）或停用（false）的；缺省 = 全部" },
+      },
+    },
+    output: {
+      schema: { type: "object", required: ["tasks"], properties: { tasks: { type: "array" } } },
+      render: (_args, value) => {
+        const tasks = (value as { tasks: { title: string }[] }).tasks ?? [];
+        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => t.title).join("；")}`;
+        return [{ type: "text", text }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { enabled?: boolean };
+      const all = await deps.store.list(deps.uid);
+      const tasks = all
+        .filter((t) => (input.enabled === undefined ? true : t.enabled === input.enabled))
+        .map((t) => {
+          let nextDueAt: number | undefined;
+          try {
+            const due = nextDue(t.trigger, deps.now(), t.tzOffsetMinutes);
+            if (due !== null) nextDueAt = due;
+          } catch {
+            // 坏 trigger：列出原样，别让查询整体失败
+          }
+          return {
+            id: t.id,
+            title: t.title,
+            instruction: t.instruction,
+            trigger: t.trigger,
+            enabled: t.enabled,
+            ...(t.agentId !== undefined ? { agentId: t.agentId } : {}),
+            ...(t.lastRunTs !== undefined ? { lastRunTs: t.lastRunTs } : {}),
+            ...(nextDueAt !== undefined ? { nextDueAt } : {}),
+          };
+        });
+      return { tasks };
+    },
+    isConcurrencySafe: () => true,
+  };
+
+  const updateTask: ToolDefinition = {
+    name: "update_task",
+    description: "修改定时任务：启停（enabled）、改标题/指令/触发时刻。taskId 从 query_tasks 拿。",
+    parameters: {
+      type: "object",
+      required: ["taskId"],
+      properties: {
+        taskId: { type: "string" },
+        enabled: { type: "boolean" },
+        title: { type: "string" },
+        instruction: { type: "string" },
+        trigger: { type: "object", description: "与 create_task 同格式，整包替换" },
+      },
+    },
+    output: {
+      schema: { type: "object", required: ["id", "title", "enabled"], properties: { id: { type: "string" }, title: { type: "string" }, enabled: { type: "boolean" } } },
+      render: (_args, value) => {
+        const v = value as { title: string; enabled: boolean };
+        return [{ type: "text", text: `已更新任务「${v.title}」（${v.enabled ? "启用" : "停用"}）` }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { taskId?: string; enabled?: boolean; title?: string; instruction?: string; trigger?: TaskTrigger };
+      if (typeof input.taskId !== "string" || input.taskId === "") throw new Error("taskId 必填（query_tasks 拿）");
+      const patch: Parameters<TaskStore["update"]>[2] = {};
+      if (input.enabled !== undefined) patch.enabled = Boolean(input.enabled);
+      if (input.title !== undefined) patch.title = String(input.title);
+      if (input.instruction !== undefined) patch.instruction = String(input.instruction);
+      if (input.trigger !== undefined) patch.trigger = input.trigger as TaskTrigger;
+      if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger");
+      const task = await deps.store.update(deps.uid, input.taskId, patch);
+      return { id: task.id, title: task.title, enabled: task.enabled };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  const deleteTask: ToolDefinition = {
+    name: "delete_task",
+    description: "删除定时任务：用户说「这个提醒不要了/别再叫我」时用。删前不必确认服务器，但拿不准用户意图时先问一句。",
+    parameters: {
+      type: "object",
+      required: ["taskId"],
+      properties: { taskId: { type: "string" } },
+    },
+    output: {
+      schema: { type: "object", required: ["deleted"], properties: { deleted: { type: "string" } } },
+      render: (_args, value) => [{ type: "text", text: `已删除任务「${(value as { deleted: string }).deleted}」` }],
+    },
+    async execute(args) {
+      const taskId = String((args as { taskId?: string } | undefined)?.taskId ?? "");
+      if (taskId === "") throw new Error("taskId 必填（query_tasks 拿）");
+      const hit = (await deps.store.list(deps.uid)).find((t) => t.id === taskId);
+      if (!hit) throw new Error(`task "${taskId}" 不存在，先用 query_tasks 查`);
+      await deps.store.remove(deps.uid, taskId);
+      return { deleted: hit.title };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  return [createTask, queryTasks, updateTask, deleteTask];
 }

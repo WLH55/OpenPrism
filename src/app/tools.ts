@@ -1,4 +1,5 @@
-// 四录入工具（D3.4 同源铁律：模型只能经工具写账本；UI 是另一写入方，source 语义不同）。
+// 录入工具（D3.4 同源铁律：模型只能经工具写账本；UI 是另一写入方，source 语义不同）。
+// 六件：record_flow / create_plan / checkin_plan / query_ledger 只读 / void_flow+cancel_plan 走作废回路（2026-09-04 补）。
 // execute 返回 canonical JSON value；render 产出人话文本块（模型输入与 UI 回执共用）。
 
 import { randomUUID } from "node:crypto";
@@ -193,16 +194,81 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         const toKey = input.to !== undefined ? Math.floor(Date.parse(input.to + "T00:00:00Z") / 86400000) + 1 : Infinity;
         const flows = active
           .filter((r) => r.kind === "event")
-          .map((r) => r as { time: number; category: string; note?: string; value?: number; unit?: string })
+          .map((r) => r as { seq: number; time: number; category: string; note?: string; value?: number; unit?: string })
           .filter((r) => dayKey(r.time) >= fromKey && dayKey(r.time) < toKey)
           .filter((r) => input.category === undefined || r.category === input.category)
           .sort((a, b) => b.time - a.time);
-        return { flows };
+        return { flows }; // seq 是作废（void_flow）的引用凭据
       }
       throw new Error("what 必须是 today | plans | flows");
     },
     isConcurrencySafe: () => true,
   };
 
-  return [recordFlow, createPlan, checkinPlan, queryLedger];
+  const voidFlow: ToolDefinition = {
+    name: "void_flow",
+    description: "作废一笔记错/重复的流水（seq 从 query_ledger 的 flows 拿）。修正 = 作废后用 record_flow 重记，不要原地补偿。",
+    parameters: {
+      type: "object",
+      required: ["seq"],
+      properties: {
+        seq: { type: "integer", description: "要作废的流水 seq" },
+        reason: { type: "string", description: "作废原因（如：记错金额）" },
+      },
+    },
+    output: {
+      schema: { type: "object", required: ["seq"], properties: { seq: { type: "integer" } } },
+      render: (_args, value) => [{ type: "text", text: `已作废流水 #${(value as { seq: number }).seq}` }],
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { seq?: number; reason?: string };
+      const seq = Number(input.seq);
+      if (!Number.isInteger(seq)) throw new Error("seq 必填（query_ledger 的 flows 里有）");
+      const hit = ledger.activeRecords().find((r) => r.seq === seq && r.kind === "event");
+      if (!hit) throw new Error(`seq ${seq} 不是有效流水，先用 query_ledger 查`);
+      await append({
+        kind: "void",
+        source: "agent",
+        actor: actor(),
+        targetSeq: seq,
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      });
+      return { seq };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  const cancelPlan: ToolDefinition = {
+    name: "cancel_plan",
+    description: "取消一个计划/待办：作废后不再出现在今天视图。planId 从 query_ledger 的 plans 拿；已打的卡不受影响。",
+    parameters: {
+      type: "object",
+      required: ["planId"],
+      properties: {
+        planId: { type: "string" },
+        reason: { type: "string", description: "取消原因" },
+      },
+    },
+    output: {
+      schema: { type: "object", required: ["planId", "title"], properties: { planId: { type: "string" }, title: { type: "string" } } },
+      render: (_args, value) => [{ type: "text", text: `已取消计划「${(value as { title: string }).title}」` }],
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { planId?: string; reason?: string };
+      if (typeof input.planId !== "string" || input.planId === "") throw new Error("planId 必填（query_ledger 的 plans 里有）");
+      const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as PlanRecord).planId === input.planId);
+      if (!hit) throw new Error(`planId "${input.planId}" 不存在，先用 query_ledger 查`);
+      await append({
+        kind: "void",
+        source: "agent",
+        actor: actor(),
+        targetSeq: hit.seq,
+        reason: input.reason ?? "用户取消计划",
+      });
+      return { planId: input.planId, title: (hit as PlanRecord).title };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  return [recordFlow, createPlan, checkinPlan, queryLedger, voidFlow, cancelPlan];
 }

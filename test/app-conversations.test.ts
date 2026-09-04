@@ -106,7 +106,9 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await (await store.agent(UID, entry.id)).whenIdle();
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
-    expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual(["checkin_plan", "create_plan", "create_task", "query_ledger", "record_flow", "save_preference"]);
+    expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
+      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "update_task", "void_flow",
+    ]);
   });
 
   it("切换伙伴：systemPrompt 换人设下一步生效；切换历史落 meta；账本 actor 随当前伙伴", async () => {
@@ -156,7 +158,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "帮我看看");
     await (await store.agent(UID, entry.id)).whenIdle();
     const names = mock.requests[0]!.tools!.map((t) => t.name).sort();
-    expect(names).toEqual(["create_task", "load_skill", "query_ledger", "save_preference"]);
+    expect(names).toEqual(["create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "save_preference", "update_task"]);
     expect(mock.requests[0]!.system).toContain("健身复盘");
     expect(mock.requests[0]!.system).toContain("健身话题");
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
