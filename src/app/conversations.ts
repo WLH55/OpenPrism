@@ -15,7 +15,7 @@ import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt, defaultAssistantPrompt, extractAgentName } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, skillIndexFile, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, syncInjectionBlock } from "./memory";
-import { createTaskTool } from "./tasks";
+import { createTaskTools } from "./tasks";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
 
@@ -251,7 +251,7 @@ export class ConversationStore {
     }
     tools.push(createSavePreferenceTool({ store: this.deps.memory as unknown as import("./memory").MemoryStore, uid, now }));
     if (this.deps.tasks) {
-      tools.push(createTaskTool({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid }));
+      tools.push(...createTaskTools({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid, now }));
     }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));

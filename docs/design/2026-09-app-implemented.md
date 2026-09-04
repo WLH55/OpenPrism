@@ -2,7 +2,7 @@
 
 > 交付视角的现状文档：每个功能给「实现原理 → 代码位置 → 怎么实现」，与设计纪要 [2026-09-app.md](2026-09-app.md)（D1–D11 决策）逐条对照，是「决策 → 落地」的映射。
 > 术语表见 [CONTEXT.md](../../CONTEXT.md)；harness 地基见 [2026-09-harness.md](2026-09-harness.md)。
-> 版本基线：截至 `53599ae`（web UI 全量对齐原型），`pnpm typecheck` 0 错误、`pnpm test` 185 全绿。
+> 版本基线：截至 `53599ae`（web UI 全量对齐原型）+ 2026-09-04 增补（模型侧任务 CRUD + 账本修正工具），`pnpm typecheck` 0 错误、`pnpm test` 190 全绿。
 
 ## 总览
 
@@ -37,9 +37,9 @@ OpenPrism 现在是**自托管的生活记录助理应用**，叠加在纯 TS ag
 - **实现**：时间语义统一 `tzOffsetMinutes`（UTC 加多少分钟得当地，如中国 +480）；计划是否覆盖"今天"由 `planScopeCoversToday` 决定（day=同日 / week=当地周一为一周之始 / month·year 比对年月 / ndays=滚动窗口 / deadline=截止日未过）；`streakDays` 连续到今天没记则从昨天起算；近 30 天序列**缺日补零**（折线与热力图共用）。分类即维度——目录从实际记过的流水动态长出，**零预置、零配置**（用户价值观：不做任何预设模板）。
 
 ### 3. 同源铁律：模型只能经工具写账本
-- **原理**：写入类工具（`record_flow`/`create_plan`/`checkin_plan`）`isConcurrencySafe: false`，并发严格排队；`render` 产出人话文本回执，UI 与模型共用同一句文案。
+- **原理**：写入类工具（`record_flow`/`create_plan`/`checkin_plan`/`void_flow`/`cancel_plan`）`isConcurrencySafe: false`，并发严格排队；`render` 产出人话文本回执，UI 与模型共用同一句文案。
 - **代码**：`src/app/tools.ts`；纪律写死在系统提示词（`src/app/persona.ts` 的 `DISCIPLINE`）。
-- **实现**：agent 来源记录带 `actor`（会话 cid + 当前伙伴名），归属可追溯；UI 是另一写入方（`source: "ui"`）。
+- **实现**：agent 来源记录带 `actor`（会话 cid + 当前伙伴名），归属可追溯；UI 是另一写入方（`source: "ui"`）。**2026-09-04 补修正回路**：`void_flow`（按 seq 作废流水，修正 = 作废后重记）、`cancel_plan`（按 planId 作废计划）；`query_ledger` flows 输出带 seq 作引用凭据——聊天更正与面板编辑共用同一 void 原语。
 
 ### 4. BYOK Key 密封铁律
 - **原理**：API Key **只以 AES-256-GCM 密文落盘**（`model.json` 的 `keyEnc`），主密钥 32B 落 `data/secret.key`（gitignore）。明文只在内存短暂存在、只发往用户配置的 baseURL；接口永不回传 Key（`GET /api/model` 只给 `hasKey` 布尔）。
@@ -83,7 +83,7 @@ OpenPrism 现在是**自托管的生活记录助理应用**，叠加在纯 TS ag
 
 | 功能 | 原理 | 代码 | 实现要点 |
 |---|---|---|---|
-| 任务模型 | 四字段：agentId/trigger/instruction/enabled | `tasks.ts` `TaskDef` | 双入口：模型对话 `create_task` 工具 + UI/API 直建 |
+| 任务模型 | 四字段：agentId/trigger/instruction/enabled | `tasks.ts` `TaskDef` | 双入口：模型对话四工具（`create_task`/`query_tasks`/`update_task`/`delete_task`，2026-09-04 补齐 CRUD——起因：用户实测"只能建不能撤"）+ UI/API 直建 |
 | 触发 | 枚举 + cron 逃生门 | `tasks.ts` `cronMatches`/`nextDue` | 自研零依赖 5 段匹配器（`* n a-b a,b */n`，周日 0\|7 归一）；**全部在任务时区求值**；cron 逐分钟前进、上限 2 年 |
 | 执行 | 到点投 `instruction` 进**任务专属持久会话**跑离线回合 | `conversations.ts:165-170`（`taskAgent`）、`main.ts:85-96`（`taskRunner`） | 与聊天回合同权装配（伙伴 = task.agentId 快照，人设仍热读）；收口后把最后一条 assistant/message 文本落站内通知 |
 | 补跑不补吵 | 锚点 = `lastRunTs ?? createdTs` | `tasks.ts` `Scheduler.tick` | 错过 <24h 补最近一次；≥24h 记 `skipped` 并推进锚点（不堆积）；30s 一 tick；支持手动 `POST …/run` |
@@ -112,7 +112,7 @@ OpenPrism 现在是**自托管的生活记录助理应用**，叠加在纯 TS ag
 
 ## 七、质量与验证
 
-- `pnpm typecheck`：0 错误；`pnpm test`：185 全绿（23 文件，含 harness 不变量守护：model-visible means logged、tool_call/result 配对、确定性测试，及真实厂商冒烟）。
+- `pnpm typecheck`：0 错误；`pnpm test`：190 全绿（23 文件，含 harness 不变量守护：model-visible means logged、tool_call/result 配对、确定性测试，及真实厂商冒烟）。
 - UI 验收：12 页 + 深/浅双主题逐页浏览器截图 + 功能冒烟（含白背景 bug 修复：`theme.css` 基层层补 `body{background:var(--bg)}`）。
 - 各批次 spec 在 `mydocs/specs/`，UI 对齐 spec：`2026-09-04_00-00_ui-align-prototype.md`（Review PASS）。
 - 已知刻意边界：简报无预设无独立机制（纯定时任务用法，D7 已收口）；任务在未配模型时执行会记一条 `failed` 运行记录（detail 说明原因），不静默也不堆积；记忆凝练依赖 BYOK 模型已配置。

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nodeEnv, nodeFileIO } from "../src/app/env";
 import { appPaths, type AppPaths } from "../src/app/store";
-import { createTaskTool, cronMatches, nextDue, Scheduler, TaskStore, type TaskTrigger } from "../src/app/tasks";
+import { createTaskTools, cronMatches, nextDue, Scheduler, TaskStore, type TaskTrigger } from "../src/app/tasks";
 
 let root: string;
 let paths: AppPaths;
@@ -142,15 +142,56 @@ describe("Scheduler", () => {
   });
 });
 
-describe("create_task 工具（双入口之二）", () => {
-  it("execute 落任务；坏 trigger 抛错（isError 化）", async () => {
+describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () => {
+  const NOW = Date.UTC(2026, 8, 3, 12, 0, 0); // 当地 20:00
+  const ctx = { signal: new AbortController().signal, env: nodeEnv };
+
+  function makeTools(uid: string) {
     const store = new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "tid-tool" });
-    const tool = createTaskTool({ store, uid: "u-tool" });
-    const ctx = { signal: new AbortController().signal, env: nodeEnv };
-    const value = (await tool.execute({ title: "喝水", instruction: "提醒喝水", trigger: { kind: "daily", time: "10:00" } }, ctx)) as { taskId: string };
+    const tools = createTaskTools({ store, uid, now: () => NOW });
+    return { store, tools, by: (name: string) => tools.find((t) => t.name === name)! };
+  }
+
+  it("create 落任务；坏 trigger 抛错（isError 化）；写工具 exclusive、查询 parallel", async () => {
+    const { store, by } = makeTools("u-create");
+    const value = (await by("create_task").execute({ title: "喝水", instruction: "提醒喝水", trigger: { kind: "daily", time: "10:00" } }, ctx)) as { taskId: string };
     expect(value.taskId).toBe("tid-tool");
-    expect((await store.list("u-tool"))).toHaveLength(1);
-    await expect(tool.execute({ title: "x", instruction: "y", trigger: { kind: "daily", time: "99:00" } }, ctx)).rejects.toThrow();
-    expect(tool.isConcurrencySafe?.({})).toBeFalsy();
+    expect(await store.list("u-create")).toHaveLength(1);
+    await expect(by("create_task").execute({ title: "x", instruction: "y", trigger: { kind: "daily", time: "99:00" } }, ctx)).rejects.toThrow();
+    expect(by("create_task").isConcurrencySafe?.({})).toBeFalsy();
+    expect(by("query_tasks").isConcurrencySafe?.({})).toBe(true);
+  });
+
+  it("query_tasks：列出 id/触发/启用态，nextDueAt 按任务时区算；enabled 过滤", async () => {
+    const { store, by } = makeTools("u-query");
+    await store.create("u-query", { title: "睡觉", instruction: "x", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
+    const result = (await by("query_tasks").execute({}, ctx)) as { tasks: { id: string; title: string; enabled: boolean; nextDueAt: number }[] };
+    expect(result.tasks).toHaveLength(1);
+    expect(result.tasks[0]!.title).toBe("睡觉");
+    expect(result.tasks[0]!.enabled).toBe(true);
+    // NOW = 当地 9-3 20:00 → daily 23:00 的下次 = 当地 9-3 23:00
+    expect(new Date(result.tasks[0]!.nextDueAt + TZ * 60000).toISOString()).toBe("2026-09-03T23:00:00.000Z");
+    const off = (await by("query_tasks").execute({ enabled: false }, ctx)) as { tasks: unknown[] };
+    expect(off.tasks).toHaveLength(0);
+  });
+
+  it("update_task：停用/改触发；坏 trigger 拒绝；空 patch 拒绝", async () => {
+    const { store, by } = makeTools("u-update");
+    const task = await store.create("u-update", { title: "晨跑", instruction: "x", trigger: { kind: "daily", time: "07:00" } });
+    const updated = (await by("update_task").execute({ taskId: task.id, enabled: false }, ctx)) as { enabled: boolean };
+    expect(updated.enabled).toBe(false);
+    expect((await store.list("u-update"))[0]!.trigger).toEqual({ kind: "daily", time: "07:00" });
+    await expect(by("update_task").execute({ taskId: task.id, trigger: { kind: "cron", expr: "oops" } }, ctx)).rejects.toThrow();
+    await expect(by("update_task").execute({ taskId: task.id }, ctx)).rejects.toThrow();
+    await expect(by("update_task").execute({ taskId: "nope", enabled: true }, ctx)).rejects.toThrow();
+  });
+
+  it("delete_task：删除后列表为空；不存在抛错", async () => {
+    const { store, by } = makeTools("u-delete");
+    const task = await store.create("u-delete", { title: "23:30 那个", instruction: "x", trigger: { kind: "daily", time: "23:30" } });
+    const value = (await by("delete_task").execute({ taskId: task.id }, ctx)) as { deleted: string };
+    expect(value.deleted).toBe("23:30 那个");
+    expect(await store.list("u-delete")).toHaveLength(0);
+    await expect(by("delete_task").execute({ taskId: task.id }, ctx)).rejects.toThrow();
   });
 });
