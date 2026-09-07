@@ -1,10 +1,37 @@
-// 智能体三段配置之「人设卡 + 能力绑定」（D4/4.1）：
-// persona.md = 纯自由 markdown（名字随 H1 重推导）；binding.json = 内置工具开关 + 技能/MCP 绑定。
+// 智能体三段配置之「身份/灵魂 + 能力绑定」（D4/4.1，ADR 0008 领域表）：
+// agents 表 = 身份（名字/描述/形象 emoji+色盘+头像/回复语言/默认模型）+ persona_md（= 灵魂 SOUL）+ bindings_json（工具开关 + 技能/MCP 绑定）。
+// 2026-09-07 五步向导改版（对齐 DeepTutor）：身份字段入库，名字显式优先（H1 推导仅作创建兜底）。
+// snapshotSync 供 conversations 的 systemPrompt 每步同步取用（node:sqlite 同步 API，语义不破）。
 
-import { join } from "node:path";
-import type { FileIO } from "../harness/index";
-import type { AppPaths } from "./store";
+import type { DatabaseSync } from "node:sqlite";
 import { extractAgentName } from "./persona";
+
+/** 伙伴身份（向导第①步 + 心智的默认模型） */
+export interface AgentIdentity {
+  description: string;
+  emoji: string;
+  color: string;
+  avatar?: string; // data:image/* data URL
+  language: string; // ''=自动跟随 | 'zh' | 'en'
+  modelProviderId?: string; // 伙伴默认模型；缺省 = 跟随会话/全局
+}
+
+const LANGUAGES = ["", "zh", "en"];
+const AVATAR_RE = /^data:image\/(png|jpeg|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/;
+const AVATAR_MAX = 200_000;
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+/** 身份字段校验（store 层守门，路由与测试共用）；非法即抛错 */
+export function validateIdentityPatch(patch: Partial<AgentIdentity & { name?: string }>): void {
+  if (patch.name !== undefined && String(patch.name).length > 64) throw new Error("name 超过 64 字上限");
+  if (patch.description !== undefined && String(patch.description).length > 500) throw new Error("description 超过 500 字上限");
+  if (patch.emoji !== undefined && String(patch.emoji).length > 16) throw new Error("emoji 超过 16 字上限");
+  if (patch.name !== undefined && String(patch.name).trim() === "") throw new Error("name 不能为空");
+  if (patch.avatar !== undefined && patch.avatar !== "" && !AVATAR_RE.test(patch.avatar)) throw new Error("avatar 必须是 data:image/* base64");
+  if (patch.avatar !== undefined && patch.avatar.length > AVATAR_MAX) throw new Error(`avatar 超过 ${AVATAR_MAX} 字符上限`);
+  if (patch.language !== undefined && !LANGUAGES.includes(patch.language)) throw new Error("language 只能是 '' | zh | en");
+  if (patch.color !== undefined && patch.color !== "" && !COLOR_RE.test(patch.color)) throw new Error("color 需要 #rrggbb");
+}
 
 export interface AgentEntry {
   id: string;
@@ -19,124 +46,156 @@ export interface AgentBinding {
   mcps: string[];
 }
 
-interface AgentIndexEntry extends AgentEntry {
-  binding: AgentBinding;
-}
-
 export interface AgentStoreDeps {
-  fileIO: FileIO;
-  paths: AppPaths;
+  db: DatabaseSync;
   now(): number;
   randomUUID(): string;
 }
 
-const INDEX = "index.jsonl";
-
-/** persona.md 的规范路径（conversations 的 systemPrompt 每步同步重取用） */
-export function agentPersonaFile(paths: AppPaths, uid: string, aid: string): string {
-  return join(paths.userDir(uid), "agents", aid, "persona.md");
+interface AgentRow {
+  id: string;
+  name: string;
+  persona_md: string;
+  bindings_json: string;
+  description: string;
+  emoji: string;
+  color: string;
+  avatar: string | null;
+  language: string;
+  model_provider_id: string | null;
+  created_ts: number;
 }
 
-/** agents 索引的规范路径 */
-export function agentIndexFile(paths: AppPaths, uid: string): string {
-  return join(paths.userDir(uid), "agents", INDEX);
+const DEFAULT_BINDING: AgentBinding = { skills: [], mcps: [] };
+
+function toIdentity(row: AgentRow): AgentIdentity {
+  return {
+    description: row.description ?? "",
+    emoji: row.emoji ?? "",
+    color: row.color ?? "",
+    ...(row.avatar ? { avatar: row.avatar } : {}),
+    language: row.language ?? "",
+    ...(row.model_provider_id ? { modelProviderId: row.model_provider_id } : {}),
+  };
 }
+
+const IDENTITY_COLS = "id, uid, name, persona_md, bindings_json, description, emoji, color, avatar, language, model_provider_id, created_ts";
 
 export class AgentStore {
   constructor(private deps: AgentStoreDeps) {}
 
-  private dir(uid: string): string {
-    return join(this.deps.paths.userDir(uid), "agents");
-  }
-  private indexFile(uid: string): string {
-    return join(this.dir(uid), INDEX);
-  }
-  private agentDir(uid: string, aid: string): string {
-    return join(this.dir(uid), aid);
-  }
-  private personaFile(uid: string, aid: string): string {
-    return join(this.agentDir(uid, aid), "persona.md");
-  }
-  private bindingFile(uid: string, aid: string): string {
-    return join(this.agentDir(uid, aid), "binding.json");
+  private getRow(uid: string, aid: string): AgentRow | undefined {
+    return this.deps.db
+      .prepare(`SELECT ${IDENTITY_COLS} FROM agents WHERE id = ? AND uid = ?`)
+      .get(aid, uid) as unknown as AgentRow | undefined;
   }
 
-  private async loadIndex(uid: string): Promise<AgentIndexEntry[]> {
-    const entries: AgentIndexEntry[] = [];
-    for (const line of await this.deps.fileIO.readAll(this.indexFile(uid))) {
-      try {
-        const entry = JSON.parse(line) as AgentIndexEntry;
-        if (typeof entry?.id === "string") entries.push(entry);
-      } catch {
-        // 崩溃半行
-      }
+  private static toBinding(json: string): AgentBinding {
+    try {
+      const parsed = JSON.parse(json) as AgentBinding;
+      if (Array.isArray(parsed?.skills) && Array.isArray(parsed?.mcps)) return parsed;
+    } catch {
+      // 坏行防御
     }
-    return entries;
+    return DEFAULT_BINDING;
   }
 
-  async list(uid: string): Promise<(AgentEntry & { binding: AgentBinding })[]> {
-    return this.loadIndex(uid);
+  async list(uid: string): Promise<(AgentEntry & { identity: AgentIdentity; binding: AgentBinding })[]> {
+    const rows = this.deps.db
+      .prepare(`SELECT ${IDENTITY_COLS} FROM agents WHERE uid = ? ORDER BY created_ts, id`)
+      .all(uid) as unknown as AgentRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      createdTs: row.created_ts,
+      identity: toIdentity(row),
+      binding: AgentStore.toBinding(row.bindings_json),
+    }));
   }
 
-  async create(uid: string, input: { persona: string; binding?: AgentBinding }): Promise<AgentEntry> {
+  async create(
+    uid: string,
+    input: { name?: string; persona: string; identity?: Partial<AgentIdentity>; binding?: AgentBinding },
+  ): Promise<AgentEntry> {
+    validateIdentityPatch(input.identity ?? {});
     const id = this.deps.randomUUID();
-    const entry: AgentIndexEntry = {
-      id,
-      name: extractAgentName(input.persona) || "助手",
-      createdTs: this.deps.now(),
-      binding: input.binding ?? { skills: [], mcps: [] },
-    };
-    await this.deps.fileIO.appendLine(this.indexFile(uid), JSON.stringify(entry));
-    // 人设正文原样落盘（不走 JSONL 语义）
-    const { mkdir, writeFile } = await import("node:fs/promises");
-    const file = this.personaFile(uid, id);
-    await mkdir(join(file, ".."), { recursive: true });
-    await writeFile(file, input.persona, "utf8");
-    return { id: entry.id, name: entry.name, createdTs: entry.createdTs };
+    // 名字显式优先；H1 推导只作兜底（向导一定显式给名）
+    const name = input.name?.trim() || extractAgentName(input.persona) || "助手";
+    const createdTs = this.deps.now();
+    const identity = input.identity ?? {};
+    this.deps.db
+      .prepare(
+        `INSERT INTO agents (id, uid, name, persona_md, bindings_json, description, emoji, color, avatar, language, model_provider_id, created_ts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        uid,
+        name,
+        input.persona,
+        JSON.stringify(input.binding ?? DEFAULT_BINDING),
+        identity.description ?? "",
+        identity.emoji ?? "",
+        identity.color ?? "",
+        identity.avatar ?? null,
+        identity.language ?? "",
+        identity.modelProviderId ?? null,
+        createdTs,
+      );
+    return { id, name, createdTs };
   }
 
   async persona(uid: string, aid: string): Promise<string> {
-    // markdown 正文含空行，须原样读（FileIO.readAll 的 JSONL 语义会滤掉空行）
-    const { readFile } = await import("node:fs/promises");
-    try {
-      return await readFile(this.personaFile(uid, aid), "utf8");
-    } catch {
-      throw new Error(`agent "${aid}" 不存在`);
-    }
+    const row = this.getRow(uid, aid);
+    if (!row) throw new Error(`agent "${aid}" 不存在`);
+    return row.persona_md;
   }
 
+  /** 同步快照（systemPrompt 每步重取：身份/灵魂/绑定热更，D4.2）；agent 不存在 = null（退默认身份） */
+  snapshotSync(uid: string, aid: string): { name: string; persona: string; identity: AgentIdentity; binding: AgentBinding } | null {
+    const row = this.getRow(uid, aid);
+    if (!row) return null;
+    return { name: row.name || "助手", persona: row.persona_md, identity: toIdentity(row), binding: AgentStore.toBinding(row.bindings_json) };
+  }
+
+  /** 灵魂编辑：名字不再随 H1 重推导（向导起的名字是显式资产；改名走 updateIdentity） */
   async updatePersona(uid: string, aid: string, markdown: string): Promise<AgentEntry> {
-    await this.persona(uid, aid); // 不存在则抛
-    const { rename, writeFile } = await import("node:fs/promises");
-    const file = this.personaFile(uid, aid);
-    const tmp = file + ".tmp";
-    await writeFile(tmp, markdown, "utf8");
-    await rename(tmp, file);
-    const name = extractAgentName(markdown) || "助手";
-    const entries = await this.loadIndex(uid);
-    const entry = entries.find((e) => e.id === aid)!;
-    entry.name = name;
-    const { mkdir } = await import("node:fs/promises");
-    await mkdir(this.dir(uid), { recursive: true });
-    await writeFile(this.indexFile(uid), entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
-    return { id: aid, name, createdTs: entry.createdTs };
+    const row = this.getRow(uid, aid);
+    if (!row) throw new Error(`agent "${aid}" 不存在`);
+    this.deps.db.prepare("UPDATE agents SET persona_md = ? WHERE id = ? AND uid = ?").run(markdown, aid, uid);
+    return { id: aid, name: row.name, createdTs: row.created_ts };
+  }
+
+  /** 身份补丁（向导/配置页共用）：字段级校验后落库；undefined 字段不动 */
+  async updateIdentity(uid: string, aid: string, patch: Partial<AgentIdentity & { name?: string }>): Promise<AgentEntry> {
+    const row = this.getRow(uid, aid);
+    if (!row) throw new Error(`agent "${aid}" 不存在`);
+    validateIdentityPatch(patch);
+    const next = {
+      name: patch.name !== undefined ? String(patch.name).trim() : row.name,
+      description: patch.description ?? row.description,
+      emoji: patch.emoji ?? row.emoji,
+      color: patch.color ?? row.color,
+      avatar: patch.avatar ?? row.avatar,
+      language: patch.language ?? row.language,
+      modelProviderId: patch.modelProviderId === undefined ? row.model_provider_id : patch.modelProviderId === "" ? null : patch.modelProviderId,
+    };
+    this.deps.db
+      .prepare(
+        "UPDATE agents SET name = ?, description = ?, emoji = ?, color = ?, avatar = ?, language = ?, model_provider_id = ? WHERE id = ? AND uid = ?",
+      )
+      .run(next.name, next.description, next.emoji, next.color, next.avatar, next.language, next.modelProviderId, aid, uid);
+    return { id: aid, name: next.name, createdTs: row.created_ts };
   }
 
   async updateBinding(uid: string, aid: string, binding: AgentBinding): Promise<void> {
-    const entries = await this.loadIndex(uid);
-    const entry = entries.find((e) => e.id === aid);
-    if (!entry) throw new Error(`agent "${aid}" 不存在`);
-    entry.binding = binding;
-    const { writeFile } = await import("node:fs/promises");
-    await writeFile(this.indexFile(uid), entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+    const row = this.getRow(uid, aid);
+    if (!row) throw new Error(`agent "${aid}" 不存在`);
+    this.deps.db.prepare("UPDATE agents SET bindings_json = ? WHERE id = ? AND uid = ?").run(JSON.stringify(binding), aid, uid);
   }
 
   async remove(uid: string, aid: string): Promise<void> {
-    const entries = await this.loadIndex(uid);
-    if (!entries.some((e) => e.id === aid)) throw new Error(`agent "${aid}" 不存在`);
-    const kept = entries.filter((e) => e.id !== aid);
-    const { writeFile, rm } = await import("node:fs/promises");
-    await writeFile(this.indexFile(uid), kept.map((e) => JSON.stringify(e)).join("\n") + (kept.length ? "\n" : ""), "utf8");
-    await rm(this.agentDir(uid, aid), { recursive: true, force: true }).catch(() => undefined);
+    const result = this.deps.db.prepare("DELETE FROM agents WHERE id = ? AND uid = ?").run(aid, uid);
+    if (result.changes === 0) throw new Error(`agent "${aid}" 不存在`);
   }
 }

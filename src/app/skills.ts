@@ -1,17 +1,11 @@
-// 技能（D4b.1/4b.2）：标准 Agent Skill（目录 + SKILL.md），自带自装（批次 2 = 粘贴单文件内容；git URL 导入留后）。
-// 渐进式加载：目录层（name + description + when_to_use，description ≤1024 字符硬约束）常驻 system prompt；
-// 正文层经 load_skill 工具按需载入——载入 = 工具事件落 Session Log，"模型可见即日志可重建"天然满足。
+// 技能（D4b.1/4b.2，ADR 0008 领域表）：skills 表 = 目录层（name/description/when_to_use）+ body_md 正文。
+// 渐进式加载：目录层常驻 system prompt；正文层经 load_skill 工具按需载入——载入 = 工具事件落会话日志，
+// "模型可见即日志可重建"天然满足。
 
-import { join } from "node:path";
-import type { FileIO, ToolDefinition } from "../harness/index";
-import type { AppPaths } from "./store";
+import type { DatabaseSync } from "node:sqlite";
+import type { ToolDefinition } from "../harness/index";
 
 const DESCRIPTION_LIMIT = 1024;
-
-/** 技能索引的规范路径（conversations 的 systemPrompt 每步同步重取用） */
-export function skillIndexFile(pathsLike: { userDir(uid: string): string }, uid: string): string {
-  return join(pathsLike.userDir(uid), "skills", "index.jsonl");
-}
 
 export interface ParsedSkill {
   name: string;
@@ -50,37 +44,44 @@ export interface SkillMeta {
 }
 
 export interface SkillStoreDeps {
-  fileIO: FileIO;
-  paths: AppPaths;
+  db: DatabaseSync;
   now(): number;
   randomUUID(): string;
+}
+
+interface SkillRow {
+  id: string;
+  name: string;
+  description: string;
+  when_to_use: string | null;
+}
+
+function rowToMeta(row: SkillRow): SkillMeta {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    ...(row.when_to_use !== null ? { whenToUse: row.when_to_use } : {}),
+  };
 }
 
 export class SkillStore {
   constructor(private deps: SkillStoreDeps) {}
 
-  private indexFile(uid: string): string {
-    return join(this.deps.paths.userDir(uid), "skills", "index.jsonl");
-  }
-  private skillFile(uid: string, sid: string): string {
-    return join(this.deps.paths.userDir(uid), "skills", sid, "SKILL.md");
-  }
-
-  private async loadIndex(uid: string): Promise<SkillMeta[]> {
-    const metas: SkillMeta[] = [];
-    for (const line of await this.deps.fileIO.readAll(this.indexFile(uid))) {
-      try {
-        const meta = JSON.parse(line) as SkillMeta;
-        if (typeof meta?.id === "string") metas.push(meta);
-      } catch {
-        // 崩溃半行
-      }
-    }
-    return metas;
-  }
-
   async list(uid: string): Promise<SkillMeta[]> {
-    return this.loadIndex(uid);
+    const rows = this.deps.db
+      .prepare("SELECT id, name, description, when_to_use FROM skills WHERE uid = ? ORDER BY created_ts, id")
+      .all(uid) as unknown as SkillRow[];
+    return rows.map(rowToMeta);
+  }
+
+  /** 同步取绑定技能的目录层（systemPrompt 每步重取；ids 为空数组返回空） */
+  listSync(uid: string, ids: string[]): SkillMeta[] {
+    if (ids.length === 0) return [];
+    const all = this.deps.db
+      .prepare("SELECT id, name, description, when_to_use FROM skills WHERE uid = ? ORDER BY created_ts, id")
+      .all(uid) as unknown as SkillRow[];
+    return all.map(rowToMeta).filter((meta) => ids.includes(meta.id));
   }
 
   async create(uid: string, content: string): Promise<SkillMeta> {
@@ -91,34 +92,23 @@ export class SkillStore {
       description: parsed.description,
       ...(parsed.whenToUse !== undefined ? { whenToUse: parsed.whenToUse } : {}),
     };
-    await this.deps.fileIO.appendLine(this.indexFile(uid), JSON.stringify(meta));
-    // 正文原样落盘（不走 JSONL 语义）
-    const { mkdir, writeFile } = await import("node:fs/promises");
-    const file = this.skillFile(uid, meta.id);
-    await mkdir(join(file, ".."), { recursive: true });
-    await writeFile(file, content, "utf8");
+    this.deps.db
+      .prepare("INSERT INTO skills (id, uid, name, description, when_to_use, body_md, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(meta.id, uid, meta.name, meta.description, parsed.whenToUse ?? null, content, this.deps.now());
     return meta;
   }
 
   async body(uid: string, sid: string): Promise<string> {
-    // markdown 正文含空行，须原样读（FileIO.readAll 的 JSONL 语义会滤掉空行）
-    const { readFile } = await import("node:fs/promises");
-    try {
-      return await readFile(this.skillFile(uid, sid), "utf8");
-    } catch {
-      throw new Error(`skill "${sid}" 不存在`);
-    }
+    const row = this.deps.db.prepare("SELECT body_md FROM skills WHERE id = ? AND uid = ?").get(sid, uid) as
+      | { body_md: string }
+      | undefined;
+    if (!row) throw new Error(`skill "${sid}" 不存在`);
+    return row.body_md;
   }
 
   async remove(uid: string, sid: string): Promise<void> {
-    const metas = await this.loadIndex(uid);
-    if (!metas.some((m) => m.id === sid)) throw new Error(`skill "${sid}" 不存在`);
-    const kept = metas.filter((m) => m.id !== sid);
-    const { writeFile, rm } = await import("node:fs/promises");
-    const index = this.indexFile(uid);
-    await writeFile(index, kept.map((m) => JSON.stringify(m)).join("\n") + (kept.length ? "\n" : ""), "utf8");
-    const dir = join(this.deps.paths.userDir(uid), "skills", sid);
-    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    const result = this.deps.db.prepare("DELETE FROM skills WHERE id = ? AND uid = ?").run(sid, uid);
+    if (result.changes === 0) throw new Error(`skill "${sid}" 不存在`);
   }
 }
 

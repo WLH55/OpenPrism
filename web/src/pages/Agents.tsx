@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { api2, type AgentBindingLoose, type AgentLoose, type McpLoose, type SkillLoose } from "../api";
+import { api, api2, type AgentBindingLoose, type AgentLoose, type McpLoose, type ModelProvider, type SkillLoose } from "../api";
 import { ArrowLeftIcon } from "../icons";
 import { Toggle } from "../ui";
+import { AgentWizard } from "../components/AgentWizard";
+import { FaceAvatar, FaceEditor } from "../components/FaceEditor";
+import { SOUL_TEMPLATES } from "../soulTemplates";
 
 const BUILTIN_TOOLS: { name: string; label: string; hint?: string }[] = [
   { name: "record_flow", label: "记账" },
@@ -10,77 +13,46 @@ const BUILTIN_TOOLS: { name: string; label: string; hint?: string }[] = [
   { name: "query_ledger", label: "查询统计", hint: "读账本，只读" },
 ];
 
-/** 伙伴列表页：卡片（头像/徽章）+ 新建，结构照 prototype 页 7 */
+/** 伙伴列表页：FaceAvatar 卡片 + 五步向导新建（身份→灵魂→心智→资料库→审阅） */
 export function Agents({ onEdit, onCreated }: { onEdit: (id: string) => void; onCreated: (id: string) => void }) {
   const [agents, setAgents] = useState<AgentLoose[]>([]);
-  const [draft, setDraft] = useState("");
-  const [message, setMessage] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [wizard, setWizard] = useState(false);
 
   const reload = useCallback(async () => setAgents(await api2.listAgents()), []);
   useEffect(() => {
     void reload().catch(() => undefined);
   }, [reload]);
 
-  const create = async () => {
-    if (draft.trim() === "") {
-      setMessage("先写一段人设（markdown 自由书写，首行 # 名字）");
-      return;
-    }
-    try {
-      const created = await api2.createAgent(draft);
-      setDraft("");
-      setCreating(false);
-      onCreated(created.id);
-    } catch (e) {
-      setMessage(`创建失败：${(e as Error).message}`);
-    }
-  };
+  if (wizard) {
+    return (
+      <AgentWizard
+        onCancel={() => setWizard(false)}
+        onDone={(id) => {
+          setWizard(false);
+          onCreated(id);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
       <header className="mb-5 flex items-end justify-between">
         <div>
-          <div className="text-xs text-ink3">自定义人设 · 共享同一份对你的记忆</div>
+          <div className="text-xs text-ink3">自定义伙伴 · 共享同一份对你的记忆</div>
           <h1 className="text-2xl font-semibold tracking-tight text-ink">伙伴</h1>
         </div>
         <button
           className="rounded-lg bg-accent2 px-3.5 py-2 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
-          onClick={() => setCreating(!creating)}
+          onClick={() => setWizard(true)}
         >
           ＋ 新建伙伴
         </button>
       </header>
 
-      {/* 新建：人设草稿 */}
-      {creating && (
-        <div className="mb-5 rounded-xl border border-line bg-surface p-4">
-          <label className="mb-1.5 block text-sm font-medium text-ink">人设卡 · 自由 markdown（名称从一级标题推导）</label>
-          <textarea
-            rows={6}
-            placeholder={"# 教练\n\n身份：私人教练\n设定：话糙理不糙，盯训练也盯作息…"}
-            className="w-full resize-y rounded-xl border border-line bg-surface px-3 py-2.5 font-mono text-sm leading-relaxed text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-          />
-          <div className="mt-3 flex items-center gap-3">
-            <button
-              className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-              onClick={() => void create()}
-            >
-              创建
-            </button>
-            <button className="text-sm text-ink3 transition hover:text-ink" onClick={() => setCreating(false)}>
-              取消
-            </button>
-            {message && <span className="text-sm text-warm">{message}</span>}
-          </div>
-        </div>
-      )}
-
       {/* 伙伴卡片列表 */}
       <div className="space-y-3">
-        {agents.length === 0 && !creating && <p className="text-sm text-ink3">还没有自定义伙伴——点右上「新建伙伴」开一个</p>}
+        {agents.length === 0 && <p className="text-sm text-ink3">还没有自定义伙伴——点右上「新建伙伴」，五步配出一个。</p>}
         {agents.map((agent) => (
           <button
             key={agent.id}
@@ -88,21 +60,19 @@ export function Agents({ onEdit, onCreated }: { onEdit: (id: string) => void; on
             onClick={() => onEdit(agent.id)}
           >
             <div className="flex items-center gap-3">
-              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-accent3 text-lg font-semibold text-accent">
-                {agent.name.slice(0, 1)}
-              </div>
+              <FaceAvatar name={agent.name} face={agent.identity} size={44} />
               <div className="min-w-0 flex-1">
                 <div className="text-[15px] font-semibold text-ink">{agent.name}</div>
-                <div className="truncate text-xs text-ink3">
-                  创建于 {new Date(agent.createdTs).toLocaleDateString()}
-                </div>
+                <div className="truncate text-xs text-ink3">{agent.identity.description || `创建于 ${new Date(agent.createdTs).toLocaleDateString()}`}</div>
               </div>
               <span className="rounded-full bg-surface2 px-2.5 py-1 text-xs text-ink3">点击编辑</span>
             </div>
-            <div className="mt-3 flex gap-2 text-xs text-ink3">
+            <div className="mt-3 flex flex-wrap gap-2 text-xs text-ink3">
               <span className="rounded-md bg-surface2 px-2 py-1">{agent.binding.tools?.length ?? 4} 个工具</span>
               <span className="rounded-md bg-surface2 px-2 py-1">{agent.binding.skills.length} 个技能</span>
               <span className="rounded-md bg-surface2 px-2 py-1">{agent.binding.mcps.length} 个 MCP</span>
+              {agent.identity.language === "zh" && <span className="rounded-md bg-surface2 px-2 py-1">中文</span>}
+              {agent.identity.language === "en" && <span className="rounded-md bg-surface2 px-2 py-1">English</span>}
             </div>
           </button>
         ))}
@@ -115,31 +85,40 @@ export function Agents({ onEdit, onCreated }: { onEdit: (id: string) => void; on
   );
 }
 
-/** 伙伴编辑页：① 人设卡 ② 能力绑定 ③ 记忆注入，结构照 prototype 页 8 */
+/** 伙伴编辑页（单页配置，与向导同字段）：身份 / 灵魂 / 心智 / 资料库 */
 export function AgentEdit({ agentId, onBack }: { agentId: string; onBack: () => void }) {
   const [agent, setAgent] = useState<AgentLoose | null>(null);
   const [persona, setPersona] = useState("");
   const [binding, setBinding] = useState<AgentBindingLoose>({ skills: [], mcps: [] });
   const [skills, setSkills] = useState<SkillLoose[]>([]);
   const [mcps, setMcps] = useState<McpLoose[]>([]);
+  const [providers, setProviders] = useState<ModelProvider[]>([]);
+  const [identityDraft, setIdentityDraft] = useState<{ name: string; description: string; language: string; modelProviderId: string } | null>(null);
+  const [face, setFace] = useState<{ emoji: string; color: string; avatar: string } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [pickSkills, setPickSkills] = useState(false);
-  const [pickMcps, setPickMcps] = useState(false);
 
   const reload = useCallback(async () => {
     const detail = await api2.getAgent(agentId);
     setAgent(detail);
     setPersona(detail.persona);
     setBinding(detail.binding ?? { skills: [], mcps: [] });
+    setIdentityDraft({
+      name: detail.name,
+      description: detail.identity.description,
+      language: detail.identity.language,
+      modelProviderId: detail.identity.modelProviderId ?? "",
+    });
+    setFace({ emoji: detail.identity.emoji, color: detail.identity.color, avatar: detail.identity.avatar ?? "" });
     setSkills(await api2.listSkills());
     setMcps(await api2.listMcps());
+    void api.getModels().then((r) => setProviders(r.providers)).catch(() => undefined);
   }, [agentId]);
 
   useEffect(() => {
     void reload().catch(() => undefined);
   }, [reload]);
 
-  if (!agent) {
+  if (!agent || !identityDraft || !face) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-6">
         <p className="text-sm text-ink3">加载中…</p>
@@ -147,10 +126,28 @@ export function AgentEdit({ agentId, onBack }: { agentId: string; onBack: () => 
     );
   }
 
-  const savePersona = async () => {
+  const saveIdentity = async () => {
     try {
-      const result = await api2.updatePersona(agent.id, persona);
-      setMessage(`人设已保存（名字：${result.name}），下一步生效`);
+      await api2.updateAgentIdentity(agent.id, {
+        name: identityDraft.name,
+        description: identityDraft.description,
+        language: identityDraft.language,
+        modelProviderId: identityDraft.modelProviderId,
+        emoji: face.emoji,
+        color: face.color,
+        avatar: face.avatar,
+      });
+      setMessage("身份已保存（名字/描述/形象/语言下一步生效；默认模型对本伙伴的既有会话即时生效）");
+      await reload();
+    } catch (e) {
+      setMessage(`保存失败：${(e as Error).message}`);
+    }
+  };
+
+  const saveSoul = async () => {
+    try {
+      await api2.updatePersona(agent.id, persona);
+      setMessage("灵魂已保存（下一步生效）");
       await reload();
     } catch (e) {
       setMessage(`保存失败：${(e as Error).message}`);
@@ -174,11 +171,18 @@ export function AgentEdit({ agentId, onBack }: { agentId: string; onBack: () => 
     const next = current.includes(name) ? current.filter((t) => t !== name) : [...current, name];
     setBinding({ ...binding, tools: next });
   };
+  const toggleId = (list: string[], id: string): string[] => (list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
 
   const remove = async () => {
+    if (!window.confirm(`删除伙伴「${agent.name}」？它的会话仍在，只是切回默认助手。`)) return;
     await api2.deleteAgent(agent.id);
     onBack();
   };
+
+  const inputCls =
+    "w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3";
+  const chip = (active: boolean) =>
+    `rounded-full border px-3 py-1.5 text-sm transition ${active ? "border-accent bg-accent3 font-medium text-accent" : "border-line text-ink2 hover:border-accent hover:text-ink"}`;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -187,145 +191,123 @@ export function AgentEdit({ agentId, onBack }: { agentId: string; onBack: () => 
           <ArrowLeftIcon className="h-4 w-4" />
           返回伙伴
         </button>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">编辑伙伴 · {agent.name}</h1>
-        <p className="mt-1 text-xs text-ink3">一个伙伴 = 人设卡 + 能力绑定 + 记忆注入，三段合成 system prompt</p>
+        <div className="flex items-center gap-3">
+          <FaceAvatar name={agent.name} face={agent.identity} size={44} />
+          <h1 className="text-2xl font-semibold tracking-tight text-ink">编辑伙伴 · {agent.name}</h1>
+        </div>
+        <p className="mt-1 text-xs text-ink3">身份 / 灵魂 / 心智 / 资料库——与创建向导同字段，改完下一步生效</p>
       </header>
+      {message && <p className="mb-4 text-sm text-ink3">{message}</p>}
 
-      {/* ① 人设卡 */}
-      <section className="mb-5">
+      {/* ① 身份 */}
+      <section className="mb-5 rounded-xl border border-line bg-surface p-4">
+        <h2 className="mb-3 text-sm font-semibold text-ink">① 身份</h2>
+        <div className="grid grid-cols-2 gap-2">
+          <input className={inputCls} placeholder="名称" value={identityDraft.name} onChange={(e) => setIdentityDraft({ ...identityDraft, name: e.target.value })} />
+          <select className={inputCls} value={identityDraft.language} onChange={(e) => setIdentityDraft({ ...identityDraft, language: e.target.value })}>
+            <option value="">自动（跟随你的语言）</option>
+            <option value="zh">始终中文</option>
+            <option value="en">始终英文</option>
+          </select>
+        </div>
+        <input
+          className={`${inputCls} mt-2`}
+          placeholder="描述（这个伙伴是做什么的）"
+          value={identityDraft.description}
+          onChange={(e) => setIdentityDraft({ ...identityDraft, description: e.target.value })}
+        />
+        <div className="mt-3">
+          <FaceEditor value={face} onChange={setFace} />
+        </div>
+        <div className="mt-3">
+          <label className="mb-1.5 block text-sm font-medium text-ink">默认模型</label>
+          <select
+            className={inputCls}
+            value={identityDraft.modelProviderId}
+            onChange={(e) => setIdentityDraft({ ...identityDraft, modelProviderId: e.target.value })}
+          >
+            <option value="">跟随会话 / 全局</option>
+            {providers.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.platform || "自定义"} · {p.model}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button className="mt-3 rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => void saveIdentity()}>
+          保存身份
+        </button>
+      </section>
+
+      {/* ② 灵魂 */}
+      <section className="mb-5 rounded-xl border border-line bg-surface p-4">
         <div className="mb-2 flex items-baseline justify-between">
-          <h2 className="text-sm font-semibold text-ink">
-            ① 人设卡 <span className="text-ink3">· 自由 markdown</span>
-          </h2>
-          <span className="text-xs text-ink3">名称从一级标题推导</span>
+          <h2 className="text-sm font-semibold text-ink">② 灵魂 · 自由 markdown</h2>
+          <div className="flex gap-1.5">
+            {SOUL_TEMPLATES.map((t) => (
+              <button key={t.id} type="button" className="text-xs text-accent hover:underline" onClick={() => setPersona(t.content)}>
+                {t.name}
+              </button>
+            ))}
+          </div>
         </div>
         <textarea
           rows={9}
-          placeholder={"# 庄丽洪\n\n身份：学姐 / 红颜知己\n设定：硅谷 AI 架构师，平时感性温暖，聊技术切换严谨模式…"}
-          className="w-full resize-y rounded-xl border border-line bg-surface px-3 py-2.5 font-mono text-sm leading-relaxed text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+          placeholder={"# 名字\n\n## 语气\n…"}
+          className={`${inputCls} resize-y font-mono text-sm leading-relaxed`}
           value={persona}
           onChange={(e) => setPersona(e.target.value)}
         />
-        <button
-          className="mt-2 rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-          onClick={() => void savePersona()}
-        >
-          保存人设
+        <button className="mt-2 rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => void saveSoul()}>
+          保存灵魂
         </button>
       </section>
 
-      {/* ② 能力绑定 */}
-      <section className="mb-5">
-        <h2 className="mb-2 text-sm font-semibold text-ink">② 能力绑定</h2>
-        <div className="rounded-xl border border-line bg-surface px-4 py-1">
-          {BUILTIN_TOOLS.map((tool, i) => (
-            <div
-              key={tool.name}
-              className={`flex items-center justify-between py-3 ${i < BUILTIN_TOOLS.length - 1 ? "border-b border-line" : ""}`}
-            >
-              <div>
-                <span className="text-[15px] text-ink">{tool.label}</span>
-                {tool.hint && <span className="ml-2 text-xs text-ink3">{tool.hint}</span>}
-              </div>
-              <Toggle checked={toolEnabled(tool.name)} onChange={() => toggleTool(tool.name)} title={tool.name} />
-            </div>
+      {/* ③ 心智 + ④ 资料库 */}
+      <section className="mb-5 rounded-xl border border-line bg-surface p-4">
+        <h2 className="mb-2 text-sm font-semibold text-ink">③ 工具面（内置）</h2>
+        <div className="flex flex-wrap gap-2">
+          {BUILTIN_TOOLS.map((t) => (
+            <button key={t.name} type="button" className={chip(toolEnabled(t.name))} onClick={() => toggleTool(t.name)} title={t.hint}>
+              {t.label}
+            </button>
           ))}
-          <div className="border-t border-line py-2 text-[11px] text-ink3">全不勾 = 全部开放；勾选列表精确生效</div>
         </div>
+        <p className="mt-1.5 text-xs text-ink3">全不选 = 不限制（四个都可用）。</p>
 
-        {/* 技能/MCP 绑定 */}
-        <div className="mt-2 space-y-2">
-          <div className="rounded-xl border border-line bg-surface px-4 py-3">
-            <button className="flex w-full items-center justify-between text-sm text-ink2 transition hover:text-ink" onClick={() => setPickSkills(!pickSkills)}>
-              <span>＋ 绑定技能{binding.skills.length > 0 ? `（已绑 ${binding.skills.length} 个）` : ""}</span>
-              <span className="text-xs text-ink3">{pickSkills ? "收起" : "展开"}</span>
-            </button>
-            {pickSkills && (
-              <div className="mt-2 space-y-2">
-                {skills.length === 0 && <p className="text-xs text-ink3">还没装技能（左下菜单「技能 / MCP」页安装）</p>}
-                {skills.map((skill) => (
-                  <label key={skill.id} className="flex items-center justify-between text-sm text-ink">
-                    <span className="min-w-0 truncate">
-                      {skill.name}
-                      <span className="ml-2 text-xs text-ink3">{skill.description}</span>
-                    </span>
-                    <Toggle
-                      checked={binding.skills.includes(skill.id)}
-                      onChange={() =>
-                        setBinding({
-                          ...binding,
-                          skills: binding.skills.includes(skill.id)
-                            ? binding.skills.filter((s) => s !== skill.id)
-                            : [...binding.skills, skill.id],
-                        })
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
+        <h2 className="mb-2 mt-4 text-sm font-semibold text-ink">MCP 工具</h2>
+        {mcps.length === 0 ? (
+          <p className="text-xs text-ink3">未配置 MCP。</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {mcps.map((m) => (
+              <button key={m.id} type="button" className={chip(binding.mcps.includes(m.id))} onClick={() => setBinding({ ...binding, mcps: toggleId(binding.mcps, m.id) })}>
+                {m.name}
+              </button>
+            ))}
           </div>
-          <div className="rounded-xl border border-line bg-surface px-4 py-3">
-            <button className="flex w-full items-center justify-between text-sm text-ink2 transition hover:text-ink" onClick={() => setPickMcps(!pickMcps)}>
-              <span>＋ 连接 MCP{binding.mcps.length > 0 ? `（已连 ${binding.mcps.length} 个）` : ""}</span>
-              <span className="text-xs text-ink3">{pickMcps ? "收起" : "展开"}</span>
-            </button>
-            {pickMcps && (
-              <div className="mt-2 space-y-2">
-                {mcps.length === 0 && <p className="text-xs text-ink3">还没接 MCP（「技能 / MCP」页添加）</p>}
-                {mcps.map((mcp) => (
-                  <label key={mcp.id} className="flex items-center justify-between text-sm text-ink">
-                    <span className="min-w-0 truncate">
-                      {mcp.name}
-                      <span className="ml-2 truncate text-xs text-ink3">{mcp.url}</span>
-                    </span>
-                    <Toggle
-                      checked={binding.mcps.includes(mcp.id)}
-                      onChange={() =>
-                        setBinding({
-                          ...binding,
-                          mcps: binding.mcps.includes(mcp.id) ? binding.mcps.filter((m) => m !== mcp.id) : [...binding.mcps, mcp.id],
-                        })
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
+        )}
+
+        <h2 className="mb-2 mt-4 text-sm font-semibold text-ink">④ 资料库 · 技能</h2>
+        {skills.length === 0 ? (
+          <p className="text-xs text-ink3">未安装技能。</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {skills.map((s) => (
+              <button key={s.id} type="button" className={chip(binding.skills.includes(s.id))} title={s.description} onClick={() => setBinding({ ...binding, skills: toggleId(binding.skills, s.id) })}>
+                {s.name}
+              </button>
+            ))}
           </div>
-        </div>
-        <button
-          className="mt-2 rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-          onClick={() => void saveBinding()}
-        >
-          保存能力绑定
+        )}
+        <button className="mt-3 rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => void saveBinding()}>
+          保存能力
         </button>
       </section>
 
-      {/* ③ 记忆注入 */}
-      <section className="mb-5">
-        <h2 className="mb-2 text-sm font-semibold text-ink">③ 记忆注入</h2>
-        <div className="flex items-center justify-between rounded-xl border border-line bg-surface px-4 py-3">
-          <div className="pr-4">
-            <div className="text-[15px] text-ink">共享长期记忆</div>
-            <div className="text-xs text-ink3">全局一份，所有伙伴读到同一个你（不可按伙伴关闭）</div>
-          </div>
-          <Toggle checked onChange={() => undefined} title="全局记忆，设计上不可关闭" />
-        </div>
-      </section>
-
-      <div className="flex items-center gap-3">
-        <button
-          className="rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99]"
-          onClick={() => void savePersona()}
-        >
-          保存
-        </button>
-        <button className="rounded-lg px-4 py-2.5 text-sm text-warm transition hover:bg-warm2" onClick={() => void remove()}>
-          删除伙伴
-        </button>
-        {message && <span className="text-sm text-ink3">{message}</span>}
-      </div>
+      <button className="text-sm text-warm transition hover:opacity-80" onClick={() => void remove()}>
+        删除这个伙伴
+      </button>
     </div>
   );
 }

@@ -1,12 +1,11 @@
-// 批次1·server：HTTP 集成（真实 node:http 监听随机端口 + 全 mock adapter，零网络外呼）。
+// 批次1·server：HTTP 集成（真实 node:http 监听随机端口 + 全 mock adapter，零网络外呼；存储 = :memory: SQLite）。
 // 覆盖：注册/登录/401 门、会话消息驱动 Turn、SSE 首事件、/api/today 折叠、快速记录/作废/打卡、模型配置不回 Key。
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { nodeEnv, nodeFileIO } from "../src/app/env";
-import { appPaths, type AppPaths } from "../src/app/store";
+import { nodeEnv } from "../src/app/env";
 import { SessionStore, type UserRecord } from "../src/app/auth";
 import { Ledger } from "../src/app/ledger";
 import { ConversationStore } from "../src/app/conversations";
@@ -14,23 +13,26 @@ import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
 import { MemoryStore } from "../src/app/memory";
+import { MemoryLayers } from "../src/app/memory-layers";
 import { TaskStore } from "../src/app/tasks";
 import { NotificationStore } from "../src/app/notify";
+import { SqliteSessionLog } from "../src/app/session-log";
 import type { TaskDef } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
+import { testDb } from "./helpers-db";
 import { sleep } from "./helpers";
 
 let root: string;
 let baseUrl: string;
 let cookie: string;
-let paths: AppPaths;
+const db = testDb();
 const users = new Map<string, UserRecord>();
 const ledgers = new Map<string, Promise<Ledger>>();
 const ledgerFor = (uid: string): Promise<Ledger> => {
   let ledger = ledgers.get(uid);
   if (!ledger) {
-    ledger = Ledger.open(nodeFileIO, paths.lifeFile(uid));
+    ledger = Ledger.open(db, uid);
     ledgers.set(uid, ledger);
   }
   return ledger;
@@ -44,7 +46,6 @@ const json = (body: unknown): { method: string; headers: Record<string, string>;
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "op-app-server-"));
-  paths = appPaths(join(root, "data"));
   const masterKey = Buffer.alloc(32, 3);
 
   const { adapter } = createMockLlmAdapter([
@@ -53,36 +54,45 @@ beforeAll(async () => {
       calls: [{ name: "record_flow", arguments: { category: "餐饮", value: 28, unit: "¥", note: "午餐" } }],
     },
     { kind: "text", text: "记好了，午餐 28。" },
-    { kind: "text", text: "<!-- slot: recent -->\n测试期记忆已凝练。" }, // consolidate 用（排在聊天步骤之后）
+    { kind: "text", text: '{"facts":[{"text":"用户在测试记忆链","section":"话题","refs":["chat:mc1"]}]}' }, // memory/run：L2 chat 抽取
+    { kind: "text", text: '{"facts":[]}' }, // memory/run：L2 ledger（聊天用例记过一笔流水，无新事实可抽）
+    { kind: "text", text: "测试期记忆已凝练[^1]。\n\n[^1]: chat" }, // memory/run：L3 recent
+    { kind: "text", text: "测试期的用户画像[^1]。\n\n[^1]: chat" }, // memory/run：L3 profile
+    { kind: "text", text: "主线：验证记忆三层[^1]。\n\n[^1]: chat" }, // memory/run：L3 scope
   ]);
 
-  const agents = new AgentStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `aid-${Math.random().toString(36).slice(2, 8)}` });
-  const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
-  const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "mc-x" });
-  const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => 5000 });
-  const tasks = new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
-  const notifications = new NotificationStore({ fileIO: nodeFileIO, paths, now: () => 5000 });
-  const conversations = new ConversationStore({
-    env: nodeEnv,
-    fileIO: nodeFileIO,
-    paths,
-    ledgerFor,
-    modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
-    adapterFactory: () => adapter as LlmAdapter,
-    now: () => Date.now(),
-    agents,
-    skills,
-    mcps,
+  const agents = new AgentStore({ db, now: () => 1, randomUUID: () => `aid-${Math.random().toString(36).slice(2, 8)}` });
+  const skills = new SkillStore({ db, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
+  const mcps = new McpRegistry({ env: nodeEnv, db, now: () => 1, randomUUID: () => "mc-x" });
+  const memory = new MemoryStore({ db, now: () => 5000 });
+  const tasks = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+  const notifications = new NotificationStore({ db, now: () => 5000 });
+  const memoryLayers = new MemoryLayers(
+    { db, now: () => 5000, randomUUID: () => `ml-${Math.random().toString(36).slice(2, 8)}`, ledgerFor, tasks },
     memory,
-  });
+  );
+  const conversations = new ConversationStore(
+    {
+      env: nodeEnv,
+      sessionLog: (key) => Promise.resolve(SqliteSessionLog.open(db, key, () => Date.now())),
+      ledgerFor,
+      modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
+      adapterFactory: () => adapter as LlmAdapter,
+      now: () => Date.now(),
+      agents,
+      skills,
+      mcps,
+      memory,
+    },
+    db,
+  );
 
   const server = createAppServer({
     env: nodeEnv,
-    fileIO: nodeFileIO,
-    paths,
+    db,
     masterKey,
     users,
-    sessions: new SessionStore(() => Date.now()),
+    sessions: new SessionStore(db, () => Date.now()),
     conversations,
     ledgerFor,
     modelTester: async () => {}, // 零网络：注入 fake 测试器
@@ -91,6 +101,7 @@ beforeAll(async () => {
     skills,
     mcps,
     memory,
+    memoryLayers,
     tasks,
     notifications,
     taskRunner: async (uidRun, task: TaskDef) => {
@@ -227,22 +238,35 @@ describe("HTTP API", () => {
 
 
 describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
-  it("agents：创建→列表→详情→改人设（名字重推导）→改绑定→删除", async () => {
+  it("agents：创建（带身份）→列表→详情→改人设（名字保留）→改身份→坏 avatar 400→改绑定→删除", async () => {
     const created = (await (await fetch(`${baseUrl}/api/agents`, {
       method: "POST",
       headers: { "Content-Type": "application/json", cookie },
-      body: JSON.stringify({ persona: "# 教练\n盯训练。" }),
+      body: JSON.stringify({ persona: "# 教练\n盯训练。", emoji: "🐯", color: "#b0501e", language: "zh" }),
     })).json()) as { id: string; name: string };
     expect(created.name).toBe("教练");
     expect((await (await fetch(`${baseUrl}/api/agents`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(1);
-    const detail = (await (await fetch(`${baseUrl}/api/agents/${created.id}`, { headers: { cookie } })).json()) as { persona: string };
+    const detail = (await (await fetch(`${baseUrl}/api/agents/${created.id}`, { headers: { cookie } })).json()) as { persona: string; identity: { emoji: string } };
     expect(detail.persona).toContain("盯训练");
+    expect(detail.identity.emoji).toBe("🐯");
     const renamed = (await (await fetch(`${baseUrl}/api/agents/${created.id}/persona`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },
       body: JSON.stringify({ markdown: "# 学姐\n温柔。" }),
     })).json()) as { name: string };
-    expect(renamed.name).toBe("学姐");
+    expect(renamed.name).toBe("教练"); // 名字是显式资产，persona 编辑不改名
+    const reidentity = (await (await fetch(`${baseUrl}/api/agents/${created.id}/identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ name: "学姐" }),
+    })).json()) as { name: string };
+    expect(reidentity.name).toBe("学姐");
+    const badAvatar = await fetch(`${baseUrl}/api/agents/${created.id}/identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ avatar: "http://evil" }),
+    });
+    expect(badAvatar.status).toBe(400);
     const bound = await fetch(`${baseUrl}/api/agents/${created.id}/binding`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },
@@ -285,10 +309,16 @@ describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
     expect(delMissing.status).toBe(404);
   });
 
-  it("memory：空槽 → PUT slot → consolidate（注入 adapter，changed=true）→ 槽位落盘", async () => {
-    const before = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as { slots: Record<string, string>; meta: { runs: number } };
+  it("memory：空槽 → PUT slot → run 全链（L1 种会话 → L2 抽取 → L3 综合）→ 槽位落盘", async () => {
+    const before = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as {
+      slots: Record<string, string>;
+      meta: { runs: number };
+      l2: { surfaces: { key: string; entries: number }[] };
+      l3: { slots: { key: string; hasNew: boolean }[] };
+    };
     expect(before.slots.profile ?? "").toBe("");
     expect(before.meta.runs).toBe(0);
+    expect(before.l2.surfaces.find((s) => s.key === "chat")?.entries).toBe(0);
     expect((await fetch(`${baseUrl}/api/memory/profile`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },
@@ -299,11 +329,43 @@ describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
       headers: { "Content-Type": "application/json", cookie },
       body: JSON.stringify({ markdown: "x" }),
     })).status).toBe(400);
-    const consolidated = (await (await fetch(`${baseUrl}/api/memory/consolidate`, { method: "POST", headers: { cookie } })).json()) as { changed: boolean };
-    expect(consolidated.changed).toBe(true);
-    const after = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as { slots: Record<string, string>; meta: { runs: number } };
+    // 种一个会话当 L1 实体（cid=mc1，与共享脚本第 3 步的 refs 对应）
+    db.prepare("INSERT INTO conversations (cid, uid, title, created_ts) VALUES ('mc1', ?, '测试会话', 1)").run(users.get("lathan")!.uid);
+    db.prepare(
+      "INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES ('mc1', 0, 'user/message', 1, 'user', ?)",
+    ).run(JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "在测试记忆链" }] } }));
+
+    const run = (await (await fetch(`${baseUrl}/api/memory/run`, { method: "POST", headers: { cookie } })).json()) as {
+      l2: Record<string, { added: number }>;
+      l3: Record<string, { changed: boolean }>;
+    };
+    expect(run.l2.chat.added).toBe(1);
+    expect(run.l3.recent.changed).toBe(true);
+    const after = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as {
+      slots: Record<string, string>;
+      meta: { runs: number };
+      l2: { surfaces: { key: string; entries: number }[] };
+      l3: { slots: { key: string; hasNew: boolean }[] };
+    };
     expect(after.slots.recent).toContain("测试期记忆已凝练");
+    expect(after.l2.surfaces.find((s) => s.key === "chat")?.entries).toBe(1);
+    expect(after.l3.slots.find((s) => s.key === "recent")?.hasNew).toBe(false);
     expect(after.meta.runs).toBe(1);
+  });
+
+  it("会话删除与自动命名端点：无用户消息命名不炸（ok:false）；删除后列表减少、再删 404", async () => {
+    const list0 = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as unknown[];
+    const created = (await (await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: "{}",
+    })).json()) as { id: string };
+    const title = (await (await fetch(`${baseUrl}/api/conversations/${created.id}/title`, { method: "POST", headers: { cookie } })).json()) as { ok: boolean };
+    expect(title.ok).toBe(false); // 无用户消息：不命名也不炸
+    expect((await fetch(`${baseUrl}/api/conversations/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
+    const list1 = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as unknown[];
+    expect(list1).toHaveLength(list0.length);
+    expect((await fetch(`${baseUrl}/api/conversations/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(404);
   });
 
   it("会话 meta/切换：默认空 → 切到教练 → meta 生效；未知 404", async () => {
@@ -440,19 +502,55 @@ describe("HTTP API 批次4（盘面/成长/合并归档/硬化）", () => {
   });
 });
 
-  it("模型配置：PUT 后 GET 只回 hasKey，永不回 Key；测试连接走注入 adapter", async () => {
-    const put = await fetch(`${baseUrl}/api/model`, {
-      method: "PUT",
+  it("多模型接入：新增（Key 只回 hasKey 永不回传）→ 列表 → 切换激活 → 删除回落；测试连接走注入 adapter", async () => {
+    const addA = (await (await fetch(`${baseUrl}/api/models`, {
+      method: "POST",
       headers: { "Content-Type": "application/json", cookie },
-      body: JSON.stringify({ baseURL: "https://api.deepseek.com", apiKey: "sk-test-123", model: "deepseek-chat" }),
-    });
-    expect(put.status).toBe(200);
-    const got = (await (await fetch(`${baseUrl}/api/model`, { headers: { cookie } })).json()) as Record<string, unknown>;
-    expect(got).toMatchObject({ baseURL: "https://api.deepseek.com", model: "deepseek-chat", hasKey: true });
-    expect(JSON.stringify(got)).not.toContain("sk-test-123");
-    const test = (await (await fetch(`${baseUrl}/api/model/test`, { method: "POST", headers: { cookie } })).json()) as {
-      ok: boolean;
+      body: JSON.stringify({ baseURL: "https://api.deepseek.com", apiKey: "sk-test-123", model: "deepseek-chat", contextWindow: 128000 }),
+    })).json()) as { id: string };
+    const listA = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as {
+      activeId: string | null;
+      providers: { id: string; platform: string; contextWindow: number | null; hasKey: boolean }[];
     };
-    expect(test.ok).toBe(true);
+    expect(listA.activeId).toBe(addA.id); // 首个自动激活
+    expect(listA.providers[0]).toMatchObject({ platform: "DeepSeek", contextWindow: 128000, hasKey: true });
+    expect(JSON.stringify(listA)).not.toContain("sk-test-123");
+    expect((await (await fetch(`${baseUrl}/api/model`, { headers: { cookie } })).json()) as Record<string, unknown>).toMatchObject({
+      baseURL: "https://api.deepseek.com",
+      model: "deepseek-chat",
+      hasKey: true,
+    });
+
+    const addB = (await (await fetch(`${baseUrl}/api/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ baseURL: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" }),
+    })).json()) as { id: string };
+    const listB = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { activeId: string | null };
+    expect(listB.activeId).toBe(addA.id); // 新增不抢激活
+    expect((await fetch(`${baseUrl}/api/models/${addB.id}/active`, { method: "PUT", headers: { cookie } })).status).toBe(200);
+    const activeNow = (await (await fetch(`${baseUrl}/api/model`, { headers: { cookie } })).json()) as { model: string };
+    expect(activeNow.model).toBe("glm-4.6");
+
+    const badAdd = await fetch(`${baseUrl}/api/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ baseURL: "ftp://bad", model: "x" }),
+    });
+    expect(badAdd.status).toBe(400);
+    const badWindow = await fetch(`${baseUrl}/api/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ baseURL: "https://ok.com", model: "x", contextWindow: 5 }),
+    });
+    expect(badWindow.status).toBe(400);
+
+    const testConn = (await (await fetch(`${baseUrl}/api/models/${addA.id}/test`, { method: "POST", headers: { cookie } })).json()) as { ok: boolean };
+    expect(testConn.ok).toBe(true);
+
+    expect((await fetch(`${baseUrl}/api/models/${addB.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
+    const listAfter = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { activeId: string | null; providers: unknown[] };
+    expect(listAfter.providers).toHaveLength(1);
+    expect(listAfter.activeId).toBe(addA.id); // 删激活行 → 回落到剩余的最近一个
   });
 });

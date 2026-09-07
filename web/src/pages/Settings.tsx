@@ -1,43 +1,151 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, type ModelProvider } from "../api";
 import { InfoIcon } from "../icons";
 
 const inputCls =
   "w-full rounded-lg border border-line bg-surface px-3 py-2.5 font-mono text-[15px] text-ink outline-none transition focus:border-accent focus:ring-2 focus:ring-accent3";
 
-/** 模型接入页：BYOK 横幅 + 表单 + 测试连接，结构照 prototype 页 11 */
+/** baseURL → 平台显示名（与服务端 platformFromBaseURL 同表的本地预览；落库以服务端推导为准） */
+const PLATFORM_PATTERNS: [RegExp, string][] = [
+  [/deepseek/i, "DeepSeek"],
+  [/bigmodel\.cn|zhipu/i, "智谱 GLM"],
+  [/dashscope|aliyuncs/i, "通义千问 Qwen"],
+  [/moonshot/i, "Moonshot Kimi"],
+  [/openrouter/i, "OpenRouter"],
+  [/openai\.com/i, "OpenAI"],
+  [/siliconflow/i, "硅基流动"],
+  [/volces\.com/i, "火山方舟"],
+  [/minimax/i, "MiniMax"],
+  [/baidu|qianfan/i, "百度千帆"],
+  [/localhost|127\.0\.0\.1|0\.0\.0\.0/i, "本地服务"],
+];
+
+function derivePlatform(baseURL: string): string {
+  for (const [pattern, name] of PLATFORM_PATTERNS) {
+    if (pattern.test(baseURL)) return name;
+  }
+  try {
+    return new URL(baseURL).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function formatWindow(n: number | null): string {
+  if (n === null) return "默认 64K";
+  return n % 1000 === 0 ? `${Math.round(n / 1000)}K` : `${n}`;
+}
+
+/** 平台预置（数据移植自 Tencent WeKnora 的厂商清单，按聊天场景补上下文窗口；baseURL/模型名为公开事实信息） */
+interface ModelPreset {
+  id: string;
+  label: string;
+  baseURL: string;
+  model: string;
+  contextWindow: number | null; // null = 各模型不同，用默认 64K 手动调
+  desc: string;
+}
+
+const MODEL_PRESETS: ModelPreset[] = [
+  { id: "deepseek", label: "DeepSeek", baseURL: "https://api.deepseek.com", model: "deepseek-chat", contextWindow: 128000, desc: "deepseek-chat / deepseek-reasoner" },
+  { id: "zhipu", label: "智谱 GLM", baseURL: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.7", contextWindow: 200000, desc: "glm-4.7 / glm-4.6 / glm-4.5-air" },
+  { id: "aliyun", label: "通义千问", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus", contextWindow: 131072, desc: "qwen-plus / qwen-max / qwen3 系列" },
+  { id: "moonshot", label: "Moonshot Kimi", baseURL: "https://api.moonshot.cn/v1", model: "kimi-k2.5", contextWindow: 256000, desc: "kimi-k2.5 / kimi-k2 系列" },
+  { id: "openai", label: "OpenAI", baseURL: "https://api.openai.com/v1", model: "gpt-5.2", contextWindow: 400000, desc: "gpt-5.2 / gpt-5-mini（按具体型号核对窗口）" },
+  { id: "gemini", label: "Gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-3-flash-preview", contextWindow: 1000000, desc: "gemini-3-flash-preview / gemini-3-pro（1M 窗口）" },
+  { id: "openrouter", label: "OpenRouter", baseURL: "https://openrouter.ai/api/v1", model: "openai/gpt-5.2-chat", contextWindow: null, desc: "聚合 100+ 厂商；窗口因模型而异，按模型页核对" },
+  { id: "siliconflow", label: "硅基流动", baseURL: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3.2", contextWindow: null, desc: "DeepSeek / Qwen / GLM 开源模型托管；窗口因模型而异" },
+  { id: "nvidia", label: "NVIDIA NIM", baseURL: "https://integrate.api.nvidia.com/v1", model: "meta/llama-3.3-70b-instruct", contextWindow: null, desc: "NIM 托管的开源模型" },
+  { id: "novita", label: "Novita AI", baseURL: "https://api.novita.ai/openai/v1", model: "moonshotai/kimi-k2.5", contextWindow: null, desc: "kimi-k2.5 / glm-5 / minimax-m2.7 等" },
+  { id: "litellm", label: "LiteLLM 代理", baseURL: "http://localhost:4000/v1", model: "", contextWindow: null, desc: "自托管统一网关（请把占位 URL 换成你的代理地址）" },
+  { id: "ollama", label: "本地 Ollama", baseURL: "http://localhost:11434/v1", model: "", contextWindow: null, desc: "本机 Ollama 的 OpenAI 兼容端点；窗口按拉取的模型填" },
+];
+
+interface FormState {
+  open: boolean;
+  editingId: string | null;
+  presetId: string | null;
+  baseURL: string;
+  model: string;
+  apiKey: string;
+  windowChoice: string; // "default" | "32768" | "65536" | "131072" | "200000" | "custom"
+  customWindow: string;
+}
+
+const EMPTY_FORM: FormState = { open: false, editingId: null, presetId: null, baseURL: "", model: "", apiKey: "", windowChoice: "default", customWindow: "" };
+
+/** 模型接入页：BYOK 横幅 + 多供应商平级列表（测试/编辑/删除）+ 预置新增表单；用哪个模型在会话里选 */
 export function Settings() {
-  const [baseURL, setBaseURL] = useState("");
-  const [model, setModel] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [hasKey, setHasKey] = useState(false);
-  const [showKey, setShowKey] = useState(false);
+  const [providers, setProviders] = useState<ModelProvider[]>([]);
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
+  const reload = () => {
     api
-      .getModel()
-      .then((config) => {
-        setBaseURL(config.baseURL);
-        setModel(config.model);
-        setHasKey(config.hasKey);
-      })
+      .getModels()
+      .then((result) => setProviders(result.providers))
       .catch(() => undefined);
-  }, []);
+  };
+
+  useEffect(reload, []);
+
+  const editing = form.editingId !== null ? providers.find((p) => p.id === form.editingId) : undefined;
+
+  const openCreate = () => setForm({ ...EMPTY_FORM, open: true });
+  const openEdit = (provider: ModelProvider) =>
+    setForm({
+      open: true,
+      editingId: provider.id,
+      presetId: null,
+      baseURL: provider.baseURL,
+      model: provider.model,
+      apiKey: "",
+      windowChoice:
+        provider.contextWindow === null
+          ? "default"
+          : ["32768", "65536", "131072", "200000"].includes(String(provider.contextWindow))
+            ? String(provider.contextWindow)
+            : "custom",
+      customWindow: provider.contextWindow !== null && !["32768", "65536", "131072", "200000"].includes(String(provider.contextWindow)) ? String(provider.contextWindow) : "",
+    });
+  const closeForm = () => setForm(EMPTY_FORM);
+
+  const applyPreset = (preset: ModelPreset) =>
+    setForm({
+      ...form,
+      open: true,
+      presetId: preset.id,
+      baseURL: preset.baseURL,
+      model: preset.model,
+      windowChoice: preset.contextWindow === null ? "default" : String(preset.contextWindow),
+      customWindow: "",
+    });
 
   const save = async () => {
     setBusy(true);
     setMessage(null);
+    const contextWindow = form.windowChoice === "default" ? null : form.windowChoice === "custom" ? Number(form.customWindow) : Number(form.windowChoice);
     try {
-      await api.putModel({
-        baseURL: baseURL.trim(),
-        model: model.trim(),
-        ...(apiKey.trim() !== "" ? { apiKey: apiKey.trim() } : {}),
-      });
-      setApiKey("");
-      setHasKey(true);
-      setMessage({ ok: true, text: "已保存（Key 加密存储在你自己的设备上）" });
+      if (form.editingId !== null) {
+        await api.updateModel(form.editingId, {
+          baseURL: form.baseURL.trim(),
+          model: form.model.trim(),
+          contextWindow,
+          ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
+        });
+        setMessage({ ok: true, text: "已更新（Key 加密存储在你自己的设备上）" });
+      } else {
+        await api.addModel({
+          baseURL: form.baseURL.trim(),
+          model: form.model.trim(),
+          contextWindow,
+          ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
+        });
+        setMessage({ ok: true, text: "已新增（首个供应商自动启用；Key 加密存储在你自己的设备上）" });
+      }
+      closeForm();
+      reload();
     } catch (e) {
       setMessage({ ok: false, text: `保存失败：${(e as Error).message}` });
     } finally {
@@ -45,22 +153,36 @@ export function Settings() {
     }
   };
 
-  const test = async () => {
+  const remove = async (provider: ModelProvider) => {
+    if (!window.confirm(`删除 ${provider.platform || provider.baseURL} · ${provider.model}？`)) return;
+    setBusy(true);
+    try {
+      await api.deleteModel(provider.id);
+      reload();
+    } catch (e) {
+      setMessage({ ok: false, text: `删除失败：${(e as Error).message}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const test = async (id: string) => {
     setBusy(true);
     setMessage(null);
     try {
-      const result = await api.testModel();
-      setMessage(
-        result.ok
-          ? { ok: true, text: "连接成功" }
-          : { ok: false, text: `连接失败：${result.error ?? "未知错误"}` },
-      );
+      const result = await api.testModel(id);
+      setMessage(result.ok ? { ok: true, text: "连接成功" } : { ok: false, text: `连接失败：${result.error ?? "未知错误"}` });
     } catch (e) {
       setMessage({ ok: false, text: `连接失败：${(e as Error).message}` });
     } finally {
       setBusy(false);
     }
   };
+
+  const platformPreview = derivePlatform(form.baseURL.trim());
+  const selectedPreset = MODEL_PRESETS.find((p) => p.id === form.presetId);
+
+  const providerLine = (p: ModelProvider): string => `${p.platform || derivePlatform(p.baseURL) || "自定义"} · ${p.model}`;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -77,74 +199,184 @@ export function Settings() {
         </p>
       </div>
 
-      <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); void save(); }}>
-        <div>
-          <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="base-url">baseURL</label>
-          <input
-            id="base-url"
-            className={inputCls}
-            placeholder="https://api.deepseek.com"
-            value={baseURL}
-            onChange={(e) => setBaseURL(e.target.value)}
-          />
-        </div>
-        <div>
-          <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="api-key">
-            API Key {hasKey && <span className="font-normal text-ink3">（已配置，留空 = 不变）</span>}
-          </label>
-          <div className="flex gap-2">
+      {/* 已接入模型（平级列表；用哪个在会话右上角选） */}
+      <div className="mb-4 space-y-2">
+        {providers.map((p) => (
+          <div key={p.id} className="flex items-center justify-between gap-3 rounded-xl border border-line bg-surface p-3.5">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-ink">{providerLine(p)}</div>
+              <div className="mt-0.5 truncate font-mono text-xs text-ink3">
+                {p.baseURL} · 窗口 {formatWindow(p.contextWindow)}
+                {p.hasKey ? " · Key 已配置" : " · 未配 Key"}
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-1.5">
+              <button
+                type="button"
+                disabled={busy}
+                className="rounded-lg border border-accent px-2.5 py-1.5 text-xs font-medium text-accent transition hover:bg-accent3 disabled:opacity-60"
+                onClick={() => void test(p.id)}
+              >
+                测试连接
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:text-ink disabled:opacity-60"
+                onClick={() => openEdit(p)}
+              >
+                编辑
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-warm transition hover:bg-warm/10 disabled:opacity-60"
+                onClick={() => void remove(p)}
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+        {providers.length === 0 && (
+          <div className="rounded-xl border border-dashed border-line px-4 py-4 text-center text-sm text-ink2">
+            还没有配置模型。点击下方新增一个平台接入，然后在对话页右上角选用。
+          </div>
+        )}
+      </div>
+
+      {/* 新增入口 */}
+      {!form.open && (
+        <button
+          type="button"
+          disabled={busy}
+          className="w-full rounded-xl border border-dashed border-line px-4 py-3 text-sm font-medium text-ink2 transition hover:border-accent hover:text-ink disabled:opacity-60"
+          onClick={openCreate}
+        >
+          ＋ 新增平台接入
+        </button>
+      )}
+
+      {/* 新增/编辑表单 */}
+      {form.open && (
+        <form
+          className="space-y-4 rounded-xl border border-line bg-surface p-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          <div className="text-sm font-semibold text-ink">{form.editingId !== null ? "编辑模型接入" : "新增平台接入"}</div>
+          <div>
+            <div className="mb-1.5 text-sm font-medium text-ink">从预置快速填入</div>
+            <div className="flex flex-wrap gap-1.5">
+              {MODEL_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  className={`rounded-full border px-3 py-1.5 text-xs transition ${
+                    form.presetId === preset.id
+                      ? "border-accent bg-accent3 font-medium text-accent"
+                      : "border-line text-ink2 hover:border-accent hover:text-ink"
+                  }`}
+                  onClick={() => applyPreset(preset)}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            {selectedPreset && <p className="mt-1.5 text-xs text-ink3">推荐模型：{selectedPreset.desc}</p>}
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="base-url">baseURL</label>
+            <input
+              id="base-url"
+              className={inputCls}
+              placeholder="https://api.deepseek.com"
+              value={form.baseURL}
+              onChange={(e) => setForm({ ...form, baseURL: e.target.value })}
+            />
+            {platformPreview !== "" && <p className="mt-1.5 text-xs text-accent">识别平台：{platformPreview}</p>}
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="api-key">
+              API Key {form.editingId !== null && <span className="font-normal text-ink3">（留空 = 不变）</span>}
+            </label>
             <input
               id="api-key"
-              type={showKey ? "text" : "password"}
-              className={`min-w-0 flex-1 ${inputCls}`}
-              placeholder={hasKey ? "sk-••••••••••••••••" : "sk-…"}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              type="password"
+              className={inputCls}
+              placeholder={editing?.hasKey ? "sk-••••••••••••••••" : "sk-…"}
+              value={form.apiKey}
+              onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
               autoComplete="off"
             />
+            <p className="mt-1.5 text-xs text-ink3">加密存储在你自己设备上，不上传任何地方。</p>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="model-name">模型</label>
+            <input
+              id="model-name"
+              className={inputCls}
+              placeholder="deepseek-chat"
+              value={form.model}
+              onChange={(e) => setForm({ ...form, model: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="context-window">上下文窗口（tokens）</label>
+            <select
+              id="context-window"
+              className={`${inputCls} font-sans`}
+              value={form.windowChoice}
+              onChange={(e) => setForm({ ...form, windowChoice: e.target.value })}
+            >
+              <option value="default">默认（64K）</option>
+              <option value="32768">32K</option>
+              <option value="65536">64K</option>
+              <option value="131072">128K</option>
+              <option value="200000">200K</option>
+              <option value="custom">自定义…</option>
+            </select>
+            {form.windowChoice === "custom" && (
+              <input
+                aria-label="自定义上下文窗口"
+                className={`${inputCls} mt-2`}
+                type="number"
+                min={1000}
+                step={1000}
+                placeholder="如 96000"
+                value={form.customWindow}
+                onChange={(e) => setForm({ ...form, customWindow: e.target.value })}
+              />
+            )}
+            <p className="mt-1.5 text-xs text-ink3">对话接近该窗口的 80% 时自动压缩历史；按你模型的真实窗口填。</p>
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={busy}
+              className="rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99] disabled:opacity-60"
+            >
+              {form.editingId !== null ? "保存修改" : "保存"}
+            </button>
             <button
               type="button"
-              className="shrink-0 rounded-lg border border-line bg-surface px-3 py-2.5 text-sm text-ink2 transition hover:text-ink"
-              onClick={() => setShowKey(!showKey)}
+              disabled={busy}
+              className="rounded-lg border border-line bg-surface px-4 py-2.5 text-[15px] font-medium text-ink transition hover:bg-surface2 disabled:opacity-60"
+              onClick={closeForm}
             >
-              {showKey ? "隐藏" : "显示"}
+              取消
             </button>
           </div>
-          <p className="mt-1.5 text-xs text-ink3">加密存储在你自己设备上，不上传任何地方。</p>
-        </div>
-        <div>
-          <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="model-name">模型</label>
-          <input
-            id="model-name"
-            className={inputCls}
-            placeholder="deepseek-chat"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-          />
-        </div>
+        </form>
+      )}
 
-        <div className="flex gap-2">
-          <button
-            type="submit"
-            disabled={busy}
-            className="rounded-lg bg-accent2 px-4 py-2.5 text-[15px] font-semibold text-white transition hover:opacity-90 active:scale-[0.99] disabled:opacity-60"
-          >
-            保存
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            className="rounded-lg border border-line bg-surface px-4 py-2.5 text-[15px] font-medium text-ink transition hover:bg-surface2 disabled:opacity-60"
-            onClick={() => void test()}
-          >
-            测试连接
-          </button>
-        </div>
-        {message && <p className={`text-sm ${message.ok ? "text-accent" : "text-warm"}`}>{message.text}</p>}
-      </form>
+      {message && <p className={`text-sm ${message.ok ? "text-accent" : "text-warm"}`}>{message.text}</p>}
 
       <p className="mt-6 text-xs leading-relaxed text-ink3">
-        OpenAI 兼容协议（DeepSeek / GLM / Qwen / Moonshot / OpenRouter…）。保存后下一回合即生效，无需重启。
+        OpenAI 兼容协议（DeepSeek / GLM / Qwen / Moonshot / OpenRouter…）。可接入多个平台；每个会话用哪个模型，在对话页右上角的模型选择器里选。保存后下一回合即生效，无需重启。
       </p>
     </div>
   );

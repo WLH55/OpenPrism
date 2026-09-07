@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type SessionEventLoose } from "../api";
+import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
 import { CheckSolidIcon, ChevronDownIcon, SwitchPartnerIcon } from "../icons";
+import { FaceAvatar } from "../components/FaceEditor";
 
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
@@ -58,6 +59,10 @@ export function Chat({
 }) {
   const [agents, setAgents] = useState<AgentLoose[]>([]);
   const [currentAgentId, setCurrentAgentId] = useState<string | undefined>(undefined);
+  const [providers, setProviders] = useState<ModelProvider[]>([]);
+  const [globalActiveId, setGlobalActiveId] = useState<string | null>(null);
+  const [modelProviderId, setModelProviderId] = useState<string | undefined>(undefined);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [items, setItems] = useState<RenderItem[]>([]);
   // 流式中的增量（turn 结束后以日志为准清空）
   const [stream, setStream] = useState<{ reasoning: string; text: string } | null>(null);
@@ -81,6 +86,7 @@ export function Chat({
       const [events, meta] = await Promise.all([api.conversationEvents(cid), api2.convMeta(cid).catch(() => ({ switches: [] as { ts: number; agentId: string }[] }) as ConversationMetaLoose)]);
       setItems(foldEvents(events, meta.switches, agentName));
       setCurrentAgentId(meta.agentId);
+      setModelProviderId(meta.modelProviderId);
     },
     [agentName],
   );
@@ -89,6 +95,16 @@ export function Chat({
     void api2
       .listAgents()
       .then(setAgents)
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    void api
+      .getModels()
+      .then((result) => {
+        setProviders(result.providers);
+        setGlobalActiveId(result.activeId);
+      })
       .catch(() => undefined);
   }, []);
 
@@ -112,6 +128,11 @@ export function Chat({
         } else {
           setBanner(null);
           void loadEvents(activeConvId).catch(() => undefined);
+          // 首回合后自动命名（后端只对默认标题生效）；失败静默，标题回退为消息截断
+          void api
+            .autoTitle(activeConvId)
+            .then(() => reloadConversations())
+            .catch(() => undefined);
         }
       } else if (event.type === "tool-call") {
         setItems((prev) => [
@@ -139,10 +160,13 @@ export function Chat({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [items, stream]);
 
-  // 点外部收起伙伴下拉
+  // 点外部收起伙伴/模型下拉
   useEffect(() => {
     const onDoc = (event: MouseEvent) => {
-      if (!headerRef.current?.contains(event.target as Node)) setPickerOpen(false);
+      if (!headerRef.current?.contains(event.target as Node)) {
+        setPickerOpen(false);
+        setModelPickerOpen(false);
+      }
     };
     document.addEventListener("click", onDoc);
     return () => document.removeEventListener("click", onDoc);
@@ -179,11 +203,30 @@ export function Chat({
     }
   };
 
+  // 会话级模型绑定：null = 跟随全局激活（后端弃池，下一回合按新模型装配）
+  const pickModel = async (providerId: string | null) => {
+    setModelPickerOpen(false);
+    if (!activeConvId || providerId === (modelProviderId ?? null)) return;
+    try {
+      await api2.setConversationModel(activeConvId, providerId);
+      setModelProviderId(providerId ?? undefined);
+    } catch (err) {
+      setBanner(`切换模型失败：${(err as Error).message}`);
+    }
+  };
+
   const partnerAvatar = (name: string, warm = false) => (
     <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${warm ? "bg-warm2 text-warm" : "bg-accent3 text-accent"}`}>
       {name.slice(0, 1)}
     </span>
   );
+
+  const boundProvider = modelProviderId !== undefined ? providers.find((p) => p.id === modelProviderId) : undefined;
+  const agentDefaultProvider = currentAgent?.identity?.modelProviderId ? providers.find((p) => p.id === currentAgent.identity.modelProviderId) : undefined;
+  const globalProvider = globalActiveId !== null ? providers.find((p) => p.id === globalActiveId) : undefined;
+  const effectiveProvider = boundProvider ?? agentDefaultProvider ?? globalProvider;
+  const modelShortLabel = effectiveProvider ? `${effectiveProvider.platform || "自定义"} · ${effectiveProvider.model}` : "未配置模型";
+  const windowLabel = (p: ModelProvider): string => (p.contextWindow === null ? "默认 64K" : `${Math.round(p.contextWindow / 1000)}K`);
 
   return (
     <div className="flex h-full min-h-0 flex-1 overflow-hidden bg-surface">
@@ -195,7 +238,7 @@ export function Chat({
             className="flex items-center gap-2 rounded-lg px-1.5 py-1 transition hover:bg-surface2"
             onClick={(e) => { e.stopPropagation(); setPickerOpen(!pickerOpen); }}
           >
-            {partnerAvatar(currentAgent?.name ?? "助")}
+            {currentAgent ? <FaceAvatar name={currentAgent.name} face={currentAgent.identity} size={32} /> : partnerAvatar("助")}
             <div className="text-left">
               <div className="flex items-center gap-1 text-sm font-semibold text-ink">
                 <span>{currentAgent?.name ?? "默认助手"}</span>
@@ -205,6 +248,16 @@ export function Chat({
             </div>
           </button>
           <div className="flex items-center gap-2">
+            <button
+              className="hidden max-w-52 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2 sm:flex"
+              onClick={(e) => { e.stopPropagation(); setPickerOpen(false); setModelPickerOpen(!modelPickerOpen); }}
+            >
+              <span className="truncate">{modelShortLabel}</span>
+              <span className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-normal ${boundProvider ? "bg-accent3 text-accent" : "bg-surface2 text-ink3"}`}>
+                {boundProvider ? "本会话" : agentDefaultProvider ? "伙伴默认" : "全局"}
+              </span>
+              <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-ink3" />
+            </button>
             <label className="flex cursor-pointer items-center gap-2 text-xs text-ink2">
               <span>思维链</span>
               <span className="relative inline-block h-5 w-9">
@@ -215,7 +268,7 @@ export function Chat({
             </label>
             <button
               className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2"
-              onClick={(e) => { e.stopPropagation(); setPickerOpen(!pickerOpen); }}
+              onClick={(e) => { e.stopPropagation(); setModelPickerOpen(false); setPickerOpen(!pickerOpen); }}
             >
               <SwitchPartnerIcon className="h-4 w-4 text-ink2" />
               切换伙伴
@@ -251,6 +304,46 @@ export function Chat({
                   {currentAgentId === agent.id && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
                 </button>
               ))}
+            </div>
+          )}
+
+          {/* 模型切换下拉（会话级绑定） */}
+          {modelPickerOpen && (
+            <div className="absolute right-4 top-full z-20 mt-1 w-72 overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+              <div className="px-3 py-2.5 text-xs text-ink3">对话模型（只影响当前会话）</div>
+              <button
+                className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2"
+                onClick={() => void pickModel(null)}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[14px] font-medium text-ink">自动{agentDefaultProvider ? `（${currentAgent?.name} 默认）` : ""}</span>
+                  <span className="block truncate text-xs text-ink3">
+                    {(agentDefaultProvider ?? globalProvider)
+                      ? `${(agentDefaultProvider ?? globalProvider)!.platform || "自定义"} · ${(agentDefaultProvider ?? globalProvider)!.model}`
+                      : "未配置模型"}
+                  </span>
+                </span>
+                {!modelProviderId && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
+              </button>
+              {providers.map((p) => (
+                <button
+                  key={p.id}
+                  className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-surface2"
+                  onClick={() => void pickModel(p.id)}
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[14px] font-medium text-ink">{p.platform || "自定义"}</span>
+                    <span className="block truncate text-xs text-ink3">
+                      {p.model} · 窗口 {windowLabel(p)}
+                      {p.hasKey ? "" : " · 未配 Key"}
+                    </span>
+                  </span>
+                  {modelProviderId === p.id && <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />}
+                </button>
+              ))}
+              {providers.length === 0 && (
+                <div className="px-3 py-2.5 text-xs text-ink3">还没有配置模型——去左下角菜单「模型接入」新增</div>
+              )}
             </div>
           )}
         </header>

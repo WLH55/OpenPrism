@@ -82,9 +82,17 @@ const agent = createAgent({ env, sessionLog: log, /* … */ });
 
 ```bash
 pnpm install
-pnpm test        # vitest：72 个测试，零网络、时钟与随机全注入，确定性
+pnpm test        # vitest：196 个测试，零网络、时钟与随机全注入，确定性
 pnpm typecheck   # tsc --noEmit
 ```
+
+### 应用层存储（ADR 0008）
+
+app 层（`src/app/`）以 SQLite 为唯一持久层（Node 内置 `node:sqlite`，**要求 Node ≥ 22.13**）：领域表建模
+（users/sessions/ledger_entries/conversations/conversation_events/tasks/...），读路径按需 SQL 查询 +
+活跃工作集缓存。旧版 JSONL 数据首次启动自动一次性导入（`data/*.jsonl` 原样保留不删除）；BYOK Key 以
+AES-256-GCM 密文入库，主密钥在 `data/secret.key`。环境变量：`OP_DATA`（默认 `./data`）、`OP_PORT`（默认 8787）、
+`OP_DB`（默认 `{OP_DATA}/openprism.db`）。备份请用 `VACUUM INTO`（WAL 模式下不要裸拷 `-wal` 伴生文件）。
 
 ## 文档
 

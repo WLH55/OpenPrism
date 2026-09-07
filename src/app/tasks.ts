@@ -1,11 +1,9 @@
-// 定时任务（D6）：任务四字段（agentId/trigger/instruction/enabled）+ 任务专属持久会话 + 调度器。
-// 触发：枚举（daily/weekly/monthly/yearly/once）+ cron 逃生门（自研零依赖 5 段匹配器）；
+// 定时任务（D6，ADR 0008 领域表）：tasks/task_runs 两表。任务四字段（agentId/trigger/instruction/enabled）
+// + 任务专属持久会话 + 调度器。触发：枚举（daily/weekly/monthly/yearly/interval/once）+ cron 逃生门（自研零依赖 5 段匹配器）；
 // 补跑不补吵：锚点 = lastRunTs ?? createdTs，错过 <24h 补最近一次，≥24h 记 skipped（锚点推进，不堆积）。
 
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { FileIO, ToolDefinition } from "../harness/index";
-import type { AppPaths } from "./store";
+import type { DatabaseSync } from "node:sqlite";
+import type { ToolDefinition } from "../harness/index";
 
 export type TaskTrigger =
   | { kind: "once"; at: number }
@@ -13,6 +11,9 @@ export type TaskTrigger =
   | { kind: "weekly"; days: number[]; time: string } // 1=周一 … 7=周日
   | { kind: "monthly"; day: number; time: string }
   | { kind: "yearly"; month: number; day: number; time: string }
+  // 自定义重复（提醒页弹窗）：每 N 个单位（分钟/小时从 startTs 直步进，无 time；天及以上锚当日 HH:mm）；
+  // month/year 日历月步进且月末截断；endTs 为结束日当天末尾（含当天）
+  | { kind: "interval"; every: number; unit: "minute" | "hour" | "day" | "week" | "month" | "year"; time?: string; startTs: number; endTs?: number }
   | { kind: "cron"; expr: string };
 
 export interface TaskDef {
@@ -148,6 +149,40 @@ export function nextDue(trigger: TaskTrigger, fromTs: number, tz: number): numbe
       }
       return null;
     }
+    case "interval": {
+      const end = trigger.endTs ?? Number.POSITIVE_INFINITY;
+      // 分钟/小时：从 startTs 直步进，与时刻无关
+      if (trigger.unit === "minute" || trigger.unit === "hour") {
+        const period = trigger.every * (trigger.unit === "minute" ? 60000 : 3600000);
+        const k = Math.max(0, Math.ceil((fromTs + 1 - trigger.startTs) / period));
+        const due = trigger.startTs + k * period;
+        return due <= end ? due : null;
+      }
+      const m = HHMM.exec(trigger.time ?? "");
+      if (!m) throw new Error(`bad time "${trigger.time ?? ""}"`);
+      const [h, mi] = [Number(m[1]), Number(m[2])];
+      const a = localParts(trigger.startTs, tz);
+      const base = localTs(a.y, a.mo, a.d, h, mi, tz); // 首个候选 = 锚点日 HH:mm（time 为准）
+      if (trigger.unit === "day" || trigger.unit === "week") {
+        const period = trigger.every * (trigger.unit === "day" ? 86400000 : 7 * 86400000);
+        const k = Math.max(0, Math.ceil((fromTs + 1 - base) / period));
+        const due = base + k * period;
+        return due <= end ? due : null;
+      }
+      // month/year：锚点日起按日历月步进，月末截断（如 1 月 31 号 → 2 月 28 号）
+      const stepMonths = trigger.every * (trigger.unit === "month" ? 1 : 12);
+      const avgMs = stepMonths * 30.44 * 86400000;
+      const kStart = Math.max(0, Math.floor((fromTs - base) / avgMs) - 2);
+      for (let k = kStart; k <= kStart + 240; k++) {
+        const months = k * stepMonths;
+        const y = a.y + Math.floor((a.mo + months) / 12);
+        const mo = (a.mo + months) % 12;
+        const d = Math.min(a.d, new Date(Date.UTC(y, mo + 1, 0)).getUTCDate());
+        const due = localTs(y, mo, d, h, mi, tz);
+        if (due > fromTs) return due <= end ? due : null;
+      }
+      return null;
+    }
     case "cron": {
       cronMatches(trigger.expr, new Date(fromTs + tz * 60000)); // 语法校验（抛错）
       // 逐分钟前进（当地时区），上限 2 年
@@ -179,6 +214,14 @@ function validateTrigger(trigger: TaskTrigger): void {
       if (trigger.month < 1 || trigger.month > 12) throw new Error("yearly 需要 month 1-12");
       if (trigger.day < 1 || trigger.day > 31) throw new Error("yearly 需要 day 1-31");
       break;
+    case "interval":
+      if (!Number.isInteger(trigger.every) || trigger.every < 1) throw new Error("interval 需要 every ≥ 1 的整数");
+      if (!["minute", "hour", "day", "week", "month", "year"].includes(trigger.unit)) throw new Error(`interval unit 非法：${String(trigger.unit)}`);
+      if (!Number.isFinite(trigger.startTs)) throw new Error("interval 需要 startTs（epoch 毫秒）");
+      if (trigger.endTs !== undefined && (!Number.isFinite(trigger.endTs) || trigger.endTs < trigger.startTs)) {
+        throw new Error("interval endTs 需不早于 startTs（epoch 毫秒）");
+      }
+      break;
     default:
       break;
   }
@@ -188,37 +231,52 @@ function validateTrigger(trigger: TaskTrigger): void {
 // ── 存储 ────────────────────────────────────────────────
 
 export interface TaskStoreDeps {
-  fileIO: FileIO;
-  paths: AppPaths;
+  db: DatabaseSync;
   now(): number;
   randomUUID(): string;
+}
+
+interface TaskRow {
+  id: string;
+  uid: string;
+  agent_id: string | null;
+  title: string;
+  instruction: string;
+  trigger_json: string;
+  enabled: number;
+  tz_offset_minutes: number;
+  created_ts: number;
+  last_run_ts: number | null;
+}
+
+function rowToTask(row: TaskRow): TaskDef {
+  return {
+    id: row.id,
+    uid: row.uid,
+    ...(row.agent_id !== null ? { agentId: row.agent_id } : {}),
+    title: row.title,
+    instruction: row.instruction,
+    trigger: JSON.parse(row.trigger_json) as TaskTrigger,
+    enabled: row.enabled === 1,
+    tzOffsetMinutes: row.tz_offset_minutes,
+    createdTs: row.created_ts,
+    ...(row.last_run_ts !== null ? { lastRunTs: row.last_run_ts } : {}),
+  };
 }
 
 export class TaskStore {
   constructor(private deps: TaskStoreDeps) {}
 
-  private indexFile(uid: string): string {
-    return join(this.deps.paths.userDir(uid), "tasks", "index.jsonl");
-  }
-  private runsFile(uid: string, id: string): string {
-    return join(this.deps.paths.userDir(uid), "tasks", id, "runs.jsonl");
-  }
-
   async list(uid: string): Promise<TaskDef[]> {
-    const tasks: TaskDef[] = [];
-    for (const line of await this.deps.fileIO.readAll(this.indexFile(uid))) {
-      try {
-        const task = JSON.parse(line) as TaskDef;
-        if (typeof task?.id === "string") tasks.push(task);
-      } catch {
-        // 坏行
-      }
-    }
-    return tasks;
+    const rows = this.deps.db
+      .prepare("SELECT * FROM tasks WHERE uid = ? ORDER BY created_ts, id")
+      .all(uid) as unknown as TaskRow[];
+    return rows.map(rowToTask);
   }
 
   async get(uid: string, id: string): Promise<TaskDef | null> {
-    return (await this.list(uid)).find((t) => t.id === id) ?? null;
+    const row = this.deps.db.prepare("SELECT * FROM tasks WHERE id = ? AND uid = ?").get(id, uid) as unknown as TaskRow | undefined;
+    return row ? rowToTask(row) : null;
   }
 
   async create(
@@ -239,49 +297,49 @@ export class TaskStore {
       tzOffsetMinutes: input.tzOffsetMinutes ?? 0,
       createdTs: this.deps.now(),
     };
-    await this.deps.fileIO.appendLine(this.indexFile(uid), JSON.stringify(task));
+    this.deps.db
+      .prepare(
+        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+      )
+      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs);
     return task;
   }
 
   async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger">>): Promise<TaskDef> {
-    const tasks = await this.list(uid);
-    const task = tasks.find((t) => t.id === id);
+    const task = await this.get(uid, id);
     if (!task) throw new Error(`task "${id}" 不存在`);
     if (patch.trigger) validateTrigger(patch.trigger);
-    Object.assign(task, patch);
-    await this.saveAll(uid, tasks);
-    return task;
+    const next: TaskDef = { ...task, ...patch };
+    this.deps.db
+      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ? WHERE id = ? AND uid = ?")
+      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, id, uid);
+    return next;
   }
 
   async remove(uid: string, id: string): Promise<void> {
-    const tasks = await this.list(uid);
-    if (!tasks.some((t) => t.id === id)) throw new Error(`task "${id}" 不存在`);
-    await this.saveAll(uid, tasks.filter((t) => t.id !== id));
+    const result = this.deps.db.prepare("DELETE FROM tasks WHERE id = ? AND uid = ?").run(id, uid);
+    if (result.changes === 0) throw new Error(`task "${id}" 不存在`);
+    this.deps.db.prepare("DELETE FROM task_runs WHERE task_id = ? AND uid = ?").run(id, uid);
+    // 任务专属会话的事件一并清理（旧文件版此处会遗留孤儿 session.jsonl）
+    this.deps.db.prepare("DELETE FROM conversation_events WHERE cid = ?").run(`task:${id}`);
   }
 
   async runs(uid: string, id: string): Promise<TaskRun[]> {
-    const runs: TaskRun[] = [];
-    for (const line of await this.deps.fileIO.readAll(this.runsFile(uid, id))) {
-      try {
-        runs.push(JSON.parse(line) as TaskRun);
-      } catch {
-        // 坏行
-      }
-    }
-    return runs;
+    const rows = this.deps.db
+      .prepare("SELECT ts, status, detail FROM task_runs WHERE uid = ? AND task_id = ? ORDER BY ts, id")
+      .all(uid, id) as unknown as { ts: number; status: TaskRun["status"]; detail: string | null }[];
+    return rows.map((row) => ({ ts: row.ts, status: row.status, ...(row.detail !== null ? { detail: row.detail } : {}) }));
   }
 
   async recordRun(uid: string, id: string, run: TaskRun): Promise<void> {
-    await this.deps.fileIO.appendLine(this.runsFile(uid, id), JSON.stringify(run));
+    this.deps.db
+      .prepare("INSERT INTO task_runs (uid, task_id, ts, status, detail) VALUES (?, ?, ?, ?, ?)")
+      .run(uid, id, run.ts, run.status, run.detail ?? null);
   }
 
-  async saveAll(uid: string, tasks: TaskDef[]): Promise<void> {
-    const { mkdir } = await import("node:fs/promises");
-    const file = this.indexFile(uid);
-    await mkdir(join(file, ".."), { recursive: true });
-    const tmp = file + ".tmp";
-    await writeFile(tmp, tasks.map((t) => JSON.stringify(t)).join("\n") + (tasks.length ? "\n" : ""), "utf8");
-    await rename(tmp, file);
+  /** 锚点推进（补跑/执行/失败共用）：替代旧版整文件重写 */
+  async updateLastRun(uid: string, id: string, ts: number): Promise<void> {
+    this.deps.db.prepare("UPDATE tasks SET last_run_ts = ? WHERE id = ? AND uid = ?").run(ts, id, uid);
   }
 }
 
@@ -335,19 +393,19 @@ export class Scheduler {
         if (now - due >= CATCHUP_WINDOW_MS) {
           // 补跑窗口外：跳过并推进锚点（不堆积，D6.3）
           task.lastRunTs = now;
-          await this.deps.tasks.saveAll(uid, tasks);
+          await this.deps.tasks.updateLastRun(uid, task.id, now);
           await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "skipped", detail: `错过 ${(now - due) / 3600000}h` });
           continue;
         }
         try {
           await this.deps.runTask(uid, task);
           task.lastRunTs = now;
-          await this.deps.tasks.saveAll(uid, tasks);
+          await this.deps.tasks.updateLastRun(uid, task.id, now);
           await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "ran" });
           fired += 1;
         } catch (error) {
           task.lastRunTs = now;
-          await this.deps.tasks.saveAll(uid, tasks);
+          await this.deps.tasks.updateLastRun(uid, task.id, now);
           await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "failed", detail: String((error as Error).message).slice(0, 200) });
         }
       }
@@ -377,7 +435,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         instruction: { type: "string", description: "每次到点投给智能体的自然语言指令" },
         trigger: {
           type: "object",
-          description: '如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
+          description: '如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
         },
       },
     },

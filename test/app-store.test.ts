@@ -1,11 +1,12 @@
-// 批次1·app 层地基：Node 平台缝（nodeFileIO）与用户沙盒目录布局（appPaths / ensureUserSandbox）。
+// 批次1·app 层地基：Node 平台缝（nodeFileIO/nodeEnv）与数据布局（appPaths + openDb 表结构，ADR 0008）。
 
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nodeEnv, nodeFileIO } from "../src/app/env";
-import { appPaths, ensureUserSandbox } from "../src/app/store";
+import { appPaths } from "../src/app/store";
+import { openDb, SCHEMA_VERSION } from "../src/app/db";
 
 let root: string;
 
@@ -46,22 +47,41 @@ describe("nodeEnv", () => {
 });
 
 describe("appPaths", () => {
-  it("目录布局符合沙盒裁决（users/{uid}/ 完整隔离）", () => {
+  it("布局收缩为 SQLite 单库 + 主密钥（ADR 0008）", () => {
     const p = appPaths(join(root, "data"));
-    expect(p.usersFile).toBe(join(root, "data", "users.jsonl"));
-    expect(p.lifeFile("u1")).toBe(join(root, "data", "users", "u1", "life.jsonl"));
-    expect(p.modelFile("u1")).toBe(join(root, "data", "users", "u1", "model.json"));
-    expect(p.convDir("u1", "c1")).toBe(join(root, "data", "users", "u1", "conversations", "c1"));
+    expect(p.dataRoot).toBe(join(root, "data"));
+    expect(p.dbFile).toBe(join(root, "data", "openprism.db"));
+    expect(p.secretKeyFile).toBe(join(root, "data", "secret.key"));
   });
 });
 
-describe("ensureUserSandbox", () => {
-  it("注册即建用户目录与会话目录，且幂等", async () => {
-    const paths = appPaths(join(root, "d2"));
-    await ensureUserSandbox(paths, "u1");
-    const dir = await stat(paths.userDir("u1"));
-    expect(dir.isDirectory()).toBe(true);
-    await expect(stat(paths.conversationsDir("u1"))).resolves.toBeTruthy();
-    await ensureUserSandbox(paths, "u1"); // 重复调用不抛
+describe("openDb", () => {
+  it("幂等建表；schema_version 写入 meta；重复 open 不抛", () => {
+    const db = openDb(join(root, "d3", "openprism.db"));
+    const version = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as unknown as { value: string };
+    expect(version.value).toBe(String(SCHEMA_VERSION));
+    const reopened = openDb(join(root, "d3", "openprism.db"));
+    const tables = reopened
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all() as unknown as { name: string }[];
+    const names = tables.map((t) => t.name);
+    db.close(); // Windows：句柄不释放 afterAll 的 rm 会 EBUSY
+    reopened.close();
+    for (const expected of [
+      "users", "sessions", "ledger_entries", "conversations", "conversation_events",
+      "agents", "skills", "mcps", "tasks", "task_runs", "notifications",
+      "memory_slots", "memory_meta", "model_config", "archives", "meta",
+    ]) {
+      expect(names).toContain(expected);
+    }
+  });
+
+  it("CHECK 约束生效（账本 kind 词表）", () => {
+    const db = openDb(":memory:");
+    expect(() =>
+      db
+        .prepare("INSERT INTO ledger_entries (uid, seq, kind, ts, source, time, category) VALUES ('u1', 0, 'nope', 1, 'ui', 1, 'x')")
+        .run(),
+    ).toThrow();
   });
 });

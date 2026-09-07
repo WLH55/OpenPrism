@@ -2,26 +2,18 @@
 // fake MCP 服务器 = 测试内真实 node:http（零外呼）。
 
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { nodeEnv, nodeFileIO } from "../src/app/env";
-import { appPaths, type AppPaths } from "../src/app/store";
+import { nodeEnv } from "../src/app/env";
 import { McpRegistry, mcpCall } from "../src/app/mcp";
 import type { PlatformEnv } from "../src/harness/index";
+import { testDb } from "./helpers-db";
 
-let root: string;
-let paths: AppPaths;
 let jsonServer: Server;
 let jsonUrl: string;
 let sseServer: Server;
 let sseUrl: string;
 
 beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "op-app-mcp-"));
-  paths = appPaths(root);
-
   // JSON 响应版 fake MCP
   jsonServer = createServer((req, res) => {
     let body = "";
@@ -62,7 +54,6 @@ afterAll(async () => {
     new Promise<void>((r) => jsonServer.close(() => r())),
     new Promise<void>((r) => sseServer.close(() => r())),
   ]);
-  await rm(root, { recursive: true, force: true });
 });
 
 describe("mcpCall", () => {
@@ -82,7 +73,7 @@ describe("mcpCall", () => {
 
 describe("McpRegistry", () => {
   it("add/list/remove 持久化；toolsFor 包装为 exclusive 工具且 execute 走 tools/call", async () => {
-    const registry = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "mc-1" });
+    const registry = new McpRegistry({ env: nodeEnv, db: testDb(), now: () => 1, randomUUID: () => "mc-1" });
     const added = await registry.add("u1", { name: "回声服务", url: jsonUrl });
     expect(added.name).toBe("回声服务");
     expect((await registry.list("u1")).map((m) => m.id)).toEqual(["mc-1"]);

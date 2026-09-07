@@ -1,29 +1,14 @@
-// 批次2·skills：标准 Agent Skill（SKILL.md + frontmatter）——解析、安装（粘贴单文件）、目录层文本、load_skill 工具。
+// 批次2·skills：标准 Agent Skill（frontmatter 解析）——安装、目录层文本、load_skill 工具（skills 表）。
 
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { nodeEnv, nodeFileIO } from "../src/app/env";
-import { appPaths, type AppPaths } from "../src/app/store";
+import { describe, expect, it } from "vitest";
+import { nodeEnv } from "../src/app/env";
 import {
   createLoadSkillTool,
   parseSkillFile,
   SkillStore,
   skillCatalogPrompt,
 } from "../src/app/skills";
-
-let root: string;
-let paths: AppPaths;
-
-beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "op-app-skills-"));
-  paths = appPaths(root);
-});
-
-afterAll(async () => {
-  await rm(root, { recursive: true, force: true });
-});
+import { testDb } from "./helpers-db";
 
 const SKILL_MD = `---
 name: 健身复盘
@@ -58,8 +43,8 @@ describe("parseSkillFile", () => {
 });
 
 describe("SkillStore", () => {
-  it("create/list/body/remove 往返；body 返回完整原文", async () => {
-    const store = new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "sk-1" });
+  it("create/list/body/remove 往返；body 返回完整原文（含空行）", async () => {
+    const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-1" });
     const meta = await store.create("u1", SKILL_MD);
     expect(meta.name).toBe("健身复盘");
     expect((await store.list("u1")).map((s) => s.id)).toEqual(["sk-1"]);
@@ -67,6 +52,14 @@ describe("SkillStore", () => {
     await store.remove("u1", "sk-1");
     expect(await store.list("u1")).toHaveLength(0);
     await expect(store.body("u1", "sk-1")).rejects.toThrow();
+  });
+
+  it("listSync：绑定技能的同步目录层（systemPrompt 每步热读）", async () => {
+    const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-2" });
+    const meta = await store.create("u1", SKILL_MD);
+    expect(store.listSync("u1", [meta.id]).map((s) => s.name)).toEqual(["健身复盘"]);
+    expect(store.listSync("u1", [])).toEqual([]);
+    expect(store.listSync("u1", ["nope"])).toEqual([]);
   });
 });
 
@@ -82,7 +75,7 @@ describe("skillCatalogPrompt / load_skill", () => {
   });
 
   it("load_skill：execute 返回正文；未知名抛错；exclusive", async () => {
-    const store = new SkillStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "sk-9" });
+    const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-9" });
     await store.create("u1", SKILL_MD);
     const tool = createLoadSkillTool({ store, uid: "u1" });
     const ctx = { signal: new AbortController().signal, env: nodeEnv };

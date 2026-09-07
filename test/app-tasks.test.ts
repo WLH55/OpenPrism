@@ -1,24 +1,10 @@
-// 批次3·tasks：触发器（枚举 + 自研 cron 匹配）、nextDue 单调性、TaskStore CRUD、Scheduler 到点/补跑/跳过。
+// 批次3·tasks：触发器（枚举 + 自研 cron 匹配）、nextDue 单调性、TaskStore CRUD、Scheduler 到点/补跑/跳过
+// （tasks/task_runs 表；调度器换实例 = 真实"重启"，数据持久在同库）。
 
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { nodeEnv, nodeFileIO } from "../src/app/env";
-import { appPaths, type AppPaths } from "../src/app/store";
+import { describe, expect, it } from "vitest";
+import { nodeEnv } from "../src/app/env";
 import { createTaskTools, cronMatches, nextDue, Scheduler, TaskStore, type TaskTrigger } from "../src/app/tasks";
-
-let root: string;
-let paths: AppPaths;
-
-beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "op-app-tasks-"));
-  paths = appPaths(root);
-});
-
-afterAll(async () => {
-  await rm(root, { recursive: true, force: true });
-});
+import { testDb } from "./helpers-db";
 
 const TZ = 480; // UTC+8
 const T = (s: string): number => Date.parse(s); // UTC 解析
@@ -56,11 +42,61 @@ describe("nextDue", () => {
     expect(nextDue({ kind: "yearly", month: 1, day: 1, time: "00:00" }, now, TZ)).toBeTruthy();
     expect(nextDue({ kind: "cron", expr: "0 9 * * *" }, now, TZ)).toBeTruthy();
   });
+
+  it("interval：每 N 天/周从锚点步进；endTs 截止（含当天）", () => {
+    const startTs = T("2026-09-01T01:00:00Z"); // 锚点：当地 9-1（周二）09:00
+    const from = T("2026-09-03T12:00:00Z"); // 当地 9-3 20:00
+    // 每 2 天 → 序列 9-1/9-3/9-5…，9-3 20:00 视角下一次 = 当地 9-5 09:00
+    const d2 = nextDue({ kind: "interval", every: 2, unit: "day", time: "09:00", startTs }, from, TZ)!;
+    expect(d2).toBe(T("2026-09-05T01:00:00Z"));
+    // 每 1 周 → 下个周二 9-8 09:00
+    const w1 = nextDue({ kind: "interval", every: 1, unit: "week", time: "09:00", startTs }, from, TZ)!;
+    expect(w1).toBe(T("2026-09-08T01:00:00Z"));
+    // endTs = 当地 9-5 当天末尾：9-3 视角下一次（9-5）当天仍可；9-5 20:00 视角下一次（9-7）越界 → null
+    const endTs = T("2026-09-05T15:59:59.999Z");
+    expect(nextDue({ kind: "interval", every: 2, unit: "day", time: "09:00", startTs, endTs }, from, TZ)).toBe(T("2026-09-05T01:00:00Z"));
+    expect(nextDue({ kind: "interval", every: 2, unit: "day", time: "09:00", startTs, endTs }, T("2026-09-05T12:00:00Z"), TZ)).toBeNull();
+  });
+
+  it("interval month：月末截断（1-31 → 2-28 → 3-31），year 步进 12 个月", () => {
+    const startTs = T("2026-01-31T02:00:00Z"); // 当地 1-31 10:00
+    const m1 = nextDue({ kind: "interval", every: 1, unit: "month", time: "10:00", startTs }, T("2026-02-20T00:00:00Z"), TZ)!;
+    expect(m1).toBe(T("2026-02-28T02:00:00Z")); // 2 月无 31 号 → 28
+    const m2 = nextDue({ kind: "interval", every: 1, unit: "month", time: "10:00", startTs }, T("2026-03-01T00:00:00Z"), TZ)!;
+    expect(m2).toBe(T("2026-03-31T02:00:00Z")); // 3 月回 31
+    const y1 = nextDue({ kind: "interval", every: 1, unit: "year", time: "10:00", startTs }, T("2026-02-20T00:00:00Z"), TZ)!;
+    expect(y1).toBe(T("2027-01-31T02:00:00Z"));
+  });
+
+  it("interval minute/hour：从 startTs 直步进（与时刻无关）", () => {
+    const startTs = T("2026-09-01T01:00:00Z"); // 锚点：当地 9-1 09:00
+    const from = T("2026-09-03T12:00:00Z"); // 距锚点 59h
+    // 每 90 分钟 → 第 40 步 = 锚点 + 60h = 当地 9-3 21:00
+    expect(nextDue({ kind: "interval", every: 90, unit: "minute", startTs }, from, TZ)).toBe(T("2026-09-03T13:00:00Z"));
+    // 每 2 小时 → 第 30 步 = 同一刻
+    expect(nextDue({ kind: "interval", every: 2, unit: "hour", startTs }, from, TZ)).toBe(T("2026-09-03T13:00:00Z"));
+    // endTs 已过 → null
+    expect(nextDue({ kind: "interval", every: 90, unit: "minute", startTs, endTs: from - 1 }, from, TZ)).toBeNull();
+  });
+
+  it("interval 校验：every ≥1 整数、unit 白名单、endTs 不早于 startTs", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-iv" });
+    const ok = { kind: "interval", every: 2, unit: "day", time: "09:00", startTs: T("2026-09-01T01:00:00Z") } as const;
+    await store.create("u1", { title: "x", instruction: "y", trigger: ok });
+    await expect(store.create("u1", { title: "x", instruction: "y", trigger: { ...ok, every: 0 } })).rejects.toThrow();
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { ...ok, unit: "century" } as unknown as TaskTrigger }),
+    ).rejects.toThrow();
+    await expect(store.create("u1", { title: "x", instruction: "y", trigger: { ...ok, time: "9:00" } })).rejects.toThrow();
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { ...ok, endTs: T("2026-08-31T00:00:00Z") } }),
+    ).rejects.toThrow();
+  });
 });
 
 describe("TaskStore", () => {
-  it("create 校验 trigger 字段（time 格式/days 范围/cron 合法）；CRUD + runs 往返", async () => {
-    const store = new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1000, randomUUID: () => "tid-1" });
+  it("create 校验 trigger 字段（time 格式/days 范围/cron 合法）；CRUD + runs 往返；删除连带清 runs", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1000, randomUUID: () => "tid-1" });
     const task = await store.create("u1", {
       title: "23点睡觉提醒",
       instruction: "提醒用户准备睡觉，语气温和。",
@@ -79,12 +115,22 @@ describe("TaskStore", () => {
     expect((await store.runs("u1", task.id))[0]!.status).toBe("ran");
     await store.remove("u1", task.id);
     expect(await store.list("u1")).toHaveLength(0);
+    expect(await store.runs("u1", task.id)).toHaveLength(0);
+  });
+
+  it("updateLastRun 推进锚点并持久（同库新实例可见）", async () => {
+    const db = testDb();
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-2" });
+    const task = await store.create("u1", { title: "x", instruction: "x", trigger: { kind: "daily", time: "09:00" } });
+    await store.updateLastRun("u1", task.id, 777);
+    const reopened = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-3" });
+    expect((await reopened.get("u1", task.id))?.lastRunTs).toBe(777);
   });
 });
 
 describe("Scheduler", () => {
-  function makeWorld(uid: string, nowTs: number) {
-    const store = new TaskStore({ fileIO: nodeFileIO, paths, now: () => nowTs, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+  function makeWorld(db: ReturnType<typeof testDb>, uid: string, nowTs: number) {
+    const store = new TaskStore({ db, now: () => nowTs, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
     const ran: { uid: string; id: string }[] = [];
     const scheduler = new Scheduler({
       uids: () => [uid],
@@ -98,26 +144,28 @@ describe("Scheduler", () => {
   }
 
   it("到点即跑；再 tick 不重复", async () => {
-    const create = makeWorld("u-due", T("2026-09-03T00:00:00Z")); // 当地 9-3 08:00 建任务
+    const db = testDb();
+    const create = makeWorld(db, "u-due", T("2026-09-03T00:00:00Z")); // 当地 9-3 08:00 建任务
     await create.store.create("u-due", { title: "睡", instruction: "去睡", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
-    const run = makeWorld("u-due", T("2026-09-03T15:01:00Z")); // 当地 23:01，到期 1 分钟
+    const run = makeWorld(db, "u-due", T("2026-09-03T15:01:00Z")); // 当地 23:01，到期 1 分钟
     expect(await run.scheduler.tick()).toBe(1);
     expect(run.ran).toHaveLength(1);
     expect(await run.scheduler.tick()).toBe(0);
   });
 
   it("错过 <24h 补跑一次（ran）；≥24h 记 skipped 不跑", async () => {
-    const create = makeWorld("u-miss", T("2026-09-03T00:00:00Z")); // due = 当地 9-3 09:00
+    const db = testDb();
+    const create = makeWorld(db, "u-miss", T("2026-09-03T00:00:00Z")); // due = 当地 9-3 09:00
     const task = await create.store.create("u-miss", { title: "x", instruction: "x", trigger: { kind: "daily", time: "09:00" }, tzOffsetMinutes: TZ });
 
-    const soon = makeWorld("u-miss", T("2026-09-03T02:00:00Z")); // 当地 10:00，错过 1h
+    const soon = makeWorld(db, "u-miss", T("2026-09-03T02:00:00Z")); // 当地 10:00，错过 1h
     expect(await soon.scheduler.tick()).toBe(1);
     expect((await soon.store.runs("u-miss", task.id)).at(-1)).toMatchObject({ status: "ran" });
 
     // 另一任务：错过 26h → skipped
-    const create2 = makeWorld("u-stale", T("2026-09-03T00:00:00Z"));
+    const create2 = makeWorld(db, "u-stale", T("2026-09-03T00:00:00Z"));
     const stale = await create2.store.create("u-stale", { title: "y", instruction: "y", trigger: { kind: "daily", time: "09:00" }, tzOffsetMinutes: TZ });
-    const late = makeWorld("u-stale", T("2026-09-04T03:00:00Z")); // 当地 9-4 11:00，due 9-3 09:00 → 26h
+    const late = makeWorld(db, "u-stale", T("2026-09-04T03:00:00Z")); // 当地 9-4 11:00，due 9-3 09:00 → 26h
     expect(await late.scheduler.tick()).toBe(0);
     expect((await late.store.runs("u-stale", stale.id)).at(-1)).toMatchObject({ status: "skipped" });
     // skipped 后锚点推进，再 tick 不重复记
@@ -125,18 +173,19 @@ describe("Scheduler", () => {
   });
 
   it("禁用不跑；once 到期跑一次后不再跑", async () => {
-    const create = makeWorld("u-off", T("2026-09-03T00:00:00Z"));
+    const db = testDb();
+    const create = makeWorld(db, "u-off", T("2026-09-03T00:00:00Z"));
     const off = await create.store.create("u-off", { title: "关", instruction: "x", trigger: { kind: "daily", time: "09:00" }, tzOffsetMinutes: TZ });
     await create.store.update("u-off", off.id, { enabled: false });
-    const world = makeWorld("u-off", T("2026-09-03T02:00:00Z"));
+    const world = makeWorld(db, "u-off", T("2026-09-03T02:00:00Z"));
     await world.scheduler.tick();
     expect(world.ran).toHaveLength(0);
 
-    const createOnce = makeWorld("u-once", T("2026-09-03T00:00:00Z"));
+    const createOnce = makeWorld(db, "u-once", T("2026-09-03T00:00:00Z"));
     await createOnce.store.create("u-once", { title: "单次", instruction: "x", trigger: { kind: "once", at: T("2026-09-03T01:30:00Z") } });
-    const first = makeWorld("u-once", T("2026-09-03T02:00:00Z"));
+    const first = makeWorld(db, "u-once", T("2026-09-03T02:00:00Z"));
     expect(await first.scheduler.tick()).toBe(1);
-    const second = makeWorld("u-once", T("2026-09-03T12:00:00Z"));
+    const second = makeWorld(db, "u-once", T("2026-09-03T12:00:00Z"));
     expect(await second.scheduler.tick()).toBe(0);
     expect(second.ran).toHaveLength(0);
   });
@@ -147,7 +196,7 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
   const ctx = { signal: new AbortController().signal, env: nodeEnv };
 
   function makeTools(uid: string) {
-    const store = new TaskStore({ fileIO: nodeFileIO, paths, now: () => 1, randomUUID: () => "tid-tool" });
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-tool" });
     const tools = createTaskTools({ store, uid, now: () => NOW });
     return { store, tools, by: (name: string) => tools.find((t) => t.name === name)! };
   }

@@ -1,9 +1,9 @@
-// 账本（D2 数据原语 + D2b 存储裁决）：users/{uid}/life.jsonl 只追加；
-// 单进程串行写队列（并行对话、串行账本追加）；启动全量载入内存；面板 = 确定性折叠。
+// 账本（D2 数据原语 + ADR 0008）：ledger_entries 表只追加（(uid, seq) 主键）；
+// 单进程串行写队列（并行对话、串行账本追加）；按 uid 懒加载进内存缓存；面板 = 确定性折叠。
 // 结构定死、内容自由：kind/time/value/plan-ref/checkin 状态是骨架，category/note/attrs 随意。
 // 更正回路 = void 事件引用 targetSeq，不原地改写（历史永远可审计）。
 
-import type { FileIO } from "../harness/index";
+import type { DatabaseSync } from "node:sqlite";
 
 export type LedgerSource = "agent" | "ui";
 
@@ -64,27 +64,174 @@ export type LedgerAppend =
   | Omit<CheckinRecord, "seq" | "ts">
   | Omit<VoidRecord, "seq" | "ts">;
 
+/** 单条落库（迁移器复用）：kind 判别列 → 各自专有列 */
+export function insertLedgerRecord(db: DatabaseSync, uid: string, record: LedgerRecord): void {
+  const actor = record.actor;
+  const actorConv = actor?.conversationId ?? null;
+  const actorAgent = actor?.agentName ?? null;
+  switch (record.kind) {
+    case "event":
+      db.prepare(
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, time, category, note, value, unit, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        uid,
+        record.seq,
+        record.kind,
+        record.ts,
+        record.source,
+        actorConv,
+        actorAgent,
+        record.time,
+        record.category,
+        record.note ?? null,
+        record.value ?? null,
+        record.unit ?? null,
+        record.attrs ? JSON.stringify(record.attrs) : null,
+      );
+      break;
+    case "plan":
+      db.prepare(
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, plan_id, title, scope, due, ndays) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        uid,
+        record.seq,
+        record.kind,
+        record.ts,
+        record.source,
+        actorConv,
+        actorAgent,
+        record.planId,
+        record.title,
+        record.scope,
+        record.due ?? null,
+        record.ndays ?? null,
+      );
+      break;
+    case "checkin":
+      db.prepare(
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, checkin_plan_id, at, done) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        uid,
+        record.seq,
+        record.kind,
+        record.ts,
+        record.source,
+        actorConv,
+        actorAgent,
+        record.planId,
+        record.at,
+        record.done ? 1 : 0,
+      );
+      break;
+    case "void":
+      db.prepare(
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, target_seq, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(uid, record.seq, record.kind, record.ts, record.source, actorConv, actorAgent, record.targetSeq, record.reason ?? null);
+      break;
+  }
+}
+
+type LedgerRow = {
+  kind: string;
+  seq: number;
+  ts: number;
+  source: string;
+  actor_conv: string | null;
+  actor_agent: string | null;
+  time: number | null;
+  category: string | null;
+  note: string | null;
+  value: number | null;
+  unit: string | null;
+  attrs_json: string | null;
+  plan_id: string | null;
+  title: string | null;
+  scope: string | null;
+  due: string | null;
+  ndays: number | null;
+  checkin_plan_id: string | null;
+  at: number | null;
+  done: number | null;
+  target_seq: number | null;
+  reason: string | null;
+};
+
+/** 行 → 记录：与旧 JSON 透传同构（缺省键不出现，fold 层零感知） */
+function rowToRecord(row: LedgerRow): LedgerRecord | null {
+  const base = {
+    seq: row.seq,
+    ts: row.ts,
+    source: row.source as LedgerSource,
+    ...(row.actor_conv !== null || row.actor_agent !== null
+      ? {
+          actor: {
+            ...(row.actor_conv !== null ? { conversationId: row.actor_conv } : {}),
+            ...(row.actor_agent !== null ? { agentName: row.actor_agent } : {}),
+          },
+        }
+      : {}),
+  };
+  switch (row.kind) {
+    case "event":
+      return {
+        ...base,
+        kind: "event",
+        time: row.time ?? row.ts,
+        category: row.category ?? "",
+        ...(row.note !== null ? { note: row.note } : {}),
+        ...(row.value !== null ? { value: row.value } : {}),
+        ...(row.unit !== null ? { unit: row.unit } : {}),
+        ...(row.attrs_json !== null ? { attrs: JSON.parse(row.attrs_json) as Record<string, string | number> } : {}),
+      };
+    case "plan":
+      return {
+        ...base,
+        kind: "plan",
+        planId: row.plan_id ?? "",
+        title: row.title ?? "",
+        scope: (row.scope ?? "day") as PlanRecord["scope"],
+        ...(row.due !== null ? { due: row.due } : {}),
+        ...(row.ndays !== null ? { ndays: row.ndays } : {}),
+      };
+    case "checkin":
+      return {
+        ...base,
+        kind: "checkin",
+        planId: row.checkin_plan_id ?? "",
+        at: row.at ?? row.ts,
+        done: row.done === 1,
+      };
+    case "void":
+      return {
+        ...base,
+        kind: "void",
+        targetSeq: row.target_seq ?? -1,
+        ...(row.reason !== null ? { reason: row.reason } : {}),
+      };
+    default:
+      return null; // 未知 kind（向前兼容）：跳过
+  }
+}
+
 export class Ledger {
   private records: LedgerRecord[] = [];
   private nextSeq = 0;
   private queue: Promise<unknown> = Promise.resolve(); // 串行写队列：并发 append 不交错
 
   private constructor(
-    private fileIO: FileIO,
-    private path: string,
+    private db: DatabaseSync,
+    private uid: string,
   ) {}
 
-  static async open(fileIO: FileIO, path: string): Promise<Ledger> {
-    const ledger = new Ledger(fileIO, path);
-    for (const line of await fileIO.readAll(path)) {
-      try {
-        const record = JSON.parse(line) as LedgerRecord;
-        if (typeof record?.seq !== "number") continue;
-        ledger.records.push(record);
-        ledger.nextSeq = Math.max(ledger.nextSeq, record.seq + 1);
-      } catch {
-        // 崩溃半行：跳过坏行
-      }
+  /** 按用户懒加载：SELECT 全部行映射为记录（账本小，折叠层契约不变） */
+  static async open(db: DatabaseSync, uid: string): Promise<Ledger> {
+    const ledger = new Ledger(db, uid);
+    const rows = db.prepare("SELECT * FROM ledger_entries WHERE uid = ? ORDER BY seq").all(uid) as unknown as LedgerRow[];
+    for (const row of rows) {
+      const record = rowToRecord(row);
+      if (record === null) continue;
+      ledger.records.push(record);
+      ledger.nextSeq = Math.max(ledger.nextSeq, record.seq + 1);
     }
     return ledger;
   }
@@ -93,7 +240,7 @@ export class Ledger {
     const run = async (): Promise<LedgerRecord> => {
       const full = { ...record, seq: this.nextSeq++, ts } as LedgerRecord;
       this.records.push(full);
-      await this.fileIO.appendLine(this.path, JSON.stringify(full));
+      insertLedgerRecord(this.db, this.uid, full);
       return full;
     };
     const appended = this.queue.then(run, run); // 前序失败也继续（队列不因单条失败卡死）

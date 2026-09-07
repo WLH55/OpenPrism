@@ -30,22 +30,44 @@ export function extractAgentName(markdown: string): string {
   return "";
 }
 
+export interface AgentIdentityPrompt {
+  name: string;
+  description?: string;
+  /** '' = 自动跟随用户语言（不加指令）；'zh' | 'en' = 末尾强制语言指令 */
+  language?: string;
+}
+
 export interface ComposePromptInput {
   persona?: string;
+  /** 绑定伙伴时的身份块（向导第①步）；缺省 = 默认助手身份 */
+  identity?: AgentIdentityPrompt;
   /** MemoryStore.injectionBlock 产物（已剥脚注）；缺省 = 无记忆注入 */
   memoryBlock?: string;
   now(): number;
   tzOffsetMinutes?: number;
 }
 
-/** 运行时合成 system prompt：人设（或默认身份）→ 日期 → 记忆 → 纪律。systemPrompt() 每步重取，改动下一步生效。 */
+const languageDirective = (language?: string): string => {
+  if (language === "zh") return "语言要求：无论用户使用什么语言，始终用简体中文回复，不要切换。";
+  if (language === "en") return "Language: always reply in English regardless of the user's language.";
+  return "";
+};
+
+/** 运行时合成 system prompt：身份（伙伴）→ 灵魂/人设 → 日期 → 记忆 → 纪律 → 语言指令。systemPrompt() 每步重取，改动下一步生效。 */
 export function composeAssistantPrompt(input: ComposePromptInput): string {
+  const identity = input.identity;
+  const identityBlock =
+    identity && identity.name
+      ? `你是由用户创造的伙伴「${identity.name}」${identity.description ? `，用户的描述：${identity.description}` : ""}。下面的灵魂定义你的性格、价值观与说话方式，与通用守则冲突时优先服从灵魂。`
+      : "";
   const persona = input.persona?.trim() || DEFAULT_IDENTITY;
-  const parts = [persona, dateLine(input.now(), input.tzOffsetMinutes ?? 0)];
+  const parts = [[identityBlock, persona].filter((p) => p !== "").join("\n\n"), dateLine(input.now(), input.tzOffsetMinutes ?? 0)];
   if (input.memoryBlock && input.memoryBlock.trim() !== "") {
     parts.push(`关于这个用户的长期记忆（自动注入，用它调整语气与举例，不要原文背诵）：\n${input.memoryBlock.trim()}`);
   }
   parts.push(DISCIPLINE);
+  const directive = languageDirective(identity?.language);
+  if (directive !== "") parts.push(directive);
   return parts.join("\n\n");
 }
 
