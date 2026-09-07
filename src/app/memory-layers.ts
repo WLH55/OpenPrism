@@ -36,6 +36,19 @@ const CHAT_CONTENT_CAP = 6000; // 单会话实体内容截断
 const L2_INPUT_CAP = 15000; // L2 抽取输入尾部截断
 const L2_FACT_CAP = 240; // 单条事实字数上限（DeepTutor 同款）
 
+/** 每晚定时窗口（本地 2–5 点）与门槛：服务常驻不重启也能日更（2026-09-08，区别于启动惰性检查） */
+export const NIGHTLY_WINDOW = { startHour: 2, endHour: 5 };
+export const MEMORY_STALE_MS = 20 * 3600 * 1000;
+
+/** 夜间定时判定：窗口内 + 距上次全链 ≥20h；tz 缺省 = 服务器本地时区。纯函数（测试注入 tz 保确定性） */
+export function nightlyDue(lastRunTs: number | undefined, now: number, tzOffsetMinutes?: number): boolean {
+  const tz = tzOffsetMinutes ?? -new Date(now).getTimezoneOffset();
+  const hour = new Date(now + tz * 60000).getUTCHours();
+  const inWindow = hour >= NIGHTLY_WINDOW.startHour && hour < NIGHTLY_WINDOW.endHour;
+  const stale = lastRunTs === undefined || now - lastRunTs >= MEMORY_STALE_MS;
+  return inWindow && stale;
+}
+
 export interface L1Entity {
   ref: string;
   label: string;

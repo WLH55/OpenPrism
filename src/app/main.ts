@@ -18,7 +18,7 @@ import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
-import { MemoryLayers } from "./memory-layers";
+import { MemoryLayers, nightlyDue } from "./memory-layers";
 import { Scheduler, TaskStore, type TaskDef } from "./tasks";
 import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
@@ -151,8 +151,14 @@ async function main(): Promise<void> {
 `),
   });
   scheduler.start();
+  // 每晚定时维护（2026-09-08）：本地 2–5 点窗口 + 距上次 ≥20h → 全链跑批；服务常驻不重启也能日更
+  const NIGHTLY_CHECK_MS = 10 * 60 * 1000;
+  const nightlyTimer = setInterval(() => {
+    void runMemoryForAll("nightly");
+  }, NIGHTLY_CHECK_MS);
   process.on("SIGINT", () => {
     scheduler.stop();
+    clearInterval(nightlyTimer);
     server.close(() => process.exit(0));
   });
 
@@ -160,11 +166,15 @@ async function main(): Promise<void> {
   process.stdout.write(`[openprism] listening on http://127.0.0.1:${port} (data: ${dataRoot}${existsSync(staticDir) ? ", static: web/dist" : ""})\n`);
 
   // 记忆三层全链（2026-09-07）：启动惰性检查——距上次全链超 20h 且有会话 → 后台跑 L1 refresh → L2 抽取 → L3 综合
-  void (async () => {
+  void runMemoryForAll("startup");
+
+  async function runMemoryForAll(reason: "startup" | "nightly"): Promise<void> {
     for (const user of users.values()) {
       const meta = await memory.meta(user.uid);
       const stale = meta.lastRunTs === undefined || Date.now() - meta.lastRunTs > 20 * 3600 * 1000;
       if (!stale) continue;
+      // 夜间档还要求在 2–5 点窗口内（启动档不限钟点，作白天补跑）
+      if (reason === "nightly" && !nightlyDue(meta.lastRunTs, Date.now())) continue;
       const hasConversations = (await conversations.list(user.uid)).length > 0;
       if (!hasConversations) continue;
       const built = await adapterFor(user.uid);
@@ -173,13 +183,13 @@ async function main(): Promise<void> {
         const result = await memoryLayers.runAll(user.uid, built.adapter, built.model);
         await memory.markRun(user.uid);
         process.stdout.write(
-          `[openprism] memory run ${user.username}: l1+${result.l1.chat.added + result.l1.ledger.added + result.l1.tasks.added} l2+${result.l2.chat.added + result.l2.ledger.added + result.l2.tasks.added}\n`,
+          `[openprism] memory run (${reason}) ${user.username}: l1+${result.l1.chat.added + result.l1.ledger.added + result.l1.tasks.added} l2+${result.l2.chat.added + result.l2.ledger.added + result.l2.tasks.added}\n`,
         );
       } catch (error) {
-        process.stdout.write(`[openprism] memory run ${user.username} failed: ${String((error as Error).message)}\n`);
+        process.stdout.write(`[openprism] memory run (${reason}) ${user.username} failed: ${String((error as Error).message)}\n`);
       }
     }
-  })();
+  }
 
 }
 
