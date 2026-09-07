@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { DatabaseSync } from "node:sqlite";
 import { Ledger, insertLedgerRecord } from "../src/app/ledger";
 import { MemoryStore } from "../src/app/memory";
-import { L3_AUTO_SLOTS, MemoryLayers, parseFactsJson } from "../src/app/memory-layers";
+import { L3_AUTO_SLOTS, MemoryLayers, nightlyDue, parseFactsJson } from "../src/app/memory-layers";
 import { TaskStore } from "../src/app/tasks";
 import { createMockLlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
@@ -317,5 +317,20 @@ describe("parseFactsJson", () => {
     expect(parseFactsJson(fenced)).toEqual([{ text: "a", section: "话题", refs: ["chat:c1"] }]);
     expect(parseFactsJson("没有 JSON")).toBeNull();
     expect(parseFactsJson("{\"facts\":\"不是数组\"}")).toBeNull();
+  });
+});
+
+describe("nightlyDue（每晚定时判定，2026-09-08）", () => {
+  const TZ = 480; // UTC+8；now 全用 UTC 表达再换算，确定性不依赖机器时区
+  const at = (y: number, mo: number, d: number, h: number, mi: number): number => Date.UTC(y, mo - 1, d, h, mi) - TZ * 60000;
+
+  it("窗口内（2–5 点）且距上次 ≥20h → true；窗口外或未过期 → false", () => {
+    const now = at(2026, 9, 8, 3, 0); // 当地 09-08 03:00
+    expect(nightlyDue(undefined, now, TZ)).toBe(true); // 从未跑过
+    expect(nightlyDue(at(2026, 9, 7, 2, 30), now, TZ)).toBe(true); // 昨天凌晨跑过 → 24.5h
+    expect(nightlyDue(at(2026, 9, 7, 12, 0), now, TZ)).toBe(false); // 15h 未到期
+    expect(nightlyDue(at(2026, 9, 6, 3, 0), at(2026, 9, 8, 12, 0), TZ)).toBe(false); // 够久但白天不在窗口
+    expect(nightlyDue(at(2026, 9, 6, 3, 0), at(2026, 9, 8, 5, 0), TZ)).toBe(false); // 5 点整 = 窗口右开
+    expect(nightlyDue(at(2026, 9, 6, 3, 0), at(2026, 9, 8, 2, 0), TZ)).toBe(true); // 2 点整 = 窗口左闭
   });
 });
