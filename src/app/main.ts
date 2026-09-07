@@ -1,19 +1,24 @@
-// 进程入口（批次 1）：OP_DATA（默认 ./data）+ OP_PORT（默认 8787）。
-// 装配：nodeEnv/nodeFileIO → 主密钥 → 用户表 → 会话池（adapter 每次调用现读配置，改设置即时生效）→ HTTP。
+// 进程入口（ADR 0008）：OP_DATA（默认 ./data）+ OP_PORT（默认 8787）+ OP_DB（默认 {OP_DATA}/openprism.db）。
+// 装配：openDb → 旧数据迁移（幂等）→ 主密钥 → 用户表 → 会话池（adapter 每次调用现读配置，改设置即时生效）→ HTTP。
+// 内存模型：启动只载用户表；账本/会话/任务等按 uid 懒加载（活跃工作集），不再全量预载。
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { nodeEnv, nodeFileIO } from "./env";
+import { nodeEnv } from "./env";
 import { appPaths } from "./store";
+import { openDb } from "./db";
+import { migrateLegacy, migrateLegacyModelConfig } from "./migrate";
 import { loadUsers, SessionStore } from "./auth";
-import { loadOrCreateMasterKey, open, readModelConfig } from "./secretbox";
+import { loadOrCreateMasterKey, open, readModelConfig, readModelProviderConfig, type ModelConfig } from "./secretbox";
 import { Ledger } from "./ledger";
 import { ConversationStore } from "./conversations";
+import { SqliteSessionLog } from "./session-log";
 import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
+import { MemoryLayers } from "./memory-layers";
 import { Scheduler, TaskStore, type TaskDef } from "./tasks";
 import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
@@ -22,68 +27,78 @@ import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 async function main(): Promise<void> {
   const dataRoot = resolve(process.env.OP_DATA ?? "./data");
   const port = Number(process.env.OP_PORT ?? 8787);
+  const dbFile = process.env.OP_DB ? resolve(process.env.OP_DB) : appPaths(dataRoot).dbFile;
   await mkdir(dataRoot, { recursive: true });
 
-  const paths = appPaths(dataRoot);
-  const masterKey = await loadOrCreateMasterKey(dataRoot);
-  const users = await loadUsers(nodeFileIO, paths.usersFile);
-  const usersByUid = new Map([...users.values()].map((u) => [u.uid, u]));
-  // 会话持久化（批次4 硬化：重启不掉线）
-  const sessions = await SessionStore.load({ fileIO: nodeFileIO, file: join(dataRoot, "sessions.jsonl") }, () => Date.now());
+  const db = openDb(dbFile);
+  const migrated = migrateLegacy(db, dataRoot);
+  if (migrated) {
+    process.stdout.write(`[openprism] legacy JSONL imported into ${dbFile}\n`);
+  }
+  migrateLegacyModelConfig(db); // 旧单模型配置 → model_providers（幂等）
 
-  // 账本实例缓存：同 uid 恒同一 Ledger（串行队列在实例内）
+  const masterKey = await loadOrCreateMasterKey(dataRoot, appPaths(dataRoot).secretKeyFile);
+  const users = await loadUsers(db);
+  const usersByUid = new Map([...users.values()].map((u) => [u.uid, u]));
+  const sessions = new SessionStore(db, () => Date.now());
+
+  // 账本实例缓存：同 uid 恒同一 Ledger（串行写队列在实例内；按需懒加载）
   const ledgers = new Map<string, Promise<Ledger>>();
   const ledgerFor = (uid: string): Promise<Ledger> => {
     let ledger = ledgers.get(uid);
     if (!ledger) {
-      ledger = Ledger.open(nodeFileIO, paths.lifeFile(uid));
+      ledger = Ledger.open(db, uid);
       ledgers.set(uid, ledger);
     }
     return ledger;
   };
 
-  // adapter 现读配置：改模型设置后下一回合即生效，无需重启或清会话池
-  const modelConfigFor = (uid: string) => readModelConfig(nodeFileIO, paths.modelFile(uid));
-  const adapterFactory = (uid: string): LlmAdapter => ({
+  // adapter 现读配置：改模型设置后下一回合即生效，无需重启或清会话池。
+  // 会话绑定了 providerId 时现读该供应商行，否则读用户全局激活。
+  const modelConfigFor = async (uid: string, providerId?: string | null): Promise<ModelConfig | null> =>
+    providerId ? readModelProviderConfig(db, uid, providerId) : readModelConfig(db, uid);
+  const adapterFactory = (uid: string, providerId: string | null, config: ModelConfig): LlmAdapter => ({
     name: "byok-live",
     async complete(request, options) {
-      const config = await modelConfigFor(uid);
-      if (!config) {
-        throw Object.assign(new Error("model not configured"), { name: "ModelNotConfiguredError" });
-      }
+      const live = providerId ? ((await readModelProviderConfig(db, uid, providerId)) ?? config) : ((await readModelConfig(db, uid)) ?? config);
       const adapter = createOpenAICompatAdapter(nodeEnv, {
-        baseURL: config.baseURL,
-        apiKey: config.keyEnc ? open(masterKey, config.keyEnc) : "",
+        baseURL: live.baseURL,
+        apiKey: live.keyEnc ? open(masterKey, live.keyEnc) : "",
       });
       return adapter.complete(request, options);
     },
   });
 
-  const agents = new AgentStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const skills = new SkillStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const mcps = new McpRegistry({ env: nodeEnv, fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const memory = new MemoryStore({ fileIO: nodeFileIO, paths, now: () => Date.now() });
-  const tasks = new TaskStore({ fileIO: nodeFileIO, paths, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const notifications = new NotificationStore({ fileIO: nodeFileIO, paths, now: () => Date.now() });
+  const agents = new AgentStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const skills = new SkillStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const mcps = new McpRegistry({ env: nodeEnv, db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const memory = new MemoryStore({ db, now: () => Date.now() });
+  const tasks = new TaskStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  const memoryLayers = new MemoryLayers({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID(), ledgerFor, tasks }, memory);
+  const notifications = new NotificationStore({ db, now: () => Date.now() });
 
-  const conversations = new ConversationStore({
-    env: nodeEnv,
-    fileIO: nodeFileIO,
-    paths,
-    ledgerFor,
-    modelConfigFor,
-    adapterFactory,
-    now: () => Date.now(),
-    agents,
-    skills,
-    mcps,
-    memory,
-    tasks,
-  });
+  const conversations = new ConversationStore(
+    {
+      env: nodeEnv,
+      sessionLog: (key) => Promise.resolve(SqliteSessionLog.open(db, key, () => Date.now())),
+      ledgerFor,
+      modelConfigFor,
+      adapterFactory,
+      now: () => Date.now(),
+      agents,
+      skills,
+      mcps,
+      memory,
+      tasks,
+    },
+    db,
+  );
 
-  // 任务执行体（调度/手动共用）：离线回合跑进任务专属会话，收口后把助手文本落站内通知
+  // 任务执行体（调度/手动共用）：跑进该伙伴的固定提醒会话（不存在即创建、置顶显示），
+  // 助手回复直接落在会话里；同时落一条站内通知兜底（提醒页徽标）
   const taskRunner = async (uidRun: string, task: TaskDef): Promise<void> => {
-    const agent = await conversations.taskAgent(uidRun, task.id, task.agentId);
+    const feed = await conversations.ensureTaskFeed(uidRun, task.agentId);
+    const agent = await conversations.agent(uidRun, feed.id);
     agent.followup(task.instruction);
     await agent.whenIdle();
     const events = agent.sessionLog.readAll();
@@ -108,8 +123,7 @@ async function main(): Promise<void> {
   const staticDir = resolve("web/dist");
   const server = createAppServer({
     env: nodeEnv,
-    fileIO: nodeFileIO,
-    paths,
+    db,
     masterKey,
     users,
     usersByUid,
@@ -121,6 +135,7 @@ async function main(): Promise<void> {
     skills,
     mcps,
     memory,
+    memoryLayers,
     tasks,
     notifications,
     taskRunner,
@@ -144,10 +159,9 @@ async function main(): Promise<void> {
   await new Promise<void>((resolveListen) => server.listen(port, "0.0.0.0", resolveListen));
   process.stdout.write(`[openprism] listening on http://127.0.0.1:${port} (data: ${dataRoot}${existsSync(staticDir) ? ", static: web/dist" : ""})\n`);
 
-  // 自动凝练（5.1 本土化：夜间/懒——启动惰性检查）：lastRun 超 20h 且有会话 → 后台跑一次
+  // 记忆三层全链（2026-09-07）：启动惰性检查——距上次全链超 20h 且有会话 → 后台跑 L1 refresh → L2 抽取 → L3 综合
   void (async () => {
-    for (const username of users.keys()) {
-      const user = users.get(username)!;
+    for (const user of users.values()) {
       const meta = await memory.meta(user.uid);
       const stale = meta.lastRunTs === undefined || Date.now() - meta.lastRunTs > 20 * 3600 * 1000;
       if (!stale) continue;
@@ -155,25 +169,14 @@ async function main(): Promise<void> {
       if (!hasConversations) continue;
       const built = await adapterFor(user.uid);
       if (!built) continue;
-      const texts: string[] = [];
-      for (const entry of await conversations.list(user.uid)) {
-        for (const line of await nodeFileIO.readAll(join(paths.convDir(user.uid, entry.id), "session.jsonl"))) {
-          try {
-            const event = JSON.parse(line) as { type: string; message?: { role: string; content: { type: string; text?: string }[] } };
-            if (event.type === "user/message" || event.type === "assistant/message") {
-              const text = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
-              if (text.trim() !== "") texts.push(`${event.message?.role === "user" ? "用户" : "助手"}：${text}`);
-            }
-          } catch {
-            // 坏行
-          }
-        }
-      }
       try {
-        const result = await memory.consolidate({ uid: user.uid, adapter: built.adapter, model: built.model, sessionTexts: texts.slice(-40) });
-        process.stdout.write(`[openprism] memory consolidate ${user.username}: changed=${result.changed}\n`);
+        const result = await memoryLayers.runAll(user.uid, built.adapter, built.model);
+        await memory.markRun(user.uid);
+        process.stdout.write(
+          `[openprism] memory run ${user.username}: l1+${result.l1.chat.added + result.l1.ledger.added + result.l1.tasks.added} l2+${result.l2.chat.added + result.l2.ledger.added + result.l2.tasks.added}\n`,
+        );
       } catch (error) {
-        process.stdout.write(`[openprism] memory consolidate ${user.username} failed: ${String((error as Error).message)}\n`);
+        process.stdout.write(`[openprism] memory run ${user.username} failed: ${String((error as Error).message)}\n`);
       }
     }
   })();

@@ -6,6 +6,25 @@ export interface ConversationEntry {
   createdTs: number;
 }
 
+/** 模型供应商（BYOK 多供应商列表视图；Key 永不回传，只有 hasKey） */
+export interface ModelProvider {
+  id: string;
+  platform: string;
+  baseURL: string;
+  model: string;
+  /** 上下文窗口 tokens；null = harness 默认 64K */
+  contextWindow: number | null;
+  hasKey: boolean;
+}
+
+export interface ConversationEntry {
+  id: string;
+  title: string;
+  /** 置顶（定时提醒会话） */
+  pinned: boolean;
+  createdTs: number;
+}
+
 export interface TodayPlanView {
   planId: string;
   title: string;
@@ -88,14 +107,21 @@ export const api = {
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   me: () => request<{ uid: string; username: string }>("/api/auth/me"),
 
-  getModel: () => request<{ baseURL: string; model: string; hasKey: boolean }>("/api/model"),
-  putModel: (input: { baseURL: string; apiKey?: string; model: string }) =>
-    request<{ ok: boolean }>("/api/model", { method: "PUT", body: JSON.stringify(input) }),
-  testModel: () => request<{ ok: boolean; error?: string }>("/api/model/test", { method: "POST" }),
+  // ── 模型接入（BYOK 多供应商） ──────────────────────────
+  getModels: () => request<{ activeId: string | null; providers: ModelProvider[] }>("/api/models"),
+  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string }) =>
+    request<{ id: string }>("/api/models", { method: "POST", body: JSON.stringify(input) }),
+  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null }) =>
+    request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
+  deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
+  activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
+  testModel: (id: string) => request<{ ok: boolean; error?: string }>(`/api/models/${id}/test`, { method: "POST" }),
 
   listConversations: () => request<ConversationEntry[]>("/api/conversations"),
   createConversation: (title?: string) =>
     request<ConversationEntry>("/api/conversations", { method: "POST", body: JSON.stringify(title ? { title } : {}) }),
+  deleteConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}`, { method: "DELETE" }),
+  autoTitle: (cid: string) => request<{ ok: boolean; title?: string }>(`/api/conversations/${cid}/title`, { method: "POST" }),
   conversationEvents: (cid: string) => request<SessionEventLoose[]>(`/api/conversations/${cid}/events`),
   sendMessage: (cid: string, text: string) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, { method: "POST", body: JSON.stringify({ text }) }),
@@ -126,12 +152,32 @@ export interface AgentBindingLoose {
   skills: string[];
   mcps: string[];
 }
+export interface AgentIdentityLoose {
+  description: string;
+  emoji: string;
+  color: string;
+  avatar?: string;
+  language: string; // ''=自动跟随 | zh | en
+  modelProviderId?: string;
+}
 export interface AgentLoose {
   id: string;
   name: string;
   createdTs: number;
+  identity: AgentIdentityLoose;
   binding: AgentBindingLoose;
   persona?: string;
+}
+export interface AgentCreatePayload {
+  name: string;
+  persona: string;
+  description?: string;
+  emoji?: string;
+  color?: string;
+  avatar?: string;
+  language?: string;
+  modelProviderId?: string | null;
+  binding?: AgentBindingLoose;
 }
 export interface SkillLoose {
   id: string;
@@ -146,14 +192,16 @@ export interface McpLoose {
 }
 export interface ConversationMetaLoose {
   agentId?: string;
+  modelProviderId?: string;
   switches: { ts: number; agentId: string }[];
 }
 
 export const api2 = {
   listAgents: () => request<AgentLoose[]>("/api/agents"),
-  createAgent: (persona: string, binding?: AgentBindingLoose) =>
-    request<AgentLoose>("/api/agents", { method: "POST", body: JSON.stringify({ persona, ...(binding ? { binding } : {}) }) }),
+  createAgent: (payload: AgentCreatePayload) => request<AgentLoose>("/api/agents", { method: "POST", body: JSON.stringify(payload) }),
   getAgent: (id: string) => request<AgentLoose & { persona: string }>(`/api/agents/${id}`),
+  updateAgentIdentity: (id: string, patch: Partial<AgentIdentityLoose & { name: string }>) =>
+    request<{ name: string }>(`/api/agents/${id}/identity`, { method: "PUT", body: JSON.stringify(patch) }),
   updatePersona: (id: string, markdown: string) =>
     request<{ name: string }>(`/api/agents/${id}/persona`, { method: "PUT", body: JSON.stringify({ markdown }) }),
   updateBinding: (id: string, binding: AgentBindingLoose) =>
@@ -170,25 +218,39 @@ export const api2 = {
   deleteMcp: (id: string) => request<{ ok: boolean }>(`/api/mcps/${id}`, { method: "DELETE" }),
   mcpTools: (id: string) => request<{ tools: string[] }>(`/api/mcps/${id}/tools`, { method: "POST" }),
 
-  getMemory: () => request<{ slots: Record<string, string>; meta: { lastRunTs?: number; runs: number } }>("/api/memory"),
+  getMemory: () => request<MemoryOverviewLoose>("/api/memory"),
   putMemorySlot: (slot: string, markdown: string) =>
     request<{ ok: boolean }>(`/api/memory/${slot}`, { method: "PUT", body: JSON.stringify({ markdown }) }),
-  consolidateMemory: () => request<{ changed: boolean }>("/api/memory/consolidate", { method: "POST" }),
+  runMemory: () => request<MemoryRunSummaryLoose>("/api/memory/run", { method: "POST" }),
+  listL1: (surface: string) => request<L1DetailLoose>(`/api/memory/l1/${surface}`),
+  refreshL1: (surface: string) => request<{ added: number; modified: number; removed: number }>(`/api/memory/l1/${surface}/refresh`, { method: "POST" }),
+  listL2: (surface: string) => request<{ entries: L2EntryLoose[] }>(`/api/memory/l2/${surface}`),
+  updateL2: (surface: string) => request<{ added: number; skipped?: string }>(`/api/memory/l2/${surface}/update`, { method: "POST" }),
+  editL2Entry: (surface: string, id: string, patch: { text?: string; section?: string }) =>
+    request<{ ok: boolean }>(`/api/memory/l2/${surface}/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  removeL2Entry: (surface: string, id: string) => request<{ ok: boolean }>(`/api/memory/l2/${surface}/${id}`, { method: "DELETE" }),
+  updateL3: (slot: string) => request<{ changed: boolean; skipped?: string }>(`/api/memory/l3/${slot}/update`, { method: "POST" }),
 
   convMeta: (cid: string) => request<ConversationMetaLoose>(`/api/conversations/${cid}/meta`),
+  setConversationModel: (cid: string, providerId: string | null) =>
+    request<{ ok: boolean }>(`/api/conversations/${cid}/model`, { method: "PUT", body: JSON.stringify({ providerId }) }),
   switchAgent: (cid: string, agentId: string) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/agent`, { method: "PUT", body: JSON.stringify({ agentId }) }),
 };
 
 // ── 批次 3：定时任务 / 通知 ──────────────────────────────
 export interface TaskTriggerLoose {
-  kind: "once" | "daily" | "weekly" | "monthly" | "yearly" | "cron";
+  kind: "once" | "daily" | "weekly" | "monthly" | "yearly" | "interval" | "cron";
   at?: number;
   time?: string;
   days?: number[];
   day?: number;
   month?: number;
   expr?: string;
+  every?: number; // interval：每 N 个单位
+  unit?: "minute" | "hour" | "day" | "week" | "month" | "year";
+  startTs?: number;
+  endTs?: number; // 结束日当天末尾（含当天）
 }
 export interface TaskLoose {
   id: string;
@@ -198,6 +260,32 @@ export interface TaskLoose {
   enabled: boolean;
   agentId?: string;
   lastRunTs?: number;
+}
+// ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
+export interface MemoryOverviewLoose {
+  slots: Record<string, string>;
+  meta: { lastRunTs?: number; runs: number };
+  l1: { surfaces: { key: string; label: string; live: number; pending: { added: number; modified: number; removed: number } }[] };
+  l2: { surfaces: { key: string; label: string; entries: number }[] };
+  l3: { slots: { key: string; chars: number; bullets: number; hasNew: boolean }[]; preferences: { chars: number; bullets: number; toolOnly: boolean } };
+}
+export interface MemoryRunSummaryLoose {
+  l1: Record<string, { added: number; modified: number; removed: number }>;
+  l2: Record<string, { added: number; skipped?: string }>;
+  l3: Record<string, { changed: boolean; skipped?: string }>;
+}
+export interface L1DetailLoose {
+  entities: { ref: string; label: string; ts: number; fingerprint: string }[];
+  changes: { kind: string; ref: string; label: string; ts: number }[];
+  pending: { added: number; modified: number; removed: number };
+}
+export interface L2EntryLoose {
+  id: string;
+  section: string;
+  text: string;
+  refs: string[];
+  createdTs: number;
+  updatedTs?: number;
 }
 export interface TaskRunLoose {
   ts: number;

@@ -37,6 +37,7 @@ function Shell({ username, onLogout }: { username: string; onLogout: () => void 
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
+  const [convQuery, setConvQuery] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const avatarRef = useRef<HTMLDivElement>(null);
 
@@ -92,6 +93,13 @@ function Shell({ username, onLogout }: { username: string; onLogout: () => void 
     setView("chat");
   };
 
+  const removeConversation = async (id: string) => {
+    if (!window.confirm("删除这个对话？消息将一并删除，不可恢复。")) return;
+    await api.deleteConversation(id);
+    const list = await reloadConversations();
+    setActiveConvId((cur) => (cur === id ? list[0]?.id ?? null : cur));
+  };
+
   const navItem = (key: View, label: string, Icon: (p: { className?: string }) => JSX.Element, badge?: number) => {
     const active = view === key || (key === "agents" && view === "agent-edit");
     return (
@@ -139,7 +147,7 @@ function Shell({ username, onLogout }: { username: string; onLogout: () => void 
           {navItem("task", "提醒", TaskIcon, unread)}
         </nav>
 
-        {/* 会话记录（按时间倒序） */}
+        {/* 会话记录（置顶在前，其余按时间倒序；支持搜索与删除） */}
         <div className="mx-3 my-2 border-t border-line" />
         <div className="flex min-h-0 flex-1 flex-col px-3">
           <div className="flex items-center justify-between px-2 pb-1">
@@ -152,28 +160,49 @@ function Shell({ username, onLogout }: { username: string; onLogout: () => void 
               新对话
             </button>
           </div>
+          <input
+            value={convQuery}
+            onChange={(e) => setConvQuery(e.target.value)}
+            placeholder="搜索对话…"
+            className="mb-1.5 w-full rounded-lg border border-line bg-surface px-3 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink3 focus:border-accent"
+          />
           <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2">
-            {conversations.map((conv) => {
+            {conversations
+              .filter((conv) => conv.title.toLowerCase().includes(convQuery.trim().toLowerCase()))
+              .map((conv) => {
               const active = conv.id === activeConvId && view === "chat";
               return (
-                <button
+                <div
                   key={conv.id}
                   onClick={() => openConversation(conv.id)}
-                  className={`w-full rounded-lg px-3 py-2.5 text-left transition hover:bg-surface ${active ? "bg-accent3" : ""}`}
+                  className={`group w-full cursor-pointer rounded-lg px-3 py-2.5 text-left transition hover:bg-surface ${active ? "bg-accent3" : ""}`}
                 >
                   <div className="flex items-center gap-2">
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent3 text-[10px] font-semibold text-accent">
                       {conv.title.slice(0, 1)}
                     </span>
-                    <span className={`truncate text-[14px] ${active ? "font-medium text-ink" : "text-ink"}`}>{conv.title}</span>
+                    <span className={`min-w-0 flex-1 truncate text-[14px] ${active ? "font-medium text-ink" : "text-ink"}`}>{conv.title}</span>
+                    {conv.pinned && (
+                      <span className="shrink-0 rounded bg-accent3 px-1 py-0.5 text-[10px] text-accent">定时</span>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); void removeConversation(conv.id); }}
+                      title="删除对话"
+                      className="hidden shrink-0 rounded p-0.5 text-ink3 transition hover:text-warm group-hover:block"
+                    >
+                      <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                    </button>
                   </div>
                   <p className="mt-0.5 truncate text-xs text-ink2">
                     {new Date(conv.createdTs).toLocaleDateString()} · {new Date(conv.createdTs).toTimeString().slice(0, 5)}
                   </p>
-                </button>
+                </div>
               );
             })}
             {conversations.length === 0 && <p className="px-2 py-1 text-xs text-ink3">还没有对话</p>}
+            {conversations.length > 0 && conversations.every((conv) => !conv.title.toLowerCase().includes(convQuery.trim().toLowerCase())) && (
+              <p className="px-2 py-1 text-xs text-ink3">没有匹配的对话</p>
+            )}
           </div>
         </div>
 

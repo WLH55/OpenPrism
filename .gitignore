@@ -58,3 +58,5 @@ Thumbs.db
 .claude/settings.local.json
 .agents/*.local.*
 .dsh-e2e/
+.zcode/
+plugins/

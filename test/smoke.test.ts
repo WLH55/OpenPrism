@@ -35,7 +35,8 @@ const env: PlatformEnv = {
   randomUUID: () => crypto.randomUUID(),
 };
 
-const adapter = createOpenAICompatAdapter(env, { baseURL: baseURL!, apiKey: apiKey! });
+// 未启用（缺 env）时给占位 baseURL：构造是惰性的不发请求，下面的用例整组跳过（存量问题：顶层无条件构造会在缺配置时崩）。
+const adapter = createOpenAICompatAdapter(env, { baseURL: baseURL ?? "https://smoke.invalid", apiKey: apiKey ?? "" });
 const TIMEOUT = 60_000;
 
 const echoTool: ToolPublicSchema = {

@@ -3,13 +3,24 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import type { FileIO, LlmAdapter, PlatformEnv } from "../harness/index";
+import { resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import type { LlmAdapter, PlatformEnv } from "../harness/index";
 import { createOpenAICompatAdapter } from "../harness/index";
-import type { AppPaths } from "./store";
-import { ensureUserSandbox } from "./store";
 import { appendUser, hashPassword, SessionStore, verifyPassword, type UserRecord } from "./auth";
-import { open, readModelConfig, seal, writeModelConfig, type ModelConfig } from "./secretbox";
+import {
+  activeModelId,
+  addModelProvider,
+  listModelProviders,
+  open,
+  readModelConfig,
+  readModelProviderConfig,
+  removeModelProvider,
+  seal,
+  setActiveModel,
+  updateModelProvider,
+  type ModelConfig,
+} from "./secretbox";
 import type { Ledger } from "./ledger";
 import { categoryView, listCategories, progressView, todayView } from "./fold";
 import { ModelNotConfiguredError, type ConversationStore } from "./conversations";
@@ -17,11 +28,12 @@ import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
 import { MEMORY_SLOTS, type MemorySlot, type MemoryStore } from "./memory";
+import { L1_SURFACES, L3_AUTO_SLOTS, SURFACE_LABELS, type L1Surface, type L3AutoSlot, type MemoryLayers } from "./memory-layers";
 
 export interface ServerDeps {
   env: PlatformEnv;
-  fileIO: FileIO;
-  paths: AppPaths;
+  /** SQLite 数据库（ADR 0008 领域表） */
+  db: DatabaseSync;
   masterKey: Buffer;
   /** 启动时载入、注册时追加的共享用户表（键 = username） */
   users: Map<string, UserRecord>;
@@ -39,6 +51,8 @@ export interface ServerDeps {
   skills: SkillStore;
   mcps: McpRegistry;
   memory: MemoryStore;
+  /** 记忆三层流水线（L1 镜像 → L2 事实 → L3 综合） */
+  memoryLayers: MemoryLayers;
   tasks: import("./tasks").TaskStore;
   notifications: import("./notify").NotificationStore;
   /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
@@ -206,11 +220,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (deps.users.has(username)) return sendError(res, 409, "username already taken");
     const uid = deps.env.randomUUID();
     const user: UserRecord = { uid, username, password: await hashPassword(password), createdTs: deps.env.now() };
-    await appendUser(deps.fileIO, deps.paths.usersFile, user);
+    appendUser(deps.db, user);
     deps.users.set(username, user);
     deps.usersByUid?.set(uid, user);
-    await ensureUserSandbox(deps.paths, uid);
-    await deps.ledgerFor(uid); // 注册即建账本文件
+    await deps.ledgerFor(uid); // 注册即开账本（空账本入缓存）
     const token = deps.sessions.issue(uid);
     return sendJson(res, 200, { uid, username }, sessionCookie(token));
   }
@@ -244,48 +257,107 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { uid, username: user.username });
   }
 
-  // ── 模型配置（BYOK） ───────────────────────────────────
-  if (path === "/api/model") {
-    const modelFile = deps.paths.modelFile(uid);
-    if (method === "GET") {
-      const config = await readModelConfig(deps.fileIO, modelFile);
-      return sendJson(res, 200, {
-        baseURL: config?.baseURL ?? "",
-        model: config?.model ?? "",
-        hasKey: Boolean(config?.keyEnc),
-      });
-    }
-    if (method === "PUT") {
-      const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string };
-      const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
-      const model = String(body.model ?? "").trim();
-      if (!/^https?:\/\//.test(baseURL)) return sendError(res, 400, "baseURL 需以 http(s):// 开头");
-      if (model === "") return sendError(res, 400, "model 必填");
-      const existing = await readModelConfig(deps.fileIO, modelFile);
+  // ── 模型接入（BYOK 多供应商） ──────────────────────────
+  /** 上下文窗口入参归一：undefined=不改/缺省、null=回默认、正整数=自定义 */
+  const parseContextWindow = (input: unknown): number | null | undefined => {
+    if (input === undefined) return undefined;
+    if (input === null) return null;
+    const n = Number(input);
+    if (!Number.isInteger(n) || n < 1000) throw new Error("contextWindow 需为 ≥1000 的整数（tokens）");
+    return n;
+  };
+  const validateBaseURL = (baseURL: string): void => {
+    if (!/^https?:\/\//.test(baseURL)) throw new Error("baseURL 需以 http(s):// 开头");
+  };
+
+  if (path === "/api/models" && method === "GET") {
+    return sendJson(res, 200, { activeId: activeModelId(deps.db, uid), providers: listModelProviders(deps.db, uid) });
+  }
+  if (path === "/api/models" && method === "POST") {
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string };
+    const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
+    const model = String(body.model ?? "").trim();
+    try {
+      validateBaseURL(baseURL);
+      if (model === "") throw new Error("model 必填");
+      const contextWindow = parseContextWindow(body.contextWindow);
       const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-      const keyEnc = apiKey !== "" ? seal(deps.masterKey, apiKey) : existing?.keyEnc;
-      const config: ModelConfig = { baseURL, model, ...(keyEnc !== undefined ? { keyEnc } : {}) };
-      await writeModelConfig(deps.fileIO, modelFile, config);
-      return sendJson(res, 200, { ok: true });
+      const created = addModelProvider(deps.db, uid, {
+        baseURL,
+        model,
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+        ...(apiKey !== "" ? { keyEnc: seal(deps.masterKey, apiKey) } : {}),
+        ...(typeof body.platform === "string" && body.platform.trim() !== "" ? { platform: body.platform.trim() } : {}),
+      });
+      return sendJson(res, 200, { id: created.id });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  const modelsMatch = /^\/api\/models\/([^/]+)(\/[^/]*)?$/.exec(path);
+  if (modelsMatch) {
+    const providerId = decodeURIComponent(modelsMatch[1]!);
+    const sub = modelsMatch[2] ?? "";
+    try {
+      if (sub === "" && method === "PUT") {
+        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown };
+        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string } = {};
+        if (body.baseURL !== undefined) {
+          const baseURL = String(body.baseURL).trim().replace(/\/+$/, "");
+          validateBaseURL(baseURL);
+          patch.baseURL = baseURL;
+        }
+        if (body.model !== undefined) {
+          const model = String(body.model).trim();
+          if (model === "") throw new Error("model 必填");
+          patch.model = model;
+        }
+        const contextWindow = parseContextWindow(body.contextWindow);
+        if (contextWindow !== undefined) patch.contextWindow = contextWindow;
+        const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+        if (apiKey !== "") patch.keyEnc = seal(deps.masterKey, apiKey);
+        updateModelProvider(deps.db, uid, providerId, patch);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "" && method === "DELETE") {
+        removeModelProvider(deps.db, uid, providerId);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/active" && method === "PUT") {
+        setActiveModel(deps.db, uid, providerId);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/test" && method === "POST") {
+        const config = readModelProviderConfig(deps.db, uid, providerId);
+        if (!config) return sendError(res, 404, `model provider "${providerId}" 不存在`);
+        const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
+        try {
+          await tester(uid, config);
+          return sendJson(res, 200, { ok: true });
+        } catch (error) {
+          return sendJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error).slice(0, 300) });
+        }
+      }
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
     }
   }
 
-  if (method === "POST" && path === "/api/model/test") {
-    const config = await readModelConfig(deps.fileIO, deps.paths.modelFile(uid));
-    const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
-    try {
-      await tester(uid, config);
-      return sendJson(res, 200, { ok: true });
-    } catch (error) {
-      return sendJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error).slice(0, 300) });
-    }
+  // GET /api/model：激活供应商视图（兼容旧客户端；列表管理走 /api/models）
+  if (path === "/api/model" && method === "GET") {
+    const config = await readModelConfig(deps.db, uid);
+    return sendJson(res, 200, {
+      baseURL: config?.baseURL ?? "",
+      model: config?.model ?? "",
+      hasKey: Boolean(config?.keyEnc),
+    });
   }
 
   // ── 会话 ───────────────────────────────────────────────
   if (path === "/api/conversations" && (method === "GET" || method === "POST")) {
     if (method === "GET") {
-      const entries = await deps.conversations.list(uid);
-      return sendJson(res, 200, entries.sort((a, b) => b.createdTs - a.createdTs));
+      const entries = await deps.conversations.list(uid); // 已按置顶在前、创建时间倒序
+      return sendJson(res, 200, entries);
     }
     const body = (await readBody(req)) as { title?: string };
     const entry = await deps.conversations.create(
@@ -295,14 +367,37 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, entry);
   }
 
+  const convRootMatch = /^\/api\/conversations\/([^/]+)$/.exec(path);
+  if (convRootMatch && method === "DELETE") {
+    try {
+      await deps.conversations.remove(uid, decodeURIComponent(convRootMatch[1]!));
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
+    }
+  }
+
+  const convTitleMatch = /^\/api\/conversations\/([^/]+)\/title$/.exec(path);
+  if (convTitleMatch && method === "POST") {
+    // 自动命名（WeKnora 同款）：仅默认标题的会话生效；失败回退首条消息截断，静默不抛
+    try {
+      const result = await deps.conversations.autoTitle(uid, decodeURIComponent(convTitleMatch[1]!));
+      return sendJson(res, 200, result ?? { ok: false });
+    } catch {
+      return sendJson(res, 200, { ok: false });
+    }
+  }
+
   const convMatch = /^\/api\/conversations\/([^/]+)(\/.*)?$/.exec(path);
   if (convMatch) {
     const cid = decodeURIComponent(convMatch[1]!);
     const sub = convMatch[2] ?? "";
 
     if (sub === "/events" && method === "GET") {
-      const lines = await deps.fileIO.readAll(join(deps.paths.convDir(uid, cid), "session.jsonl"));
-      return sendJson(res, 200, lines.map((line) => JSON.parse(line)));
+      const rows = deps.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq").all(cid) as unknown as {
+        event_json: string;
+      }[];
+      return sendJson(res, 200, rows.map((row) => JSON.parse(row.event_json)));
     }
 
     if (sub === "/messages" && method === "POST") {
@@ -362,19 +457,59 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         return sendError(res, 404, String((error as Error).message));
       }
     }
+    // 会话级模型绑定（2026-09-07）：providerId = null 表示跟随全局激活
+    if (sub === "/model" && method === "PUT") {
+      const body = (await readBody(req)) as { providerId?: string | null };
+      const providerId = body.providerId ?? null;
+      if (providerId !== null && !listModelProviders(deps.db, uid).some((p) => p.id === providerId)) {
+        return sendError(res, 404, `model provider "${providerId}" 不存在`);
+      }
+      try {
+        await deps.conversations.switchModel(uid, cid, providerId);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendError(res, 404, String((error as Error).message));
+      }
+    }
   }
 
   // ── 智能体（三段配置） ─────────────────────────────────
   if (path === "/api/agents" && (method === "GET" || method === "POST")) {
     if (method === "GET") return sendJson(res, 200, await deps.agents.list(uid));
-    const body = (await readBody(req)) as { persona?: string; binding?: AgentBinding };
+    const body = (await readBody(req)) as {
+      persona?: string;
+      name?: string;
+      binding?: AgentBinding;
+      description?: string;
+      emoji?: string;
+      color?: string;
+      avatar?: string;
+      language?: string;
+      modelProviderId?: string | null;
+    };
     const persona = String(body.persona ?? "");
     if (persona.trim() === "") return sendError(res, 400, "persona 必填（markdown 自由书写）");
-    const entry = await deps.agents.create(uid, {
-      persona,
-      ...(body.binding ? { binding: body.binding } : {}),
-    });
-    return sendJson(res, 200, entry);
+    if (body.modelProviderId && !deps.db.prepare("SELECT 1 FROM model_providers WHERE uid = ? AND id = ?").get(uid, body.modelProviderId)) {
+      return sendError(res, 400, `模型 "${body.modelProviderId}" 不存在`);
+    }
+    try {
+      const entry = await deps.agents.create(uid, {
+        persona,
+        ...(body.name !== undefined ? { name: String(body.name) } : {}),
+        ...(body.binding ? { binding: body.binding } : {}),
+        identity: {
+          ...(body.description !== undefined ? { description: String(body.description) } : {}),
+          ...(body.emoji !== undefined ? { emoji: String(body.emoji) } : {}),
+          ...(body.color !== undefined ? { color: String(body.color) } : {}),
+          ...(body.avatar !== undefined ? { avatar: String(body.avatar) } : {}),
+          ...(body.language !== undefined ? { language: String(body.language) } : {}),
+          ...(body.modelProviderId !== undefined ? { modelProviderId: body.modelProviderId === null ? "" : String(body.modelProviderId) } : {}),
+        },
+      });
+      return sendJson(res, 200, entry);
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
   }
   const agentMatch = /^\/api\/agents\/([^/]+)(\/[^/]*)?$/.exec(path);
   if (agentMatch) {
@@ -392,6 +527,26 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       if (sub === "/persona" && method === "PUT") {
         const body = (await readBody(req)) as { markdown?: string };
         return sendJson(res, 200, await deps.agents.updatePersona(uid, aid, String(body.markdown ?? "")));
+      }
+      if (sub === "/identity" && method === "PUT") {
+        const body = (await readBody(req)) as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+        for (const key of ["name", "description", "emoji", "color", "avatar", "language", "modelProviderId"] as const) {
+          if (body[key] !== undefined) patch[key] = body[key];
+        }
+        if (typeof patch.modelProviderId === "string" && patch.modelProviderId !== "") {
+          const hit = deps.db.prepare("SELECT 1 FROM model_providers WHERE uid = ? AND id = ?").get(uid, patch.modelProviderId);
+          if (!hit) return sendError(res, 400, `模型 "${String(patch.modelProviderId)}" 不存在`);
+        }
+        try {
+          const entry = await deps.agents.updateIdentity(uid, aid, patch);
+          // 伙伴默认模型变更 → 弃池其绑定会话（下一回合重装配）
+          deps.conversations.evictAgentConversations(uid, aid);
+          return sendJson(res, 200, entry);
+        } catch (error) {
+          const msg = String((error as Error).message);
+          return sendError(res, msg.includes("不存在") ? 404 : 400, msg);
+        }
       }
       if (sub === "/binding" && method === "PUT") {
         const body = (await readBody(req)) as { binding?: AgentBinding };
@@ -464,10 +619,34 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
   }
 
-  // ── 长期记忆 ───────────────────────────────────────────
+  // ── 长期记忆（三层：L1 镜像 / L2 模块事实 / L3 跨模块知识） ──
   if (path === "/api/memory" && method === "GET") {
     const [slots, meta] = await Promise.all([deps.memory.read(uid), deps.memory.meta(uid)]);
-    return sendJson(res, 200, { slots, meta });
+    const l1Surfaces = await Promise.all(
+      L1_SURFACES.map(async (key) => ({
+        key,
+        label: SURFACE_LABELS[key],
+        live: (await deps.memoryLayers.l1Live(uid, key)).length,
+        pending: await deps.memoryLayers.l1Pending(uid, key),
+      })),
+    );
+    const l2Surfaces = L1_SURFACES.map((key) => ({ key, label: SURFACE_LABELS[key], entries: deps.memoryLayers.l2EntryCount(uid, key) }));
+    const slotChars = (md: string): { chars: number; bullets: number } => ({
+      chars: md.length,
+      bullets: md.split("\n").filter((l) => l.trim().startsWith("-")).length,
+    });
+    const l3Slots = L3_AUTO_SLOTS.map((key) => {
+      const md = slots[key] ?? "";
+      return { key, label: key, ...slotChars(md), hasNew: deps.memoryLayers.l3Pending(uid, key) > 0 };
+    });
+    const prefMd = slots.preferences ?? "";
+    return sendJson(res, 200, {
+      slots,
+      meta,
+      l1: { surfaces: l1Surfaces },
+      l2: { surfaces: l2Surfaces },
+      l3: { slots: l3Slots, preferences: { ...slotChars(prefMd), toolOnly: true } },
+    });
   }
   const memorySlotMatch = /^\/api\/memory\/([a-z]+)$/.exec(path);
   if (memorySlotMatch && method === "PUT") {
@@ -477,32 +656,66 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     await deps.memory.writeSlot(uid, slot, String(body.markdown ?? ""));
     return sendJson(res, 200, { ok: true });
   }
-  if (path === "/api/memory/consolidate" && method === "POST") {
+  if ((path === "/api/memory/run" || path === "/api/memory/consolidate") && method === "POST") {
     const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
     if (!built) return sendError(res, 409, "model_not_configured");
-    // 会话文本采集：全部会话的 user/assistant 文本，取尾部 40 条
-    const texts: string[] = [];
-    for (const entry of await deps.conversations.list(uid)) {
-      const lines = await deps.fileIO.readAll(join(deps.paths.convDir(uid, entry.id), "session.jsonl"));
-      for (const line of lines) {
-        try {
-          const event = JSON.parse(line) as { type: string; message?: { role: string; content: { type: string; text?: string }[] } };
-          if (event.type === "user/message" || event.type === "assistant/message") {
-            const text = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
-            if (text.trim() !== "") texts.push(`${event.message?.role === "user" ? "用户" : "助手"}：${text}`);
-          }
-        } catch {
-          // 坏行
+    const result = await deps.memoryLayers.runAll(uid, built.adapter, built.model);
+    await deps.memory.markRun(uid);
+    return sendJson(res, 200, result);
+  }
+  const l1Match = /^\/api\/memory\/l1\/(chat|ledger|tasks)(\/refresh)?$/.exec(path);
+  if (l1Match) {
+    const surface = l1Match[1]! as L1Surface;
+    if (l1Match[2] === "/refresh" && method === "POST") {
+      return sendJson(res, 200, await deps.memoryLayers.l1Refresh(uid, surface));
+    }
+    if (l1Match[2] === undefined && method === "GET") {
+      const live = await deps.memoryLayers.l1Live(uid, surface);
+      return sendJson(res, 200, {
+        entities: live.map((e) => ({ ref: e.ref, label: e.label, ts: e.ts, fingerprint: e.fingerprint })),
+        changes: deps.memoryLayers.l1Changes(uid, surface),
+        pending: await deps.memoryLayers.l1Pending(uid, surface),
+      });
+    }
+  }
+  const l2Match = /^\/api\/memory\/l2\/(chat|ledger|tasks)(?:\/([^/]+))?$/.exec(path);
+  if (l2Match) {
+    const surface = l2Match[1]! as L1Surface;
+    const entryId = l2Match[2];
+    if (method === "GET" && entryId === undefined) {
+      return sendJson(res, 200, { entries: deps.memoryLayers.l2Entries(uid, surface) });
+    }
+    if (method === "POST" && entryId === "update") {
+      const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
+      if (!built) return sendError(res, 409, "model_not_configured");
+      return sendJson(res, 200, await deps.memoryLayers.l2Update(uid, surface, built.adapter, built.model));
+    }
+    if (method === "POST" && entryId === "reset") {
+      deps.memoryLayers.l2ResetGate(uid, surface);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (entryId !== undefined && entryId !== "update" && (method === "PUT" || method === "DELETE")) {
+      try {
+        if (method === "DELETE") {
+          deps.memoryLayers.l2RemoveEntry(uid, surface, entryId);
+          return sendJson(res, 200, { ok: true });
         }
+        const body = (await readBody(req)) as { text?: string; section?: string };
+        await deps.memoryLayers.l2EditEntry(uid, surface, entryId, {
+          ...(body.text !== undefined ? { text: String(body.text) } : {}),
+          ...(body.section !== undefined ? { section: String(body.section) } : {}),
+        });
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendError(res, 404, String((error as Error).message));
       }
     }
-    const result = await deps.memory.consolidate({
-      uid,
-      adapter: built.adapter,
-      model: built.model,
-      sessionTexts: texts.slice(-40),
-    });
-    return sendJson(res, 200, result);
+  }
+  const l3RunMatch = /^\/api\/memory\/l3\/(recent|profile|scope)\/update$/.exec(path);
+  if (l3RunMatch && method === "POST") {
+    const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
+    if (!built) return sendError(res, 409, "model_not_configured");
+    return sendJson(res, 200, await deps.memoryLayers.l3Update(uid, l3RunMatch[1]! as L3AutoSlot, built.adapter, built.model));
   }
 
   // ── 账本直写（ui 来源） ────────────────────────────────
@@ -613,24 +826,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
 
-  // ── 盘面/成长（D7/D11.3，确定性折叠） ──────────────────
-  const archiveFile = () => join(deps.paths.userDir(uid), "archives.json");
+  // ── 盘面/成长（D7/D11.3，确定性折叠；归档名单存 archives 表） ──
   const readArchived = async (): Promise<string[]> => {
-    const lines = await deps.fileIO.readAll(archiveFile());
-    if (lines.length === 0) return [];
+    const row = deps.db.prepare("SELECT list_json FROM archives WHERE uid = ?").get(uid) as
+      | { list_json: string }
+      | undefined;
+    if (!row) return [];
     try {
-      const parsed = JSON.parse(lines[lines.length - 1]!) as string[];
+      const parsed = JSON.parse(row.list_json) as string[];
       return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
     }
   };
-  const writeArchived = async (list: string[]): Promise<void> => {
-    const { mkdir, writeFile, rename } = await import("node:fs/promises");
-    const file = archiveFile();
-    await mkdir(join(file, ".."), { recursive: true });
-    await writeFile(file + ".tmp", JSON.stringify(list), "utf8");
-    await rename(file + ".tmp", file);
+  const writeArchived = (list: string[]): void => {
+    deps.db
+      .prepare(
+        "INSERT INTO archives (uid, list_json, updated_ts) VALUES (?, ?, ?) ON CONFLICT(uid) DO UPDATE SET list_json = excluded.list_json, updated_ts = excluded.updated_ts",
+      )
+      .run(uid, JSON.stringify(list), deps.env.now());
   };
 
   if (path === "/api/panels" && method === "GET") {
@@ -674,7 +888,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const next = path.endsWith("/archive")
       ? current.includes(name) ? current : [...current, name]
       : current.filter((n) => n !== name);
-    await writeArchived(next);
+    writeArchived(next);
     return sendJson(res, 200, { archived: next });
   }
   const panelCategory = /^\/api\/panels\/category\/([^/]+)$/.exec(path);

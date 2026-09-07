@@ -2,15 +2,42 @@ import { useCallback, useEffect, useState } from "react";
 import { api2, api3, type AgentLoose, type NotificationLoose, type TaskLoose, type TaskRunLoose, type TaskTriggerLoose } from "../api";
 import { Toggle } from "../ui";
 
-const TRIGGER_LABEL: Record<string, string> = {
-  once: "单次",
-  daily: "每天",
-  weekly: "每周",
-  monthly: "每月",
-  yearly: "每年",
-  cron: "cron",
-};
 const WEEKDAY = ["", "一", "二", "三", "四", "五", "六", "日"];
+const WORKDAYS = [1, 2, 3, 4, 5];
+const UNIT_CHAR: Record<"minute" | "hour" | "day" | "week" | "month" | "year", string> = {
+  minute: "分钟",
+  hour: "小时",
+  day: "天",
+  week: "周",
+  month: "个月",
+  year: "年",
+};
+const CUSTOM_UNITS = ["minute", "hour", "day", "week", "month", "year"] as const;
+type CustomUnit = (typeof CUSTOM_UNITS)[number];
+/** 分钟/小时按固定间隔从创建时刻跑（无时刻）；天及以上锚当日 HH:mm */
+const isTimedUnit = (u: CustomUnit): boolean => u === "day" || u === "week" || u === "month" || u === "year";
+
+type SchedKind = "hourly" | "daily" | "workday" | "weekly" | "monthly" | "custom";
+
+const SCHEDULE_TYPES: { value: SchedKind; label: string }[] = [
+  { value: "hourly", label: "每小时" },
+  { value: "daily", label: "每天" },
+  { value: "workday", label: "每工作日" },
+  { value: "weekly", label: "每周" },
+  { value: "monthly", label: "每月" },
+  { value: "custom", label: "自定义" },
+];
+
+/** 自定义重复的频率短语：every=1 → 每天/每周…；>1 → 每 2 天 */
+const freqText = (every: number, unit: CustomUnit): string => (every === 1 ? `每${UNIT_CHAR[unit]}` : `每 ${every} ${UNIT_CHAR[unit]}`);
+/** 历史数据兜底：unit 缺失/非法按「天」理解 */
+const asUnit = (unit: TaskTriggerLoose["unit"]): CustomUnit => (unit !== undefined && CUSTOM_UNITS.includes(unit) ? unit : "day");
+
+const pad = (n: number): string => String(n).padStart(2, "0");
+const HOURS = Array.from({ length: 24 }, (_, i) => i);
+const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+const DAYS_31 = Array.from({ length: 31 }, (_, i) => i + 1);
+const TZ_OFFSET_MINUTES = -new Date().getTimezoneOffset(); // 本地时区（如 UTC+8 → 480）
 
 function triggerText(trigger: TaskTriggerLoose): string {
   switch (trigger.kind) {
@@ -18,32 +45,53 @@ function triggerText(trigger: TaskTriggerLoose): string {
       return `单次 ${trigger.at ? new Date(trigger.at).toLocaleString() : ""}`;
     case "daily":
       return `每天 ${trigger.time}`;
-    case "weekly":
-      return `每周${(trigger.days ?? []).map((d) => WEEKDAY[d] ?? d).join("、")} ${trigger.time}`;
+    case "weekly": {
+      const days = trigger.days ?? [];
+      if (WORKDAYS.every((d) => days.includes(d)) && days.length === WORKDAYS.length) return `每工作日 ${trigger.time}`;
+      return `每周${days.map((d) => WEEKDAY[d] ?? d).join("、")} ${trigger.time}`;
+    }
     case "monthly":
       return `每月 ${trigger.day} 日 ${trigger.time}`;
     case "yearly":
       return `每年 ${trigger.month}-${trigger.day} ${trigger.time}`;
-    case "cron":
+    case "interval": {
+      const end = trigger.endTs ? ` · 至 ${new Date(trigger.endTs).toLocaleDateString()}` : "";
+      const time = typeof trigger.time === "string" && trigger.time !== "" ? ` ${trigger.time}` : "";
+      return `${freqText(trigger.every ?? 1, asUnit(trigger.unit))}${time}${end}`;
+    }
+    case "cron": {
+      const hourly = /^(\d{1,2}) \* \* \* \*$/.exec(trigger.expr ?? "");
+      if (hourly) return `每小时第 ${hourly[1]!.padStart(2, "0")} 分`;
       return `cron ${trigger.expr}`;
+    }
     default:
       return "?";
   }
 }
 
 function triggerShort(trigger: TaskTriggerLoose): string {
-  // 左侧时间列：每日 → HH:mm；每周 → 周X HH:mm；每月 → N日 HH:mm；其余 → 触发摘要
+  // 左侧时间列：每日 → HH:mm；每小时 → 每小时；每周 → 周X HH:mm；每月 → N日 HH:mm；其余 → 触发摘要
   switch (trigger.kind) {
     case "daily":
       return trigger.time ?? "";
-    case "weekly":
-      return `${(trigger.days ?? []).map((d) => WEEKDAY[d] ?? d).join("")} ${trigger.time ?? ""}`.trim();
+    case "weekly": {
+      const days = trigger.days ?? [];
+      const label = WORKDAYS.every((d) => days.includes(d)) && days.length === WORKDAYS.length ? "工作日" : days.map((d) => WEEKDAY[d] ?? d).join("");
+      return `${label} ${trigger.time ?? ""}`.trim();
+    }
     case "monthly":
       return `${trigger.day}日 ${trigger.time ?? ""}`.trim();
     case "yearly":
       return `${trigger.month}-${trigger.day}`;
-    case "cron":
+    case "interval": {
+      const base = freqText(trigger.every ?? 1, asUnit(trigger.unit));
+      return typeof trigger.time === "string" && trigger.time !== "" ? `${base} ${trigger.time}` : base;
+    }
+    case "cron": {
+      const hourly = /^(\d{1,2}) \* \* \* \*$/.exec(trigger.expr ?? "");
+      if (hourly) return "每小时";
       return "cron";
+    }
     default:
       return "—";
   }
@@ -57,13 +105,21 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [message, setMessage] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationLoose[]>([]);
-  // 新建表单
+  // 新建表单（结构化调度）
   const [title, setTitle] = useState("");
   const [instruction, setInstruction] = useState("");
-  const [kind, setKind] = useState<TaskTriggerLoose["kind"]>("daily");
-  const [time, setTime] = useState("23:00");
-  const [days, setDays] = useState<number[]>([1]);
-  const [cron, setCron] = useState("0 9 * * *");
+  const [schedKind, setSchedKind] = useState<SchedKind>("daily");
+  const [minute, setMinute] = useState(0); // 每小时的第 M 分
+  const [hour, setHour] = useState(23);
+  const [minuteOfHour, setMinuteOfHour] = useState(0);
+  const [weekdays, setWeekdays] = useState<number[]>(WORKDAYS);
+  const [monthDay, setMonthDay] = useState(1);
+  // 自定义重复（interval 触发器）：每 N 天/周/月/年 + 结束条件
+  const [customEvery, setCustomEvery] = useState(1);
+  const [customUnit, setCustomUnit] = useState<CustomUnit>("day");
+  const [customEnd, setCustomEnd] = useState<"never" | "date">("never");
+  const [customEndDate, setCustomEndDate] = useState("");
+  const [customOpen, setCustomOpen] = useState(false);
   const [agentId, setAgentId] = useState("");
 
   const reload = useCallback(async () => {
@@ -84,20 +140,53 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   }, [reloadNotifications]);
 
   const create = async () => {
-    const trigger: TaskTriggerLoose =
-      kind === "daily"
-        ? { kind: "daily", time }
-        : kind === "weekly"
-          ? { kind: "weekly", days, time }
-          : kind === "cron"
-            ? { kind: "cron", expr: cron }
-            : { kind: "daily", time };
+    const createTime = `${pad(hour)}:${pad(minuteOfHour)}`;
+    let trigger: TaskTriggerLoose;
+    switch (schedKind) {
+      case "hourly":
+        trigger = { kind: "cron", expr: `${pad(minute)} * * * *` };
+        break;
+      case "daily":
+        trigger = { kind: "daily", time: createTime };
+        break;
+      case "workday":
+        trigger = { kind: "weekly", days: WORKDAYS, time: createTime };
+        break;
+      case "weekly":
+        trigger = { kind: "weekly", days: weekdays.length > 0 ? weekdays : [1], time: createTime };
+        break;
+      case "monthly":
+        trigger = { kind: "monthly", day: monthDay, time: createTime };
+        break;
+      case "custom": {
+        if (customEnd === "date" && customEndDate === "") {
+          setMessage("自定义重复：选了「指定日期」就要挑一个结束日期");
+          return;
+        }
+        const every = Math.max(1, Math.floor(customEvery) || 1);
+        const timed = isTimedUnit(customUnit);
+        const start = new Date();
+        if (timed) start.setHours(hour, minuteOfHour, 0, 0); // 天及以上：锚今天 HH:mm；分钟/小时：从现在起算
+        const endTs = customEnd === "date" ? new Date(`${customEndDate}T23:59:59`).getTime() : undefined; // 含结束日当天
+        trigger = {
+          kind: "interval",
+          every,
+          unit: customUnit,
+          ...(timed ? { time: createTime } : {}),
+          startTs: start.getTime(),
+          ...(endTs !== undefined && Number.isFinite(endTs) ? { endTs } : {}),
+        };
+        break;
+      }
+      default:
+        trigger = { kind: "daily", time: createTime };
+    }
     try {
-      await api3.createTask({ title, instruction, trigger, ...(agentId !== "" ? { agentId } : {}) });
+      await api3.createTask({ title, instruction, trigger, tzOffsetMinutes: TZ_OFFSET_MINUTES, ...(agentId !== "" ? { agentId } : {}) });
       setTitle("");
       setInstruction("");
       setCreateOpen(false);
-      setMessage("已创建（到点以该伙伴身份跑一次离线回合）");
+      setMessage("已创建（到点以该伙伴身份跑一次离线回合，提醒落进它的定时提醒会话）");
       await reload();
     } catch (e) {
       setMessage(`创建失败：${(e as Error).message}`);
@@ -180,6 +269,29 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const inputCls =
     "rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3";
 
+  const createTime = `${pad(hour)}:${pad(minuteOfHour)}`;
+  const scheduleSummary = (() => {
+    switch (schedKind) {
+      case "hourly":
+        return `每小时第 ${pad(minute)} 分`;
+      case "daily":
+        return `每天 ${createTime}`;
+      case "workday":
+        return `每工作日 ${createTime}`;
+      case "weekly":
+        return `每周${(weekdays.length > 0 ? weekdays : [1]).map((d) => WEEKDAY[d]).join("、")} ${createTime}`;
+      case "monthly":
+        return `每月 ${monthDay} 号 ${createTime}`;
+      default: {
+        const every = Math.max(1, Math.floor(customEvery) || 1);
+        const end = customEnd === "date" && customEndDate !== "" ? ` · 至 ${customEndDate}` : " · 永不结束";
+        return isTimedUnit(customUnit) ? `${freqText(every, customUnit)} ${createTime}${end}` : `${freqText(every, customUnit)}${end}`;
+      }
+    }
+  })();
+
+  const selectCls = `${inputCls} w-auto`;
+
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
       <header className="mb-5 flex items-end justify-between">
@@ -209,44 +321,101 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               ))}
             </select>
           </div>
+          <div className="mt-2 space-y-2">
+            <div className="text-sm font-medium text-ink">调度</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <select className={selectCls} value={schedKind} onChange={(e) => setSchedKind(e.target.value as SchedKind)}>
+                {SCHEDULE_TYPES.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+              {schedKind === "hourly" && (
+                <>
+                  <span className="text-sm text-ink2">第</span>
+                  <select className={selectCls} value={minute} onChange={(e) => setMinute(Number(e.target.value))}>
+                    {MINUTES.map((m) => (
+                      <option key={m} value={m}>
+                        {pad(m)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-sm text-ink2">分钟</span>
+                </>
+              )}
+              {schedKind === "weekly" && (
+                <span className="flex gap-1">
+                  {[1, 2, 3, 4, 5, 6, 7].map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      className={`h-8 w-8 rounded-lg border text-xs transition ${
+                        weekdays.includes(d)
+                          ? "border-accent bg-accent3 font-medium text-accent"
+                          : "border-line text-ink3 hover:border-accent hover:text-ink"
+                      }`}
+                      onClick={() =>
+                        setWeekdays(weekdays.includes(d) ? weekdays.filter((x) => x !== d) : [...weekdays, d].sort((a, b) => a - b))
+                      }
+                    >
+                      {WEEKDAY[d]}
+                    </button>
+                  ))}
+                </span>
+              )}
+              {schedKind === "monthly" && (
+                <select className={selectCls} value={monthDay} onChange={(e) => setMonthDay(Number(e.target.value))}>
+                  {DAYS_31.map((d) => (
+                    <option key={d} value={d}>
+                      {d} 号
+                    </option>
+                  ))}
+                </select>
+              )}
+              {(schedKind === "daily" || schedKind === "workday" || schedKind === "weekly" || schedKind === "monthly" || (schedKind === "custom" && isTimedUnit(customUnit))) && (
+                <>
+                  <span className="text-sm text-ink2">于</span>
+                  <select className={selectCls} value={hour} onChange={(e) => setHour(Number(e.target.value))} aria-label="小时">
+                    {HOURS.map((h) => (
+                      <option key={h} value={h}>
+                        {pad(h)}
+                      </option>
+                    ))}
+                  </select>
+                  <select className={selectCls} value={minuteOfHour} onChange={(e) => setMinuteOfHour(Number(e.target.value))} aria-label="分钟">
+                    {MINUTES.map((m) => (
+                      <option key={m} value={m}>
+                        {pad(m)}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+              {schedKind === "custom" && (
+                <button
+                  type="button"
+                  className="rounded-lg border border-line px-3 py-2 text-sm text-ink2 transition hover:border-accent hover:text-ink"
+                  onClick={() => setCustomOpen(true)}
+                >
+                  自定义重复…<span className="ml-1.5 text-xs text-accent">{scheduleSummary}</span>
+                </button>
+              )}
+              <span className="ml-auto text-xs text-ink3">{scheduleSummary}</span>
+            </div>
+            <p className="text-xs text-ink3">
+              按本地时区（UTC{-TZ_OFFSET_MINUTES >= 0 ? "+" : ""}
+              {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
+            </p>
+          </div>
           <textarea
-            className={`${inputCls} mt-2`}
+            className={`${inputCls} mt-2 w-full`}
             rows={2}
             placeholder="指令（每次到点投给伙伴的话，如：提醒用户准备睡觉，结合今日打卡温和劝）"
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
           />
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <select className={`${inputCls} w-auto`} value={kind} onChange={(e) => setKind(e.target.value as TaskTriggerLoose["kind"])}>
-              {Object.entries(TRIGGER_LABEL).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            {kind === "daily" && (
-              <input className={`${inputCls} w-28`} value={time} onChange={(e) => setTime(e.target.value)} placeholder="23:00" />
-            )}
-            {kind === "weekly" && (
-              <>
-                <span className="flex gap-3 text-sm text-ink2">
-                  {[1, 2, 3, 4, 5, 6, 7].map((d) => (
-                    <label key={d} className="flex items-center gap-1">
-                      <input
-                        type="checkbox"
-                        checked={days.includes(d)}
-                        onChange={() => setDays(days.includes(d) ? days.filter((x) => x !== d) : [...days, d])}
-                      />
-                      {WEEKDAY[d]}
-                    </label>
-                  ))}
-                </span>
-                <input className={`${inputCls} w-28`} value={time} onChange={(e) => setTime(e.target.value)} placeholder="08:00" />
-              </>
-            )}
-            {kind === "cron" && (
-              <input className={`${inputCls} w-48 font-mono`} value={cron} onChange={(e) => setCron(e.target.value)} placeholder="0 9 * * *" />
-            )}
             <button
               className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
               onClick={() => void create()}
@@ -257,6 +426,59 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         </div>
       )}
       {message && <p className="mb-4 text-sm text-ink3">{message}</p>}
+
+      {/* 自定义重复弹窗：每 N 天/周/月/年 + 结束条件（落 interval 触发器） */}
+      {customOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={() => setCustomOpen(false)}>
+          <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-[15px] font-semibold text-ink">自定义重复</h3>
+              <button className="text-lg leading-none text-ink3 transition hover:text-ink" onClick={() => setCustomOpen(false)} aria-label="关闭">
+                ×
+              </button>
+            </div>
+            <div className="mt-4 text-sm font-medium text-ink">重复频率</div>
+            <div className="mt-2 flex gap-2">
+              <input
+                type="number"
+                min={1}
+                className={`${inputCls} w-24`}
+                value={customEvery}
+                onChange={(e) => setCustomEvery(Number(e.target.value))}
+                aria-label="重复间隔"
+              />
+              <select className={`${inputCls} flex-1`} value={customUnit} onChange={(e) => setCustomUnit(e.target.value as CustomUnit)} aria-label="重复单位">
+                {CUSTOM_UNITS.map((u) => (
+                  <option key={u} value={u}>
+                    {UNIT_CHAR[u]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-4 text-sm font-medium text-ink">结束</div>
+            <div className="mt-2 space-y-2">
+              <label className="flex items-center gap-2 text-sm text-ink2">
+                <input type="radio" checked={customEnd === "never"} onChange={() => setCustomEnd("never")} /> 永不结束
+              </label>
+              <label className="flex items-center gap-2 text-sm text-ink2">
+                <input type="radio" checked={customEnd === "date"} onChange={() => setCustomEnd("date")} /> 指定日期
+              </label>
+              {customEnd === "date" && (
+                <input type="date" className={inputCls} value={customEndDate} onChange={(e) => setCustomEndDate(e.target.value)} />
+              )}
+            </div>
+            <div className="mt-4 flex items-center justify-between">
+              <span className="text-xs text-ink3">
+                {freqText(Math.max(1, Math.floor(customEvery) || 1), customUnit)}
+                {customEnd === "date" && customEndDate !== "" ? ` · 至 ${customEndDate}` : " · 永不结束"}
+              </span>
+              <button className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => setCustomOpen(false)}>
+                确认
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 统计行 */}
       <div className="mb-5 rounded-xl border border-line bg-surface px-4 py-3 text-sm text-ink2">
@@ -276,9 +498,9 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         </div>
       </section>
 
-      {/* 每周/每月 */}
+      {/* 周期任务（每小时/每周/每月/自定义重复等） */}
       <section className="mb-6">
-        <h2 className="mb-2 text-sm font-semibold text-ink">每周 / 每月</h2>
+        <h2 className="mb-2 text-sm font-semibold text-ink">周期任务</h2>
         <div className="space-y-1.5">
           {recurring.length === 0 && <p className="text-sm text-ink3">（无）</p>}
           {recurring.map((task) => (

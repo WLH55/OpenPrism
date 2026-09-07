@@ -1,11 +1,9 @@
-// MCP 客户端（D4b.1）：remote URL 型工具服务器，Streamable HTTP JSON-RPC 最小实现
+// MCP 客户端（D4b.1，ADR 0008 领域表）：remote URL 型工具服务器，Streamable HTTP JSON-RPC 最小实现
 // （POST + JSON/SSE 双响应解析 + Mcp-Session-Id 传递）。仅 remote 型——本地 command 型不做（公网禁令天然满足）。
 // 安装 = 自带自装：URL + 可选头；信任边界 = 安装时连接测试一次，绑定即授权（运行中无逐次审批）。
 
-import { rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { FileIO, PlatformEnv, ToolDefinition } from "../harness/index";
-import type { AppPaths } from "./store";
+import type { DatabaseSync } from "node:sqlite";
+import type { PlatformEnv, ToolDefinition } from "../harness/index";
 
 export interface McpServerConfig {
   id: string;
@@ -60,8 +58,7 @@ export async function mcpCall(env: PlatformEnv, server: McpServerConfig, method:
 
 export interface McpRegistryDeps {
   env: PlatformEnv;
-  fileIO: FileIO;
-  paths: AppPaths;
+  db: DatabaseSync;
   now(): number;
   randomUUID(): string;
 }
@@ -91,27 +88,16 @@ function wrapTool(env: PlatformEnv, server: McpServerConfig, tool: { name: strin
 export class McpRegistry {
   constructor(private deps: McpRegistryDeps) {}
 
-  private file(uid: string): string {
-    return join(this.deps.paths.userDir(uid), "mcps.json");
-  }
-
   async list(uid: string): Promise<McpServerConfig[]> {
-    const lines = await this.deps.fileIO.readAll(this.file(uid));
-    if (lines.length === 0) return [];
-    try {
-      const parsed = JSON.parse(lines[lines.length - 1]!) as McpServerConfig[];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-
-  private async persist(uid: string, configs: McpServerConfig[]): Promise<void> {
-    const tmp = this.file(uid) + ".tmp";
-    const { mkdir } = await import("node:fs/promises");
-    await mkdir(join(this.file(uid), ".."), { recursive: true });
-    await writeFile(tmp, JSON.stringify(configs), "utf8");
-    await rename(tmp, this.file(uid));
+    const rows = this.deps.db
+      .prepare("SELECT id, name, url, headers_json FROM mcps WHERE uid = ? ORDER BY created_ts, id")
+      .all(uid) as unknown as { id: string; name: string; url: string; headers_json: string | null }[];
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      url: row.url,
+      ...(row.headers_json !== null ? { headers: JSON.parse(row.headers_json) as Record<string, string> } : {}),
+    }));
   }
 
   async add(uid: string, input: { name: string; url: string; headers?: Record<string, string> }): Promise<McpServerConfig> {
@@ -129,14 +115,15 @@ export class McpRegistry {
       url: input.url,
       ...(input.headers ? { headers: input.headers } : {}),
     };
-    await this.persist(uid, [...(await this.list(uid)), config]);
+    this.deps.db
+      .prepare("INSERT INTO mcps (id, uid, name, url, headers_json, created_ts) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(config.id, uid, config.name, config.url, config.headers ? JSON.stringify(config.headers) : null, this.deps.now());
     return config;
   }
 
   async remove(uid: string, id: string): Promise<void> {
-    const configs = await this.list(uid);
-    if (!configs.some((c) => c.id === id)) throw new Error(`mcp "${id}" 不存在`);
-    await this.persist(uid, configs.filter((c) => c.id !== id));
+    const result = this.deps.db.prepare("DELETE FROM mcps WHERE id = ? AND uid = ?").run(id, uid);
+    if (result.changes === 0) throw new Error(`mcp "${id}" 不存在`);
   }
 
   /** initialize + tools/list → 包装为 harness 工具（exclusive；名称用服务器原名，重名在注册时暴露） */

@@ -1,9 +1,6 @@
-// 批次1·auth：scrypt 慢哈希 + timingSafe 校验 + 用户注册表 JSONL + 会话令牌（时钟注入，无真实计时断言）。
+// 批次1·auth：scrypt 慢哈希 + timingSafe 校验 + users/sessions 表（ADR 0008）；时钟注入，无真实计时断言。
 
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   appendUser,
   hashPassword,
@@ -12,17 +9,7 @@ import {
   verifyPassword,
   type UserRecord,
 } from "../src/app/auth";
-import { nodeFileIO } from "../src/app/env";
-
-let root: string;
-
-beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "op-app-auth-"));
-});
-
-afterAll(async () => {
-  await rm(root, { recursive: true, force: true });
-});
+import { testDb } from "./helpers-db";
 
 describe("密码哈希", () => {
   it("同口令不同盐产生不同哈希；同盐可复现", async () => {
@@ -47,33 +34,23 @@ describe("密码哈希", () => {
   });
 });
 
-describe("用户注册表", () => {
+describe("用户注册表（users 表）", () => {
   it("appendUser/loadUsers 往返，键为用户名，密码可验", async () => {
-    const usersFile = join(root, "users.jsonl");
+    const db = testDb();
     const u1: UserRecord = { uid: "uuid-1", username: "lathan", password: await hashPassword("p1"), createdTs: 1000 };
     const u2: UserRecord = { uid: "uuid-2", username: "mike", password: await hashPassword("p2"), createdTs: 2000 };
-    await appendUser(nodeFileIO, usersFile, u1);
-    await appendUser(nodeFileIO, usersFile, u2);
-    const map = await loadUsers(nodeFileIO, usersFile);
+    appendUser(db, u1);
+    appendUser(db, u2);
+    const map = await loadUsers(db);
     expect([...map.keys()]).toEqual(["lathan", "mike"]);
     expect(map.get("lathan")?.uid).toBe("uuid-1");
     expect(await verifyPassword("p1", map.get("lathan")!.password)).toBe(true);
   });
-
-  it("坏行跳过（崩溃半行容错），不影响其余记录", async () => {
-    const usersFile = join(root, "bad.jsonl");
-    await nodeFileIO.appendLine(usersFile, "{broken json");
-    const u: UserRecord = { uid: "u", username: "ok", password: await hashPassword("p"), createdTs: 1 };
-    await appendUser(nodeFileIO, usersFile, u);
-    const map = await loadUsers(nodeFileIO, usersFile);
-    expect(map.size).toBe(1);
-    expect(map.get("ok")?.uid).toBe("u");
-  });
 });
 
-describe("SessionStore", () => {
+describe("SessionStore（sessions 表）", () => {
   it("issue/verify 往返；令牌 48hex 且互异", () => {
-    const s = new SessionStore(() => 0);
+    const s = new SessionStore(testDb(), () => 0);
     const t1 = s.issue("u1");
     const t2 = s.issue("u1");
     expect(t1).toMatch(/^[0-9a-f]{48}$/);
@@ -82,8 +59,9 @@ describe("SessionStore", () => {
   });
 
   it("到期与撤销返回 null；undefined 令牌返回 null（时钟注入）", () => {
+    const db = testDb();
     let now = 0;
-    const s = new SessionStore(() => now, 1000);
+    const s = new SessionStore(db, () => now, 1000);
     const t = s.issue("u1");
     now = 999;
     expect(s.verify(t)).toBe("u1");
@@ -94,20 +72,29 @@ describe("SessionStore", () => {
     expect(s.verify(t2)).toBeNull();
     expect(s.verify(undefined)).toBeNull();
   });
-});
 
-describe("SessionStore 持久化（批次4：重启不掉线）", () => {
-  it("issue/revoke 落事件行；load 重放恢复（撤销的仍撤销）", async () => {
-    const file = join(root, "sessions.jsonl");
+  it("持久化（重启不掉线）：同库新实例恢复签发；撤销的仍撤销", () => {
+    const db = testDb();
     let now = 0;
-    const s1 = new SessionStore(() => now, 1000, { fileIO: nodeFileIO, file });
+    const s1 = new SessionStore(db, () => now, 1000);
     const keep = s1.issue("u1");
     const gone = s1.issue("u2");
     s1.revoke(gone);
     now = 500; // 时间前进但仍在 TTL 内
-    const s2 = await SessionStore.load({ fileIO: nodeFileIO, file }, () => now);
+    const s2 = new SessionStore(db, () => now, 1000);
     expect(s2.verify(keep)).toBe("u1");
     expect(s2.verify(gone)).toBeNull();
   });
-});
 
+  it("issue 顺手清理过期令牌", () => {
+    const db = testDb();
+    let now = 0;
+    const s = new SessionStore(db, () => now, 1000);
+    const t = s.issue("u1");
+    now = 2000;
+    s.issue("u2"); // 触发清理
+    const count = db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as unknown as { n: number };
+    expect(count.n).toBe(1); // 只剩 u2 的新令牌
+    expect(s.verify(t)).toBeNull();
+  });
+});

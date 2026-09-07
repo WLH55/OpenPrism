@@ -1,31 +1,17 @@
 // 批次1·tools：四录入工具（模型只能经工具写账本）+ 默认助手 persona（日期注入防算术错）。
 
 import { describe, expect, it } from "vitest";
-import type { FileIO } from "../src/harness/index";
 import type { ToolDefinition } from "../src/harness/index";
 import { defaultAssistantPrompt } from "../src/app/persona";
 import { createLedgerTools } from "../src/app/tools";
 import { Ledger, type FlowRecord, type PlanRecord } from "../src/app/ledger";
+import { testDb } from "./helpers-db";
 
 // 固定锚：2026-09-03 12:00 UTC（当地 UTC+8 = 20:00 周四）
 const NOW = Date.UTC(2026, 8, 3, 12, 0, 0);
 
-function memoryFileIO(): FileIO {
-  const files = new Map<string, string[]>();
-  return {
-    async appendLine(path: string, line: string) {
-      const lines = files.get(path) ?? [];
-      lines.push(line);
-      files.set(path, lines);
-    },
-    async readAll(path: string) {
-      return [...(files.get(path) ?? [])];
-    },
-  };
-}
-
 async function freshTools() {
-  const ledger = await Ledger.open(memoryFileIO(), "life.jsonl");
+  const ledger = await Ledger.open(testDb(), "u1");
   const tools = createLedgerTools({
     ledger,
     now: () => NOW,

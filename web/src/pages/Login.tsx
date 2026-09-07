@@ -59,20 +59,6 @@ export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }
       </div>
 
       <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-        {mode === "register" && (
-          <div>
-            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="confirm">确认密码</label>
-            <input
-              id="confirm"
-              type="password"
-              autoComplete="new-password"
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
-              placeholder="再输一遍"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-            />
-          </div>
-        )}
         <div>
           <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="user">用户名</label>
           <input
@@ -97,6 +83,20 @@ export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }
             onChange={(e) => setPassword(e.target.value)}
           />
         </div>
+        {mode === "register" && (
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="confirm">确认密码</label>
+            <input
+              id="confirm"
+              type="password"
+              autoComplete="new-password"
+              className="w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
+              placeholder="再输一遍"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </div>
+        )}
         {error && <p className="text-sm text-warm">{error}</p>}
         <button
           type="submit"

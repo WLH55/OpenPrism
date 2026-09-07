@@ -1,9 +1,7 @@
-// 通知（D9 首版 = 站内兜底通道）：users/{uid}/notifications.jsonl 追加式；
-// 通道缝 = NotifyChannel 数组（微信桥等后续接入，D9.2 双向网关架构位）。
+// 通知（D9 首版 = 站内兜底通道，ADR 0008 领域表）：notifications 表，(uid, seq) 主键；
+// markRead = UPDATE（不再整文件重写）。通道缝 = NotifyChannel 数组（微信桥等后续接入，D9.2 双向网关架构位）。
 
-import { join } from "node:path";
-import type { FileIO } from "../harness/index";
-import type { AppPaths } from "./store";
+import type { DatabaseSync } from "node:sqlite";
 
 export interface NotificationRow {
   seq: number;
@@ -23,73 +21,59 @@ export interface NotifyPayload {
 export type NotifyChannel = (uid: string, payload: NotifyPayload) => Promise<void>;
 
 export class NotificationStore {
-  constructor(private deps: { fileIO: FileIO; paths: AppPaths; now(): number }) {}
-
-  private file(uid: string): string {
-    return join(this.deps.paths.userDir(uid), "notifications.jsonl");
-  }
-
-  private rowsAsync = new Map<string, Promise<NotificationRow[]>>();
-
-  private load(uid: string): Promise<NotificationRow[]> {
-    let cached = this.rowsAsync.get(uid);
-    if (!cached) {
-      cached = (async () => {
-        const rows: NotificationRow[] = [];
-        for (const line of await this.deps.fileIO.readAll(this.file(uid))) {
-          try {
-            const row = JSON.parse(line) as NotificationRow;
-            if (typeof row?.seq === "number") rows.push(row);
-          } catch {
-            // 坏行
-          }
-        }
-        return rows;
-      })();
-      this.rowsAsync.set(uid, cached);
-    }
-    return cached;
-  }
+  constructor(private deps: { db: DatabaseSync; now(): number }) {}
 
   async push(uid: string, payload: NotifyPayload): Promise<NotificationRow> {
-    const rows = await this.load(uid);
-    const row: NotificationRow = {
-      seq: rows.reduce((max, r) => Math.max(max, r.seq), -1) + 1,
-      ts: this.deps.now(),
-      kind: payload.kind,
-      ...(payload.taskId !== undefined ? { taskId: payload.taskId } : {}),
-      text: payload.text,
+    const ts = this.deps.now();
+    // seq = 用户内 max+1（INSERT...SELECT 原子取号；单进程下无并发竞争窗口）
+    this.deps.db
+      .prepare(
+        "INSERT INTO notifications (uid, seq, ts, kind, task_id, text) SELECT ?, IFNULL(MAX(seq), -1) + 1, ?, ?, ?, ? FROM notifications WHERE uid = ?",
+      )
+      .run(uid, ts, payload.kind, payload.taskId ?? null, payload.text, uid);
+    const row = this.deps.db
+      .prepare("SELECT seq, ts, kind, task_id, text, read_ts FROM notifications WHERE uid = ? ORDER BY seq DESC LIMIT 1")
+      .get(uid) as unknown as { seq: number; ts: number; kind: string; task_id: string | null; text: string; read_ts: number | null };
+    return {
+      seq: row.seq,
+      ts: row.ts,
+      kind: row.kind,
+      ...(row.task_id !== null ? { taskId: row.task_id } : {}),
+      text: row.text,
+      ...(row.read_ts !== null ? { readTs: row.read_ts } : {}),
     };
-    await this.deps.fileIO.appendLine(this.file(uid), JSON.stringify(row));
-    rows.push(row);
-    return row;
   }
 
   async list(uid: string, opts?: { unreadOnly?: boolean }): Promise<NotificationRow[]> {
-    const rows = await this.load(uid);
-    return opts?.unreadOnly ? rows.filter((r) => r.readTs === undefined) : rows;
+    const where = opts?.unreadOnly ? "WHERE uid = ? AND read_ts IS NULL" : "WHERE uid = ?";
+    const rows = this.deps.db
+      .prepare(`SELECT seq, ts, kind, task_id, text, read_ts FROM notifications ${where} ORDER BY seq`)
+      .all(uid) as unknown as { seq: number; ts: number; kind: string; task_id: string | null; text: string; read_ts: number | null }[];
+    return rows.map((row) => ({
+      seq: row.seq,
+      ts: row.ts,
+      kind: row.kind,
+      ...(row.task_id !== null ? { taskId: row.task_id } : {}),
+      text: row.text,
+      ...(row.read_ts !== null ? { readTs: row.read_ts } : {}),
+    }));
   }
 
   async unreadCount(uid: string): Promise<number> {
-    return (await this.list(uid, { unreadOnly: true })).length;
+    const row = this.deps.db
+      .prepare("SELECT COUNT(*) AS n FROM notifications WHERE uid = ? AND read_ts IS NULL")
+      .get(uid) as unknown as { n: number };
+    return row.n;
   }
 
   async markRead(uid: string, which: number | "all"): Promise<void> {
-    const rows = await this.load(uid);
-    const now = this.deps.now();
-    let dirty = false;
-    for (const row of rows) {
-      if (row.readTs === undefined && (which === "all" || row.seq === which)) {
-        row.readTs = now;
-        dirty = true;
-      }
+    if (which === "all") {
+      this.deps.db.prepare("UPDATE notifications SET read_ts = ? WHERE uid = ? AND read_ts IS NULL").run(this.deps.now(), uid);
+      return;
     }
-    if (!dirty) return;
-    const { writeFile } = await import("node:fs/promises");
-    const { mkdir } = await import("node:fs/promises");
-    const file = this.file(uid);
-    await mkdir(join(file, ".."), { recursive: true });
-    await writeFile(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+    this.deps.db
+      .prepare("UPDATE notifications SET read_ts = ? WHERE uid = ? AND seq = ? AND read_ts IS NULL")
+      .run(this.deps.now(), uid, which);
   }
 }
 
