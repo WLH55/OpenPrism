@@ -168,6 +168,40 @@ CREATE TABLE IF NOT EXISTS memory_meta (
   runs        INTEGER NOT NULL DEFAULT 0
 );
 
+-- 记忆条目化（2026-09-10，WeKnora 化重构 Spec §6.1）：条目 = 唯一真相，supersede 链不物理删除；
+-- 旧 L1/L2/L3 六表（l1_entities/l1_changes/l2_entries/l2_meta/l3_meta/memory_slots）代码零引用，仅为回滚保留。
+CREATE TABLE IF NOT EXISTS memory_items (
+  uid           TEXT NOT NULL,
+  id            TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('profile','preference','fact','task')),
+  status        TEXT NOT NULL CHECK (status IN ('active','superseded','archived','pending')),
+  origin        TEXT NOT NULL CHECK (origin IN ('explicit','extracted','manual')),
+  topic         TEXT NOT NULL DEFAULT '',
+  norm_key      TEXT NOT NULL,
+  content       TEXT NOT NULL,
+  importance    INTEGER NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+  source_ref    TEXT,
+  valid_from    INTEGER NOT NULL,
+  invalid_at    INTEGER,
+  superseded_by TEXT,
+  expires_at    INTEGER,
+  last_used_ts  INTEGER,
+  use_count     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (uid, id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_items_key ON memory_items(uid, norm_key, status);
+CREATE INDEX IF NOT EXISTS idx_memory_items_live ON memory_items(uid, status, importance, valid_from);
+
+-- 墓碑：只存指纹与主题（不存原文），阻止后台蒸馏复活用户已删除的记忆
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+  uid         TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  topic       TEXT NOT NULL DEFAULT '',
+  source_ref  TEXT,
+  created_ts  INTEGER NOT NULL,
+  PRIMARY KEY (uid, fingerprint)
+);
+
 -- 记忆三层（2026-09-07，对齐 DeepTutor）：L1 实时镜像快照 + 变更日志；L2 每模块事实 + seen 门控；L3 槽增量 meta。
 CREATE TABLE IF NOT EXISTS l1_entities (
   uid         TEXT NOT NULL,
@@ -281,6 +315,14 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "agents", "avatar", "TEXT"); // data:image/* data URL，≤200KB
   ensureColumn(db, "agents", "language", "TEXT NOT NULL DEFAULT ''"); // ''=自动跟随 | zh | en
   ensureColumn(db, "agents", "model_provider_id", "TEXT"); // 伙伴默认模型；NULL = 跟随会话/全局
+  // 记忆条目化（2026-09-10）：调度与水位线状态扩列（chat 水位线 / ledger 水位线 / tasks 指纹 / 去抖计划 / 在飞 / 提取节流 / 整理时钟）
+  ensureColumn(db, "memory_meta", "extract_cursor", "INTEGER");
+  ensureColumn(db, "memory_meta", "ledger_cursor", "INTEGER");
+  ensureColumn(db, "memory_meta", "tasks_fingerprint", "TEXT");
+  ensureColumn(db, "memory_meta", "scheduled_ts", "INTEGER");
+  ensureColumn(db, "memory_meta", "in_flight_since", "INTEGER");
+  ensureColumn(db, "memory_meta", "last_extract_ts", "INTEGER");
+  ensureColumn(db, "memory_meta", "consolidated_ts", "INTEGER");
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }

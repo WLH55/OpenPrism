@@ -27,8 +27,8 @@ import { ModelNotConfiguredError, type ConversationStore } from "./conversations
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
-import { MEMORY_SLOTS, type MemorySlot, type MemoryStore } from "./memory";
-import { L1_SURFACES, L3_AUTO_SLOTS, SURFACE_LABELS, type L1Surface, type L3AutoSlot, type MemoryLayers } from "./memory-layers";
+import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
+import type { MemoryExtractor } from "./memory-extract";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -45,14 +45,14 @@ export interface ServerDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** 连接测试：默认用当前配置发一次 1-token 非流式请求；测试注入 fake（零网络） */
   modelTester?(uid: string, config: ModelConfig | null): Promise<void>;
-  /** 记忆凝练用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（consolidate 返回 409）；测试注入 mock */
+  /** 记忆提取/整理用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（extract 返回 409）；测试注入 mock */
   adapterFor?(uid: string): Promise<{ adapter: LlmAdapter; model: string } | null>;
   agents: AgentStore;
   skills: SkillStore;
   mcps: McpRegistry;
   memory: MemoryStore;
-  /** 记忆三层流水线（L1 镜像 → L2 事实 → L3 综合） */
-  memoryLayers: MemoryLayers;
+  /** 记忆提取管线（条目化，2026-09-10）：手动提取/整理端点与去抖调度共用 */
+  memoryExtractor: MemoryExtractor;
   tasks: import("./tasks").TaskStore;
   notifications: import("./notify").NotificationStore;
   /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
@@ -619,103 +619,88 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
   }
 
-  // ── 长期记忆（三层：L1 镜像 / L2 模块事实 / L3 跨模块知识） ──
+  // ── 长期记忆（条目化，2026-09-10 WeKnora 化重构） ──
   if (path === "/api/memory" && method === "GET") {
-    const [slots, meta] = await Promise.all([deps.memory.read(uid), deps.memory.meta(uid)]);
-    const l1Surfaces = await Promise.all(
-      L1_SURFACES.map(async (key) => ({
-        key,
-        label: SURFACE_LABELS[key],
-        live: (await deps.memoryLayers.l1Live(uid, key)).length,
-        pending: await deps.memoryLayers.l1Pending(uid, key),
-      })),
-    );
-    const l2Surfaces = L1_SURFACES.map((key) => ({ key, label: SURFACE_LABELS[key], entries: deps.memoryLayers.l2EntryCount(uid, key) }));
-    const slotChars = (md: string): { chars: number; bullets: number } => ({
-      chars: md.length,
-      bullets: md.split("\n").filter((l) => l.trim().startsWith("-")).length,
+    const counts = deps.memory.countByStatus(uid);
+    const meta = deps.memory.metaRow(uid);
+    return sendJson(res, 200, { counts, meta });
+  }
+  if (path === "/api/memory/items" && method === "GET") {
+    const kindParam = url.searchParams.get("kind");
+    const statusParam = url.searchParams.get("status");
+    const kind = (MEMORY_KINDS as readonly string[]).includes(kindParam ?? "") ? (kindParam as MemoryKind) : undefined;
+    const status = (MEMORY_STATUSES as readonly string[]).includes(statusParam ?? "") ? (statusParam as MemoryStatus) : undefined;
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? "100")) || 100);
+    const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+    return sendJson(res, 200, { items: deps.memory.listItems(uid, { kind, status, limit, offset }) });
+  }
+  if (path === "/api/memory/items" && method === "POST") {
+    const body = (await readBody(req)) as { kind?: string; content?: string; importance?: number; topic?: string };
+    const kind = (MEMORY_KINDS as readonly string[]).includes(String(body.kind ?? "")) ? (body.kind as MemoryKind) : "fact";
+    const content = String(body.content ?? "").trim();
+    if (content === "") return sendError(res, 400, "content 必填");
+    const result = deps.memory.insertItem(uid, {
+      kind,
+      content,
+      ...(body.topic !== undefined ? { topic: String(body.topic) } : {}),
+      ...(body.importance !== undefined ? { importance: Number(body.importance) } : {}),
+      origin: "manual",
     });
-    const l3Slots = L3_AUTO_SLOTS.map((key) => {
-      const md = slots[key] ?? "";
-      return { key, label: key, ...slotChars(md), hasNew: deps.memoryLayers.l3Pending(uid, key) > 0 };
-    });
-    const prefMd = slots.preferences ?? "";
-    return sendJson(res, 200, {
-      slots,
-      meta,
-      l1: { surfaces: l1Surfaces },
-      l2: { surfaces: l2Surfaces },
-      l3: { slots: l3Slots, preferences: { ...slotChars(prefMd), toolOnly: true } },
-    });
+    if (!result.item) return sendError(res, 400, "内容被拒绝（敏感材料或重复）");
+    return sendJson(res, 200, { item: result.item });
   }
-  const memorySlotMatch = /^\/api\/memory\/([a-z]+)$/.exec(path);
-  if (memorySlotMatch && method === "PUT") {
-    const slot = memorySlotMatch[1]! as MemorySlot;
-    if (!(MEMORY_SLOTS as readonly string[]).includes(slot)) return sendError(res, 400, `slot 只能是 ${MEMORY_SLOTS.join(" / ")}`);
-    const body = (await readBody(req)) as { markdown?: string };
-    await deps.memory.writeSlot(uid, slot, String(body.markdown ?? ""));
-    return sendJson(res, 200, { ok: true });
+  if (path === "/api/memory/items" && method === "DELETE") {
+    const body = (await readBody(req)) as { confirm?: string };
+    if (body.confirm !== "clear") return sendError(res, 400, "需要 confirm:clear");
+    const removed = deps.memory.clearAll(uid);
+    return sendJson(res, 200, { removed });
   }
-  if ((path === "/api/memory/run" || path === "/api/memory/consolidate") && method === "POST") {
-    const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
-    if (!built) return sendError(res, 409, "model_not_configured");
-    const result = await deps.memoryLayers.runAll(uid, built.adapter, built.model);
-    await deps.memory.markRun(uid);
-    return sendJson(res, 200, result);
-  }
-  const l1Match = /^\/api\/memory\/l1\/(chat|ledger|tasks)(\/refresh)?$/.exec(path);
-  if (l1Match) {
-    const surface = l1Match[1]! as L1Surface;
-    if (l1Match[2] === "/refresh" && method === "POST") {
-      return sendJson(res, 200, await deps.memoryLayers.l1Refresh(uid, surface));
-    }
-    if (l1Match[2] === undefined && method === "GET") {
-      const live = await deps.memoryLayers.l1Live(uid, surface);
-      return sendJson(res, 200, {
-        entities: live.map((e) => ({ ref: e.ref, label: e.label, ts: e.ts, fingerprint: e.fingerprint })),
-        changes: deps.memoryLayers.l1Changes(uid, surface),
-        pending: await deps.memoryLayers.l1Pending(uid, surface),
-      });
-    }
-  }
-  const l2Match = /^\/api\/memory\/l2\/(chat|ledger|tasks)(?:\/([^/]+))?$/.exec(path);
-  if (l2Match) {
-    const surface = l2Match[1]! as L1Surface;
-    const entryId = l2Match[2];
-    if (method === "GET" && entryId === undefined) {
-      return sendJson(res, 200, { entries: deps.memoryLayers.l2Entries(uid, surface) });
-    }
-    if (method === "POST" && entryId === "update") {
-      const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
-      if (!built) return sendError(res, 409, "model_not_configured");
-      return sendJson(res, 200, await deps.memoryLayers.l2Update(uid, surface, built.adapter, built.model));
-    }
-    if (method === "POST" && entryId === "reset") {
-      deps.memoryLayers.l2ResetGate(uid, surface);
-      return sendJson(res, 200, { ok: true });
-    }
-    if (entryId !== undefined && entryId !== "update" && (method === "PUT" || method === "DELETE")) {
-      try {
-        if (method === "DELETE") {
-          deps.memoryLayers.l2RemoveEntry(uid, surface, entryId);
-          return sendJson(res, 200, { ok: true });
-        }
-        const body = (await readBody(req)) as { text?: string; section?: string };
-        await deps.memoryLayers.l2EditEntry(uid, surface, entryId, {
-          ...(body.text !== undefined ? { text: String(body.text) } : {}),
-          ...(body.section !== undefined ? { section: String(body.section) } : {}),
+  const memoryItemMatch = /^\/api\/memory\/items\/([^/]+)(\/confirm|\/reject)?$/.exec(path);
+  if (memoryItemMatch) {
+    const id = memoryItemMatch[1]!;
+    const suffix = memoryItemMatch[2];
+    try {
+      if (suffix === undefined && method === "PUT") {
+        const body = (await readBody(req)) as { content?: string; importance?: number; topic?: string };
+        const item = deps.memory.updateItemContent(uid, id, {
+          ...(body.content !== undefined ? { content: String(body.content) } : {}),
+          ...(body.importance !== undefined ? { importance: Number(body.importance) } : {}),
+          ...(body.topic !== undefined ? { topic: String(body.topic) } : {}),
         });
-        return sendJson(res, 200, { ok: true });
-      } catch (error) {
-        return sendError(res, 404, String((error as Error).message));
+        return sendJson(res, 200, { item });
       }
+      if (suffix === undefined && method === "DELETE") {
+        deps.memory.deleteItem(uid, id);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (suffix === "/confirm" && method === "POST") {
+        deps.memory.confirmItem(uid, id);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (suffix === "/reject" && method === "POST") {
+        deps.memory.rejectItem(uid, id);
+        return sendJson(res, 200, { ok: true });
+      }
+    } catch (error) {
+      return sendError(res, 404, String((error as Error).message));
     }
   }
-  const l3RunMatch = /^\/api\/memory\/l3\/(recent|profile|scope)\/update$/.exec(path);
-  if (l3RunMatch && method === "POST") {
+  if (path === "/api/memory/extract" && method === "POST") {
     const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
     if (!built) return sendError(res, 409, "model_not_configured");
-    return sendJson(res, 200, await deps.memoryLayers.l3Update(uid, l3RunMatch[1]! as L3AutoSlot, built.adapter, built.model));
+    return sendJson(res, 200, await deps.memoryExtractor.extractOnce(uid, built.adapter, built.model));
+  }
+  if (path === "/api/memory/consolidate" && method === "POST") {
+    const built = deps.adapterFor ? await deps.adapterFor(uid) : null;
+    if (!built) return sendError(res, 409, "model_not_configured");
+    return sendJson(res, 200, await deps.memoryExtractor.consolidate(uid, built.adapter, built.model, true));
+  }
+  if (path === "/api/memory/export" && method === "GET") {
+    const items = deps.memory.listItems(uid, { limit: 20000 });
+    const body = JSON.stringify({ exportedAt: new Date().toISOString(), items }, null, 2);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": 'attachment; filename="openprism-memory.json"' });
+    res.end(body);
+    return;
   }
 
   // ── 账本直写（ui 来源） ────────────────────────────────

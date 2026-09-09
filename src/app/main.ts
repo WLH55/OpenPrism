@@ -18,7 +18,7 @@ import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
-import { MemoryLayers, nightlyDue } from "./memory-layers";
+import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extract";
 import { Scheduler, TaskStore, type TaskDef } from "./tasks";
 import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
@@ -72,9 +72,10 @@ async function main(): Promise<void> {
   const agents = new AgentStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const skills = new SkillStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const mcps = new McpRegistry({ env: nodeEnv, db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const memory = new MemoryStore({ db, now: () => Date.now() });
+  const memory = new MemoryStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const tasks = new TaskStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
-  const memoryLayers = new MemoryLayers({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID(), ledgerFor, tasks }, memory);
+  // 旧 L2/槽数据一次性迁移（幂等）；水位线初始化 = 现状（历史不重喂，见 Spec §6.4）
+  migrateLegacyMemory(db, { now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const notifications = new NotificationStore({ db, now: () => Date.now() });
 
   const conversations = new ConversationStore(
@@ -90,6 +91,7 @@ async function main(): Promise<void> {
       mcps,
       memory,
       tasks,
+      onTurnDone: (uidTurn) => memoryExtractor.notify(uidTurn),
     },
     db,
   );
@@ -110,7 +112,7 @@ async function main(): Promise<void> {
     await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: text.slice(0, 500) });
   };
 
-  // 记忆凝练 adapter：现读用户 BYOK 配置
+  // 记忆提取 adapter：现读用户 BYOK 配置
   const adapterFor = async (uid: string) => {
     const config = await modelConfigFor(uid);
     if (!config || !config.keyEnc) return null;
@@ -119,6 +121,9 @@ async function main(): Promise<void> {
       model: config.model,
     };
   };
+
+  // 记忆提取管线（条目化，2026-09-10）：三 surface 水位线/指纹检测 + 决策制蒸馏 + 整理
+  const memoryExtractor = new MemoryExtractor({ db, now: () => Date.now(), memory, adapterFor });
 
   const staticDir = resolve("web/dist");
   const server = createAppServer({
@@ -135,7 +140,7 @@ async function main(): Promise<void> {
     skills,
     mcps,
     memory,
-    memoryLayers,
+    memoryExtractor,
     tasks,
     notifications,
     taskRunner,
@@ -151,13 +156,29 @@ async function main(): Promise<void> {
 `),
   });
   scheduler.start();
-  // 每晚定时维护（2026-09-08）：本地 2–5 点窗口 + 距上次 ≥20h → 全链跑批；服务常驻不重启也能日更
+  // 记忆提取调度（2026-09-10，WeKnora 化）：10s 扫描到期用户（去抖 90s 登记的）→ 逐个串行提取；
+  // 在飞超时自动判死（进程崩溃后重启即恢复），无需专门恢复逻辑
+  const EXTRACT_CHECK_MS = 10 * 1000;
+  const extractTimer = setInterval(() => {
+    void (async () => {
+      for (const uid of memoryExtractor.dueUids([...users.values()].map((u) => u.uid), Date.now())) {
+        const summary = await memoryExtractor.runDue(uid);
+        if (summary.segments > 0 || summary.skipped === "model_error") {
+          process.stdout.write(
+            `[openprism] memory extract ${uid}: +${summary.added} ~${summary.updated} -${summary.deleted} (segments ${summary.segments}${summary.skipped ? `, ${summary.skipped}` : ""})\n`,
+          );
+        }
+      }
+    })().catch((error) => process.stdout.write(`[openprism] memory extract failed: ${String((error as Error).message)}\n`));
+  }, EXTRACT_CHECK_MS);
+  // 每晚整理维护（2026-09-08 引入、2026-09-10 改为只整理）：本地 2–5 点窗口 + 距上次 ≥20h → 合并冗余/过期归档/陈旧降级
   const NIGHTLY_CHECK_MS = 10 * 60 * 1000;
   const nightlyTimer = setInterval(() => {
-    void runMemoryForAll("nightly");
+    void runConsolidateForAll("nightly");
   }, NIGHTLY_CHECK_MS);
   process.on("SIGINT", () => {
     scheduler.stop();
+    clearInterval(extractTimer);
     clearInterval(nightlyTimer);
     server.close(() => process.exit(0));
   });
@@ -165,28 +186,26 @@ async function main(): Promise<void> {
   await new Promise<void>((resolveListen) => server.listen(port, "0.0.0.0", resolveListen));
   process.stdout.write(`[openprism] listening on http://127.0.0.1:${port} (data: ${dataRoot}${existsSync(staticDir) ? ", static: web/dist" : ""})\n`);
 
-  // 记忆三层全链（2026-09-07）：启动惰性检查——距上次全链超 20h 且有会话 → 后台跑 L1 refresh → L2 抽取 → L3 综合
-  void runMemoryForAll("startup");
+  // 启动补跑：距上次整理超 20h 且有条目 → 后台跑一次 consolidate（不限钟点，作白天补跑）
+  void runConsolidateForAll("startup");
 
-  async function runMemoryForAll(reason: "startup" | "nightly"): Promise<void> {
+  async function runConsolidateForAll(reason: "startup" | "nightly"): Promise<void> {
     for (const user of users.values()) {
-      const meta = await memory.meta(user.uid);
-      const stale = meta.lastRunTs === undefined || Date.now() - meta.lastRunTs > 20 * 3600 * 1000;
+      const meta = memory.metaRow(user.uid);
+      const stale = meta.consolidatedTs === undefined || Date.now() - meta.consolidatedTs > 20 * 3600 * 1000;
       if (!stale) continue;
       // 夜间档还要求在 2–5 点窗口内（启动档不限钟点，作白天补跑）
-      if (reason === "nightly" && !nightlyDue(meta.lastRunTs, Date.now())) continue;
-      const hasConversations = (await conversations.list(user.uid)).length > 0;
-      if (!hasConversations) continue;
+      if (reason === "nightly" && !nightlyDue(meta.consolidatedTs, Date.now())) continue;
+      if (memory.countByStatus(user.uid).total === 0) continue;
       const built = await adapterFor(user.uid);
       if (!built) continue;
       try {
-        const result = await memoryLayers.runAll(user.uid, built.adapter, built.model);
-        await memory.markRun(user.uid);
+        const result = await memoryExtractor.consolidate(user.uid, built.adapter, built.model);
         process.stdout.write(
-          `[openprism] memory run (${reason}) ${user.username}: l1+${result.l1.chat.added + result.l1.ledger.added + result.l1.tasks.added} l2+${result.l2.chat.added + result.l2.ledger.added + result.l2.tasks.added}\n`,
+          `[openprism] memory consolidate (${reason}) ${user.username}: reviewed ${result.reviewed}, expired ${result.expired}, demoted ${result.demoted}, merged ${result.merged}\n`,
         );
       } catch (error) {
-        process.stdout.write(`[openprism] memory run (${reason}) ${user.username} failed: ${String((error as Error).message)}\n`);
+        process.stdout.write(`[openprism] memory consolidate (${reason}) ${user.username} failed: ${String((error as Error).message)}\n`);
       }
     }
   }

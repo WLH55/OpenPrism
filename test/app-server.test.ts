@@ -13,7 +13,7 @@ import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
 import { MemoryStore } from "../src/app/memory";
-import { MemoryLayers } from "../src/app/memory-layers";
+import { MemoryExtractor } from "../src/app/memory-extract";
 import { TaskStore } from "../src/app/tasks";
 import { NotificationStore } from "../src/app/notify";
 import { SqliteSessionLog } from "../src/app/session-log";
@@ -54,23 +54,25 @@ beforeAll(async () => {
       calls: [{ name: "record_flow", arguments: { category: "餐饮", value: 28, unit: "¥", note: "午餐" } }],
     },
     { kind: "text", text: "记好了，午餐 28。" },
-    { kind: "text", text: '{"facts":[{"text":"用户在测试记忆链","section":"话题","refs":["chat:mc1"]}]}' }, // memory/run：L2 chat 抽取
-    { kind: "text", text: '{"facts":[]}' }, // memory/run：L2 ledger（聊天用例记过一笔流水，无新事实可抽）
-    { kind: "text", text: "测试期记忆已凝练[^1]。\n\n[^1]: chat" }, // memory/run：L3 recent
-    { kind: "text", text: "测试期的用户画像[^1]。\n\n[^1]: chat" }, // memory/run：L3 profile
-    { kind: "text", text: "主线：验证记忆三层[^1]。\n\n[^1]: chat" }, // memory/run：L3 scope
+    // memory/extract：chat 段决策 add（决策制，2026-09-10 条目化）
+    { kind: "text", text: '{"memories":[{"action":"add","target":null,"kind":"fact","topic":"测试链","content":"用户在测试记忆链","importance":3,"source":1,"expires_at":null}]}' },
+    // memory/extract：后续段（mc1 会话/账本）无新事实
+    { kind: "text", text: '{"memories":[]}' },
+    { kind: "text", text: '{"memories":[]}' },
   ]);
 
   const agents = new AgentStore({ db, now: () => 1, randomUUID: () => `aid-${Math.random().toString(36).slice(2, 8)}` });
   const skills = new SkillStore({ db, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
   const mcps = new McpRegistry({ env: nodeEnv, db, now: () => 1, randomUUID: () => "mc-x" });
-  const memory = new MemoryStore({ db, now: () => 5000 });
+  const memory = new MemoryStore({ db, now: () => 5000, randomUUID: () => `mid-${Math.random().toString(36).slice(2, 8)}` });
   const tasks = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
   const notifications = new NotificationStore({ db, now: () => 5000 });
-  const memoryLayers = new MemoryLayers(
-    { db, now: () => 5000, randomUUID: () => `ml-${Math.random().toString(36).slice(2, 8)}`, ledgerFor, tasks },
+  const memoryExtractor = new MemoryExtractor({
+    db,
+    now: () => 5000,
     memory,
-  );
+    adapterFor: async () => ({ adapter, model: "mock-1" }),
+  });
   const conversations = new ConversationStore(
     {
       env: nodeEnv,
@@ -101,7 +103,7 @@ beforeAll(async () => {
     skills,
     mcps,
     memory,
-    memoryLayers,
+    memoryExtractor,
     tasks,
     notifications,
     taskRunner: async (uidRun, task: TaskDef) => {
@@ -309,48 +311,47 @@ describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
     expect(delMissing.status).toBe(404);
   });
 
-  it("memory：空槽 → PUT slot → run 全链（L1 种会话 → L2 抽取 → L3 综合）→ 槽位落盘", async () => {
+  it("memory：手动加条目 → 提取（chat 决策 add）→ 条目列表/删除+墓碑 → 清空", async () => {
     const before = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as {
-      slots: Record<string, string>;
-      meta: { runs: number };
-      l2: { surfaces: { key: string; entries: number }[] };
-      l3: { slots: { key: string; hasNew: boolean }[] };
+      counts: { total: number };
     };
-    expect(before.slots.profile ?? "").toBe("");
-    expect(before.meta.runs).toBe(0);
-    expect(before.l2.surfaces.find((s) => s.key === "chat")?.entries).toBe(0);
-    expect((await fetch(`${baseUrl}/api/memory/profile`, {
-      method: "PUT",
+    expect(before.counts.total).toBe(0);
+    // 手动新增（origin=manual）
+    const created = (await (await fetch(`${baseUrl}/api/memory/items`, {
+      method: "POST",
       headers: { "Content-Type": "application/json", cookie },
-      body: JSON.stringify({ markdown: "工程师" }),
-    })).status).toBe(200);
-    expect((await fetch(`${baseUrl}/api/memory/badslot`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", cookie },
-      body: JSON.stringify({ markdown: "x" }),
-    })).status).toBe(400);
-    // 种一个会话当 L1 实体（cid=mc1，与共享脚本第 3 步的 refs 对应）
+      body: JSON.stringify({ kind: "profile", content: "工程师", importance: 4 }),
+    })).json()) as { item: { id: string; origin: string } };
+    expect(created.item.origin).toBe("manual");
+    // 种一个会话供提取（cid=mc1，chat 段水位线之上）
     db.prepare("INSERT INTO conversations (cid, uid, title, created_ts) VALUES ('mc1', ?, '测试会话', 1)").run(users.get("lathan")!.uid);
     db.prepare(
       "INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES ('mc1', 0, 'user/message', 1, 'user', ?)",
     ).run(JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "在测试记忆链" }] } }));
 
-    const run = (await (await fetch(`${baseUrl}/api/memory/run`, { method: "POST", headers: { cookie } })).json()) as {
-      l2: Record<string, { added: number }>;
-      l3: Record<string, { changed: boolean }>;
+    const extract = (await (await fetch(`${baseUrl}/api/memory/extract`, { method: "POST", headers: { cookie } })).json()) as {
+      added: number;
+      skipped?: string;
     };
-    expect(run.l2.chat.added).toBe(1);
-    expect(run.l3.recent.changed).toBe(true);
+    expect(extract.added).toBe(1);
+    expect(extract.skipped).toBeUndefined();
     const after = (await (await fetch(`${baseUrl}/api/memory`, { headers: { cookie } })).json()) as {
-      slots: Record<string, string>;
-      meta: { runs: number };
-      l2: { surfaces: { key: string; entries: number }[] };
-      l3: { slots: { key: string; hasNew: boolean }[] };
+      counts: { total: number; active: number };
     };
-    expect(after.slots.recent).toContain("测试期记忆已凝练");
-    expect(after.l2.surfaces.find((s) => s.key === "chat")?.entries).toBe(1);
-    expect(after.l3.slots.find((s) => s.key === "recent")?.hasNew).toBe(false);
-    expect(after.meta.runs).toBe(1);
+    expect(after.counts.total).toBe(2);
+    expect(after.counts.active).toBe(2);
+    const items = (await (await fetch(`${baseUrl}/api/memory/items?status=active`, { headers: { cookie } })).json()) as {
+      items: { id: string; content: string }[];
+    };
+    const extracted = items.items.find((i) => i.content.includes("测试记忆链"));
+    expect(extracted).toBeDefined();
+    // 删除（+墓碑：后台不再学回）
+    expect((await fetch(`${baseUrl}/api/memory/items/${extracted!.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/memory/items/${extracted!.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(404);
+    // 清空（需要 confirm）
+    expect((await fetch(`${baseUrl}/api/memory/items`, { method: "DELETE", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({}) })).status).toBe(400);
+    const cleared = (await (await fetch(`${baseUrl}/api/memory/items`, { method: "DELETE", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ confirm: "clear" }) })).json()) as { removed: number };
+    expect(cleared.removed).toBe(1);
   });
 
   it("会话删除与自动命名端点：无用户消息命名不炸（ok:false）；删除后列表减少、再删 404", async () => {
