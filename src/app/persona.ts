@@ -1,5 +1,5 @@
 // 人设与 system prompt 合成（批次 2：D4 三段配置——人设卡 + 记忆注入 + 纪律）。
-// 人设 = 纯自由 markdown，名字从 H1 推导（4.1）；记忆块由 MemoryStore.injectionBlock 提供（已剥脚注，5.2）。
+// 人设 = 纯自由 markdown，名字从 H1 推导（4.1）；记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -63,7 +63,8 @@ export function composeAssistantPrompt(input: ComposePromptInput): string {
   const persona = input.persona?.trim() || DEFAULT_IDENTITY;
   const parts = [[identityBlock, persona].filter((p) => p !== "").join("\n\n"), dateLine(input.now(), input.tzOffsetMinutes ?? 0)];
   if (input.memoryBlock && input.memoryBlock.trim() !== "") {
-    parts.push(`关于这个用户的长期记忆（自动注入，用它调整语气与举例，不要原文背诵）：\n${input.memoryBlock.trim()}`);
+    // 记忆块自带 <user_memory> 信封（背景资料非指令、冲突以用户当前说法为准），此处直接拼入
+    parts.push(input.memoryBlock.trim());
   }
   parts.push(DISCIPLINE);
   const directive = languageDirective(identity?.language);

@@ -219,17 +219,25 @@ export const api2 = {
   mcpTools: (id: string) => request<{ tools: string[] }>(`/api/mcps/${id}/tools`, { method: "POST" }),
 
   getMemory: () => request<MemoryOverviewLoose>("/api/memory"),
-  putMemorySlot: (slot: string, markdown: string) =>
-    request<{ ok: boolean }>(`/api/memory/${slot}`, { method: "PUT", body: JSON.stringify({ markdown }) }),
-  runMemory: () => request<MemoryRunSummaryLoose>("/api/memory/run", { method: "POST" }),
-  listL1: (surface: string) => request<L1DetailLoose>(`/api/memory/l1/${surface}`),
-  refreshL1: (surface: string) => request<{ added: number; modified: number; removed: number }>(`/api/memory/l1/${surface}/refresh`, { method: "POST" }),
-  listL2: (surface: string) => request<{ entries: L2EntryLoose[] }>(`/api/memory/l2/${surface}`),
-  updateL2: (surface: string) => request<{ added: number; skipped?: string }>(`/api/memory/l2/${surface}/update`, { method: "POST" }),
-  editL2Entry: (surface: string, id: string, patch: { text?: string; section?: string }) =>
-    request<{ ok: boolean }>(`/api/memory/l2/${surface}/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
-  removeL2Entry: (surface: string, id: string) => request<{ ok: boolean }>(`/api/memory/l2/${surface}/${id}`, { method: "DELETE" }),
-  updateL3: (slot: string) => request<{ changed: boolean; skipped?: string }>(`/api/memory/l3/${slot}/update`, { method: "POST" }),
+  listMemoryItems: (query: { kind?: string; status?: string; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (query.kind) params.set("kind", query.kind);
+    if (query.status) params.set("status", query.status);
+    params.set("limit", String(query.limit ?? 200));
+    return request<{ items: MemoryItemLoose[] }>(`/api/memory/items?${params.toString()}`);
+  },
+  addMemoryItem: (payload: { kind: string; content: string; importance?: number; topic?: string }) =>
+    request<{ item: MemoryItemLoose }>("/api/memory/items", { method: "POST", body: JSON.stringify(payload) }),
+  clearMemoryItems: () => request<{ removed: number }>("/api/memory/items", { method: "DELETE", body: JSON.stringify({ confirm: "clear" }) }),
+  editMemoryItem: (id: string, patch: { content?: string; importance?: number; topic?: string }) =>
+    request<{ item: MemoryItemLoose }>(`/api/memory/items/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  removeMemoryItem: (id: string) => request<{ ok: boolean }>(`/api/memory/items/${id}`, { method: "DELETE" }),
+  confirmMemoryItem: (id: string) => request<{ ok: boolean }>(`/api/memory/items/${id}/confirm`, { method: "POST" }),
+  rejectMemoryItem: (id: string) => request<{ ok: boolean }>(`/api/memory/items/${id}/reject`, { method: "POST" }),
+  extractMemory: () => request<{ segments: number; added: number; updated: number; deleted: number; skipped?: string }>("/api/memory/extract", { method: "POST" }),
+  consolidateMemory: () =>
+    request<{ reviewed: number; expired: number; demoted: number; merged: number; skipped?: string }>("/api/memory/consolidate", { method: "POST" }),
+  exportMemoryUrl: () => "/api/memory/export",
 
   convMeta: (cid: string) => request<ConversationMetaLoose>(`/api/conversations/${cid}/meta`),
   setConversationModel: (cid: string, providerId: string | null) =>
@@ -263,29 +271,23 @@ export interface TaskLoose {
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
 export interface MemoryOverviewLoose {
-  slots: Record<string, string>;
-  meta: { lastRunTs?: number; runs: number };
-  l1: { surfaces: { key: string; label: string; live: number; pending: { added: number; modified: number; removed: number } }[] };
-  l2: { surfaces: { key: string; label: string; entries: number }[] };
-  l3: { slots: { key: string; chars: number; bullets: number; hasNew: boolean }[]; preferences: { chars: number; bullets: number; toolOnly: boolean } };
+  counts: Record<string, number>;
+  meta: { runs: number; lastExtractTs?: number; consolidatedTs?: number; scheduledTs?: number };
 }
-export interface MemoryRunSummaryLoose {
-  l1: Record<string, { added: number; modified: number; removed: number }>;
-  l2: Record<string, { added: number; skipped?: string }>;
-  l3: Record<string, { changed: boolean; skipped?: string }>;
-}
-export interface L1DetailLoose {
-  entities: { ref: string; label: string; ts: number; fingerprint: string }[];
-  changes: { kind: string; ref: string; label: string; ts: number }[];
-  pending: { added: number; modified: number; removed: number };
-}
-export interface L2EntryLoose {
+export interface MemoryItemLoose {
   id: string;
-  section: string;
-  text: string;
-  refs: string[];
-  createdTs: number;
-  updatedTs?: number;
+  kind: string;
+  status: string;
+  origin: string;
+  topic: string;
+  content: string;
+  importance: number;
+  sourceRef?: string;
+  validFrom: number;
+  invalidAt?: number;
+  supersededBy?: string;
+  expiresAt?: number;
+  useCount: number;
 }
 export interface TaskRunLoose {
   ts: number;

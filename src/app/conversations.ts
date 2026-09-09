@@ -11,7 +11,7 @@ import { AgentStore, type AgentBinding } from "./agents";
 import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
-import { createSavePreferenceTool } from "./memory";
+import { createSavePreferenceTool, createSearchMemoryTool } from "./memory";
 import { createTaskTools } from "./tasks";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
@@ -41,10 +41,17 @@ export interface ConversationDeps {
   memory: MemoryStoreLike;
   /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
   tasks?: TaskStoreLike;
+  /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
+  onTurnDone?(uid: string): void;
 }
 
 export interface TaskStoreLike {
   create(uid: string, input: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface MemoryStoreLike {
+  /** 条目化召回注入块（纯函数：输入=库内条目+query） */
+  recallBlockSync(uid: string, query?: string): string;
 }
 
 /** 测试替身面（避免循环依赖具体类） */
@@ -57,10 +64,6 @@ export interface SkillMetaLike {
   name: string;
   description: string;
   whenToUse?: string;
-}
-export interface MemoryStoreLike {
-  writeSlot(uid: string, slot: string, markdown: string): Promise<void>;
-  appendPreference(uid: string, line: string, ts: number): Promise<void>;
 }
 
 export interface ConversationEntry {
@@ -359,7 +362,9 @@ export class ConversationStore {
     if (binding.skills.length > 0) {
       tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid }));
     }
-    tools.push(createSavePreferenceTool({ store: this.deps.memory as unknown as import("./memory").MemoryStore, uid, now }));
+    const memoryStore = this.deps.memory as unknown as import("./memory").MemoryStore;
+    tools.push(createSavePreferenceTool({ store: memoryStore, uid, now }));
+    tools.push(createSearchMemoryTool({ store: memoryStore, uid }));
     if (this.deps.tasks) {
       tools.push(...createTaskTools({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid, now }));
     }
@@ -377,15 +382,29 @@ export class ConversationStore {
         // 上下文窗口喂给压缩器判压（0.8 阈值）；缺省 = harness 默认 64K
         ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}),
       },
-      systemPrompt: () => this.composePromptWithMeta(uid, metaOf()),
+      systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf()),
       tools,
       maxStepsPerTurn: 24,
     });
   }
 
-  private composePromptWithMeta(uid: string, meta: ConversationMeta): string {
+  /** 情境召回的 query = 会话最近一条用户消息（首轮空 → 仅常驻块）；同步读（systemPrompt 闭包是同步的） */
+  private lastUserTextSync(cid: string): string {
+    const row = this.db
+      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND type = 'user/message' ORDER BY seq DESC LIMIT 1")
+      .get(cid) as { event_json: string } | undefined;
+    if (!row) return "";
+    try {
+      const event = JSON.parse(row.event_json) as { message?: { content?: { type: string; text?: string }[] } };
+      return (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").slice(0, 500);
+    } catch {
+      return "";
+    }
+  }
+
+  private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
     const current = this.syncCurrentAgent(uid, meta);
-    const memoryBlock = (this.deps.memory as unknown as { injectionBlockSync(uid: string): string }).injectionBlockSync(uid);
+    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string): string }).recallBlockSync(uid, this.lastUserTextSync(cid));
     const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
     const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
     return composeAssistantPrompt({
@@ -400,6 +419,8 @@ export class ConversationStore {
   async send(uid: string, cid: string, text: string): Promise<void> {
     const agent = await this.agent(uid, cid);
     agent.followup(text);
+    // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
+    this.deps.onTurnDone?.(uid);
   }
 
   /** 凝练原料：该用户全部会话的 user/assistant 文本（SQL 取代逐文件全扫） */
