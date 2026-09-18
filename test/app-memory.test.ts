@@ -184,3 +184,22 @@ describe("工具", () => {
     expect((rendered[0] as { text: string }).text).toContain("不要编造");
   });
 });
+
+describe("容量淘汰（2026-09-18）", () => {
+  it("archiveOverflow：interest 常驻锚点豁免淘汰，容量额度只计非 interest 条目", () => {
+    const s = store();
+    for (let i = 0; i < 199; i += 1) {
+      s.insertItem("u1", { kind: "fact", content: `填充事实条目编号 ${i} 号内容`, topic: `主题${i}`, origin: "extracted", importance: 5 });
+    }
+    s.insertItem("u1", { kind: "fact", content: "最低重要度的事实条目应被先淘汰", topic: "低位", origin: "extracted", importance: 1 });
+    s.insertItem("u1", { kind: "interest", content: "门店排班管理", topic: "门店排班管理", origin: "extracted", importance: 1 });
+    // 201 条 active 未触发淘汰：interest 不占容量额度
+    expect(s.listItems("u1", { kind: "interest", status: "active" })).toHaveLength(1);
+    expect(s.listItems("u1", { kind: "fact", status: "active", limit: 500 })).toHaveLength(200);
+    s.insertItem("u1", { kind: "fact", content: "再塞一条触发容量淘汰的新事实", topic: "触发", origin: "extracted", importance: 5 });
+    // importance 1 的 interest 仍在库；淘汰的是最低重要度的非 interest 条目
+    expect(s.listItems("u1", { kind: "interest", status: "active" })).toHaveLength(1);
+    const lowFact = s.listItems("u1", { status: "archived" }).find((i) => i.content.includes("最低重要度"));
+    expect(lowFact).toBeDefined();
+  });
+});

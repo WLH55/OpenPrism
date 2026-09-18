@@ -13,7 +13,7 @@ import {
   parseExpiry,
   type ExtractSummary,
 } from "../src/app/memory-extract";
-import { createMockLlmAdapter, llmFailure } from "../src/harness/index";
+import { createMockLlmAdapter, llmFailure, type MockScriptStep } from "../src/harness/index";
 import type { LlmRequest } from "../src/harness/index";
 import { testDb } from "./helpers-db";
 
@@ -348,5 +348,161 @@ describe("migrateLegacyMemory", () => {
     // 幂等：重跑不重复
     migrateLegacyMemory(db, { now: () => 2000, randomUUID: () => "r2" });
     expect(memory.listItems("u1", { kind: "fact" }).length).toBe(1);
+  });
+});
+
+// ── 主题计数与语义候选（2026-09-18 Spec §4.3 checklist 5、14） ──────────
+
+describe("主题计数与语义候选（2026-09-18）", () => {
+  it("parseDecisionsJson：topics 数组提取；缺失/非数组 → undefined", () => {
+    const withTopics = parseDecisionsJson('{"memories":[],"topics":["健身","饮食"]}');
+    expect(withTopics?.topics).toEqual(["健身", "饮食"]);
+    expect(parseDecisionsJson('{"memories":[]}')?.topics).toBeUndefined();
+    expect(parseDecisionsJson('{"memories":[],"topics":"健身"}')?.topics).toBeUndefined();
+  });
+
+  it("提取输出 topics → 计数 → 第三次达标自动晋升 interest", async () => {
+    const db = testDb();
+    const memory = makeStore(db);
+    seedChat(db, "u1", "c1", [{ role: "user", text: "最近在弄门店排班管理", ts: 1000 }]);
+    let call = 0;
+    const output = (): string => ['{"memories":[],"topics":["门店排班管理"]}', '{"memories":[],"topics":["店排班管理"]}', '{"memories":[],"topics":[" 门店排班管理 "]}'][Math.min(call, 2)]!;
+    const step = (): MockScriptStep => ({
+      kind: "fn",
+      fn: async () => ({
+        message: { role: "assistant" as const, content: [{ type: "text" as const, text: output() }] },
+        finishReason: "stop" as string,
+      }),
+    });
+    const mock = createMockLlmAdapter([step(), step(), step()]);
+    const embedded: string[] = [];
+    const extractor = new MemoryExtractor({
+      db,
+      now: () => clock,
+      memory,
+      adapterFor: async () => ({ adapter: mock.adapter, model: "m" }),
+      embedNewItems: async (_uid, items) => {
+        embedded.push(...items.map((i) => i.content));
+      },
+    });
+
+    const s1 = await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(s1.interestsPromoted).toBeUndefined();
+    call = 1;
+    seedChat(db, "u1", "c2", [{ role: "user", text: "班次又要重排了", ts: 2000 }]);
+    const s2 = await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(s2.interestsPromoted).toBeUndefined();
+    call = 2;
+    seedChat(db, "u1", "c3", [{ role: "user", text: "排班工具选型中", ts: 3000 }]);
+    const s3 = await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(s3.interestsPromoted).toBe(1);
+    const interests = memory.listItems("u1", { kind: "interest" });
+    expect(interests.length).toBe(1);
+    expect(interests[0]?.content).toBe("门店排班管理");
+    expect(embedded).toEqual(["门店排班管理"]); // 晋升条目写入即嵌入，不等回填
+  });
+
+  it("vectorCandidates：旧条目超限时以语义候选替换；返回 null 退回词法前缀", async () => {
+    const db = testDb();
+    const memory = makeStore(db);
+    for (let i = 0; i < 20; i++) {
+      memory.insertItem("u1", { kind: "fact", content: `填充条目内容编号 ${i} 号`, topic: `填充主题${i}`, origin: "extracted" });
+    }
+    const target = memory.insertItem("u1", { kind: "fact", content: "用户正在减脂控制饮食", topic: "身体状况", origin: "extracted" });
+    seedChat(db, "u1", "c1", [{ role: "user", text: "帮我看看这周吃了什么", ts: 1000 }]);
+    let capturedPrompt = "";
+    const captureStep: MockScriptStep = {
+      kind: "fn",
+      fn: async (req: LlmRequest) => {
+        capturedPrompt = req.messages[0]!.content.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("");
+        return { message: { role: "assistant" as const, content: [{ type: "text" as const, text: '{"memories":[],"topics":[]}' }] }, finishReason: "stop" as string };
+      },
+    };
+    const mock = createMockLlmAdapter([captureStep, captureStep]);
+    const extractor = new MemoryExtractor({
+      db,
+      now: () => clock,
+      memory,
+      adapterFor: async () => ({ adapter: mock.adapter, model: "m" }),
+      vectorCandidates: async () => [target.item!],
+    });
+    await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(capturedPrompt).toContain("用户正在减脂控制饮食");
+    expect(capturedPrompt).not.toContain("填充条目内容编号 5");
+
+    // null → 词法前缀兜底（填充条目进入候选）
+    const extractor2 = new MemoryExtractor({
+      db,
+      now: () => clock,
+      memory,
+      adapterFor: async () => ({ adapter: mock.adapter, model: "m" }),
+      vectorCandidates: async () => null,
+    });
+    seedChat(db, "u1", "c2", [{ role: "user", text: "再看看这周吃了什么", ts: 2000 }]);
+    await extractor2.extractOnce("u1", mock.adapter, "m");
+    expect(capturedPrompt).toContain("填充条目内容编号");
+  });
+
+  it("embedNewItems 挂点：决策新增的条目回调给向量写入", async () => {
+    const db = testDb();
+    const memory = makeStore(db);
+    seedChat(db, "u1", "c1", [{ role: "user", text: "我在学钢琴", ts: 1000 }]);
+    const mock = createMockLlmAdapter([
+      {
+        kind: "fn",
+        fn: async () => ({
+          message: { role: "assistant" as const, content: [{ type: "text" as const, text: '{"memories":[{"action":"add","target":null,"kind":"fact","topic":"爱好","content":"用户在学钢琴","importance":3,"source":1,"expires_at":null}],"topics":["乐器学习"]}' }] },
+          finishReason: "stop" as string,
+        }),
+      },
+    ]);
+    const embedded: string[] = [];
+    const extractor = new MemoryExtractor({
+      db,
+      now: () => clock,
+      memory,
+      adapterFor: async () => ({ adapter: mock.adapter, model: "m" }),
+      embedNewItems: async (_uid, items) => {
+        embedded.push(...items.map((i) => i.content));
+      },
+    });
+    const summary = await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(summary.added).toBe(1);
+    expect(embedded).toEqual(["用户在学钢琴"]);
+  });
+
+  it("interest 常驻锚点对提取候选不可见且免疫 update/delete 取代（2026-09-18 E2E 回归）", async () => {
+    const db = testDb();
+    const memory = makeStore(db);
+    memory.insertItem("u1", { kind: "interest", content: "门店排班管理", topic: "门店排班管理", origin: "extracted" });
+    const f1 = memory.insertItem("u1", { kind: "fact", content: "用户偏好靠窗座位", topic: "出行", origin: "extracted" });
+    const f2 = memory.insertItem("u1", { kind: "fact", content: "用户对花生过敏", topic: "饮食", origin: "extracted" });
+    seedChat(db, "u1", "c1", [{ role: "user", text: "聊聊出行和饮食吧", ts: 1000 }]);
+    let capturedPrompt = "";
+    const mock = createMockLlmAdapter([
+      {
+        kind: "fn",
+        fn: async (req: LlmRequest) => {
+          capturedPrompt = req.messages[0]!.content.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("");
+          return {
+            message: {
+              role: "assistant" as const,
+              content: [{ type: "text" as const, text: '{"memories":[{"action":"update","target":0,"kind":"fact","topic":"出行","content":"用户坐高铁只买靠窗座位","importance":3,"source":1,"expires_at":null},{"action":"delete","target":1}]}' }],
+            },
+            finishReason: "stop" as string,
+          };
+        },
+      },
+    ]);
+    const extractor = new MemoryExtractor({ db, now: () => clock, memory, adapterFor: async () => ({ adapter: mock.adapter, model: "m" }) });
+    await extractor.extractOnce("u1", mock.adapter, "m");
+    expect(capturedPrompt).toContain("用户偏好靠窗座位"); // 非 interest 条目照常进候选
+    expect(capturedPrompt).not.toContain("门店排班管理"); // interest 对模型不可见
+    expect(memory.getItem("u1", f1.item!.id)!.status).toBe("superseded"); // update 照常取代
+    expect(memory.getItem("u1", f2.item!.id)!.status).toBe("superseded"); // delete 照常取代
+    const interest = memory.listItems("u1", { kind: "interest" });
+    expect(interest).toHaveLength(1);
+    expect(interest[0]!.status).toBe("active");
+    expect(interest[0]!.supersededBy).toBeUndefined();
   });
 });

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type ModelProvider } from "../api";
+import { api, api2, type ModelProvider } from "../api";
 import { InfoIcon } from "../icons";
 
 const inputCls =
@@ -70,9 +70,10 @@ interface FormState {
   apiKey: string;
   windowChoice: string; // "default" | "32768" | "65536" | "131072" | "200000" | "custom"
   customWindow: string;
+  kind: string; // "chat" | "embedding"（提供方用途，2026-09-18）
 }
 
-const EMPTY_FORM: FormState = { open: false, editingId: null, presetId: null, baseURL: "", model: "", apiKey: "", windowChoice: "default", customWindow: "" };
+const EMPTY_FORM: FormState = { open: false, editingId: null, presetId: null, baseURL: "", model: "", apiKey: "", windowChoice: "default", customWindow: "", kind: "chat" };
 
 /** 模型接入页：BYOK 横幅 + 多供应商平级列表（测试/编辑/删除）+ 预置新增表单；用哪个模型在会话里选 */
 export function Settings() {
@@ -80,11 +81,18 @@ export function Settings() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [memoryConfig, setMemoryConfig] = useState<{ interestThreshold: number; embeddingProviderId: string | null }>({ interestThreshold: 3, embeddingProviderId: null });
 
   const reload = () => {
     api
       .getModels()
       .then((result) => setProviders(result.providers))
+      .catch(() => undefined);
+    api2
+      .getMemory()
+      .then((overview) => {
+        if (overview.config) setMemoryConfig(overview.config);
+      })
       .catch(() => undefined);
   };
 
@@ -101,6 +109,7 @@ export function Settings() {
       baseURL: provider.baseURL,
       model: provider.model,
       apiKey: "",
+      kind: provider.kind === "embedding" ? "embedding" : "chat",
       windowChoice:
         provider.contextWindow === null
           ? "default"
@@ -132,6 +141,7 @@ export function Settings() {
           baseURL: form.baseURL.trim(),
           model: form.model.trim(),
           contextWindow,
+          kind: form.kind,
           ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
         });
         setMessage({ ok: true, text: "已更新（Key 加密存储在你自己的设备上）" });
@@ -140,12 +150,27 @@ export function Settings() {
           baseURL: form.baseURL.trim(),
           model: form.model.trim(),
           contextWindow,
+          kind: form.kind,
           ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
         });
         setMessage({ ok: true, text: "已新增（首个供应商自动启用；Key 加密存储在你自己的设备上）" });
       }
       closeForm();
       reload();
+    } catch (e) {
+      setMessage({ ok: false, text: `保存失败：${(e as Error).message}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveMemoryConfig = async (patch: { interestThreshold?: number | null; embeddingProviderId?: string | null }) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api2.patchMemoryConfig(patch);
+      setMemoryConfig(result.config);
+      setMessage({ ok: true, text: "记忆设置已保存" });
     } catch (e) {
       setMessage({ ok: false, text: `保存失败：${(e as Error).message}` });
     } finally {
@@ -204,7 +229,10 @@ export function Settings() {
         {providers.map((p) => (
           <div key={p.id} className="flex items-center justify-between gap-3 rounded-xl border border-line bg-surface p-3.5">
             <div className="min-w-0">
-              <div className="truncate text-sm font-semibold text-ink">{providerLine(p)}</div>
+              <div className="truncate text-sm font-semibold text-ink">
+                {providerLine(p)}
+                {p.kind === "embedding" && <span className="ml-2 rounded-full bg-accent3 px-1.5 py-0.5 text-[11px] font-normal text-accent">向量</span>}
+              </div>
               <div className="mt-0.5 truncate font-mono text-xs text-ink3">
                 {p.baseURL} · 窗口 {formatWindow(p.contextWindow)}
                 {p.hasKey ? " · Key 已配置" : " · 未配 Key"}
@@ -324,6 +352,19 @@ export function Settings() {
             />
           </div>
           <div>
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="provider-kind">用途</label>
+            <select
+              id="provider-kind"
+              className={`${inputCls} font-sans`}
+              value={form.kind}
+              onChange={(e) => setForm({ ...form, kind: e.target.value })}
+            >
+              <option value="chat">对话与提取（chat）</option>
+              <option value="embedding">记忆向量（embedding）</option>
+            </select>
+            <p className="mt-1.5 text-xs text-ink3">embedding 用途用于记忆的语义召回；上下文窗口对它无效。</p>
+          </div>
+          <div>
             <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="context-window">上下文窗口（tokens）</label>
             <select
               id="context-window"
@@ -374,6 +415,53 @@ export function Settings() {
       )}
 
       {message && <p className={`text-sm ${message.ok ? "text-accent" : "text-warm"}`}>{message.text}</p>}
+
+      {/* 记忆增强（可选）：语义召回绑定 + 兴趣晋升阈值 */}
+      <div className="mt-6 rounded-xl border border-line bg-surface p-4">
+        <div className="text-sm font-semibold text-ink">记忆增强（可选）</div>
+        <p className="mt-1 text-xs leading-relaxed text-ink3">
+          选一个 embedding 提供方后，记忆按语义而不只是字面召回（问「怎么控制体重」也能想起「在减脂」）；
+          不选则只用字面匹配。旧记忆的向量每晚自动补算，每轮最多 200 条。
+        </p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-medium text-ink">语义召回提供方</span>
+            <select
+              aria-label="记忆语义召回提供方"
+              className={`${inputCls} font-sans`}
+              value={memoryConfig.embeddingProviderId ?? ""}
+              disabled={busy}
+              onChange={(e) => void saveMemoryConfig({ embeddingProviderId: e.target.value === "" ? null : e.target.value })}
+            >
+              <option value="">不开启（只用字面匹配）</option>
+              {providers
+                .filter((p) => p.kind === "embedding")
+                .map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {providerLine(p)}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-medium text-ink">主题晋升兴趣的次数门槛</span>
+            <input
+              aria-label="主题晋升次数门槛"
+              className={inputCls}
+              type="number"
+              min={1}
+              max={20}
+              value={memoryConfig.interestThreshold}
+              disabled={busy}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isInteger(n) && n >= 1 && n <= 20) void saveMemoryConfig({ interestThreshold: n });
+              }}
+            />
+            <span className="mt-1.5 block text-xs text-ink3">同一主题被谈起这么多次后，自动记为长期兴趣。</span>
+          </label>
+        </div>
+      </div>
 
       <p className="mt-6 text-xs leading-relaxed text-ink3">
         OpenAI 兼容协议（DeepSeek / GLM / Qwen / Moonshot / OpenRouter…）。可接入多个平台；每个会话用哪个模型，在对话页右上角的模型选择器里选。保存后下一回合即生效，无需重启。

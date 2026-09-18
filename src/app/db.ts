@@ -170,10 +170,11 @@ CREATE TABLE IF NOT EXISTS memory_meta (
 
 -- 记忆条目化（2026-09-10，WeKnora 化重构 Spec §6.1）：条目 = 唯一真相，supersede 链不物理删除；
 -- 旧 L1/L2/L3 六表（l1_entities/l1_changes/l2_entries/l2_meta/l3_meta/memory_slots）代码零引用，仅为回滚保留。
+-- kind 增 interest（2026-09-18 主题计数晋升）；存量库 CHECK 无 interest，由 ensureInterestKind 重建表迁移。
 CREATE TABLE IF NOT EXISTS memory_items (
   uid           TEXT NOT NULL,
   id            TEXT NOT NULL,
-  kind          TEXT NOT NULL CHECK (kind IN ('profile','preference','fact','task')),
+  kind          TEXT NOT NULL CHECK (kind IN ('profile','preference','fact','task','interest')),
   status        TEXT NOT NULL CHECK (status IN ('active','superseded','archived','pending')),
   origin        TEXT NOT NULL CHECK (origin IN ('explicit','extracted','manual')),
   topic         TEXT NOT NULL DEFAULT '',
@@ -200,6 +201,21 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
   source_ref  TEXT,
   created_ts  INTEGER NOT NULL,
   PRIMARY KEY (uid, fingerprint)
+);
+
+-- 主题计数（2026-09-18，WeKnora memory_topic_stats 移植）：同一主题跨对话重复出现 → 计数，
+-- 达阈值自动晋升 interest 记忆；aliases 收录历次说法（归一索引 + interest 向量重建原料）；
+-- forgotten_ts = 用户"不再追踪"（永不再自动晋升）；promoted_ts 防重复晋升。
+CREATE TABLE IF NOT EXISTS memory_topic_stats (
+  uid            TEXT NOT NULL,
+  normalized_key TEXT NOT NULL,
+  topic          TEXT NOT NULL,
+  aliases_json   TEXT NOT NULL DEFAULT '[]',
+  hits           INTEGER NOT NULL DEFAULT 0,
+  last_seen_ts   INTEGER NOT NULL,
+  promoted_ts    INTEGER,
+  forgotten_ts   INTEGER,
+  PRIMARY KEY (uid, normalized_key)
 );
 
 -- 记忆三层（2026-09-07，对齐 DeepTutor）：L1 实时镜像快照 + 变更日志；L2 每模块事实 + seen 门控；L3 槽增量 meta。
@@ -279,6 +295,32 @@ CREATE TABLE IF NOT EXISTS model_active (
   provider_id TEXT NOT NULL
 );
 
+-- 向量召回（2026-09-18，WeKnora memory_item_embeddings 移植）：BLOB（小端 float32）= 唯一真相；
+-- model_id = providerId:model名（换提供方或换模型名 → 旧向量自然失效，由回填按新模型重建）；
+-- source_fingerprint = 条目内容指纹（内容变更即重算）。个人规模进程内余弦扫描，不用向量索引扩展。
+CREATE TABLE IF NOT EXISTS memory_item_embeddings (
+  uid                TEXT NOT NULL,
+  item_id            TEXT NOT NULL,
+  model_id           TEXT NOT NULL,
+  dims               INTEGER NOT NULL,
+  vector             BLOB NOT NULL,
+  source_fingerprint TEXT NOT NULL,
+  created_ts         INTEGER NOT NULL,
+  PRIMARY KEY (uid, item_id)
+);
+
+-- 查询向量缓存（铁律 2 的确定性面）：同文本同模型只算一次；注入块因此 = 库状态（含本表）+ 日志内
+-- query 文本 的确定性推导，重放无需任何外部调用。
+CREATE TABLE IF NOT EXISTS query_vectors (
+  uid         TEXT NOT NULL,
+  text_key    TEXT NOT NULL,
+  model_id    TEXT NOT NULL,
+  dims        INTEGER NOT NULL,
+  vector      BLOB NOT NULL,
+  created_ts  INTEGER NOT NULL,
+  PRIMARY KEY (uid, text_key, model_id)
+);
+
 CREATE TABLE IF NOT EXISTS archives (
   uid        TEXT PRIMARY KEY,
   list_json  TEXT NOT NULL DEFAULT '[]',
@@ -295,6 +337,44 @@ CREATE TABLE IF NOT EXISTS meta (
 function ensureColumn(db: DatabaseSync, table: string, column: string, decl: string): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
   if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+
+/**
+ * 存量库 memory_items 的 kind CHECK 不含 interest（SQLite 改 CHECK 只能重建表）：
+ * 检测建表 SQL 里没有 interest 即重建（数据原样搬运 + 重建索引）；幂等，新库直接跳过。
+ */
+function ensureInterestKind(db: DatabaseSync): void {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'").get() as
+    | { sql: string }
+    | undefined;
+  if (!row || row.sql.includes("'interest'")) return;
+  db.exec(`
+    CREATE TABLE memory_items_rebuild (
+      uid           TEXT NOT NULL,
+      id            TEXT NOT NULL,
+      kind          TEXT NOT NULL CHECK (kind IN ('profile','preference','fact','task','interest')),
+      status        TEXT NOT NULL CHECK (status IN ('active','superseded','archived','pending')),
+      origin        TEXT NOT NULL CHECK (origin IN ('explicit','extracted','manual')),
+      topic         TEXT NOT NULL DEFAULT '',
+      norm_key      TEXT NOT NULL,
+      content       TEXT NOT NULL,
+      importance    INTEGER NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+      source_ref    TEXT,
+      valid_from    INTEGER NOT NULL,
+      invalid_at    INTEGER,
+      superseded_by TEXT,
+      expires_at    INTEGER,
+      last_used_ts  INTEGER,
+      use_count     INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (uid, id)
+    );
+    INSERT INTO memory_items_rebuild (uid, id, kind, status, origin, topic, norm_key, content, importance, source_ref, valid_from, invalid_at, superseded_by, expires_at, last_used_ts, use_count)
+      SELECT uid, id, kind, status, origin, topic, norm_key, content, importance, source_ref, valid_from, invalid_at, superseded_by, expires_at, last_used_ts, use_count FROM memory_items;
+    DROP TABLE memory_items;
+    ALTER TABLE memory_items_rebuild RENAME TO memory_items;
+    CREATE INDEX IF NOT EXISTS idx_memory_items_key ON memory_items(uid, norm_key, status);
+    CREATE INDEX IF NOT EXISTS idx_memory_items_live ON memory_items(uid, status, importance, valid_from);
+  `);
 }
 
 /** 打开（或创建）数据库：DDL 幂等；":memory:" 供测试 */
@@ -323,6 +403,11 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "memory_meta", "in_flight_since", "INTEGER");
   ensureColumn(db, "memory_meta", "last_extract_ts", "INTEGER");
   ensureColumn(db, "memory_meta", "consolidated_ts", "INTEGER");
+  // 主题计数与向量召回（2026-09-18）：晋升阈值（NULL=默认 3）+ 记忆绑定的 embedding 提供方（NULL=语义召回关闭）
+  ensureColumn(db, "memory_meta", "interest_threshold", "INTEGER");
+  ensureColumn(db, "memory_meta", "embedding_provider_id", "TEXT");
+  ensureColumn(db, "model_providers", "kind", "TEXT NOT NULL DEFAULT 'chat'"); // 提供方用途（chat|embedding，2026-09-18）
+  ensureInterestKind(db); // 存量库 kind CHECK 补 interest（重建表，幂等）
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }

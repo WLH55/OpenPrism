@@ -321,3 +321,33 @@ describe("错误码表映射", () => {
     expect(served).toBe(true);
   });
 });
+
+describe("embed（embedding 端点，2026-09-18）", () => {
+  const embedAdapter = (responder: (url: string, init?: EnvFetchRequest) => Promise<EnvFetchResponse>) =>
+    createOpenAICompatAdapter(envWith(responder), { baseURL: "https://x/v1", apiKey: "k", stream: false });
+
+  it("请求打 /embeddings、显式 float；响应取向量", async () => {
+    let seenUrl = "";
+    let seenBody = "";
+    const adapter = embedAdapter(async (url, init) => {
+      seenUrl = url;
+      seenBody = String(init?.body ?? "");
+      return jsonResponse({ data: [{ embedding: [0.25, -0.5, 1] }], model: "embed-v1" });
+    });
+    const out = await adapter.embed!({ model: "embed-v1", input: "用户在减脂" });
+    expect(seenUrl).toBe("https://x/v1/embeddings");
+    expect(JSON.parse(seenBody)).toMatchObject({ model: "embed-v1", input: "用户在减脂", encoding_format: "float" });
+    expect(out).toEqual({ model: "embed-v1", vector: [0.25, -0.5, 1] });
+  });
+
+  it("错误归一：401 → AUTH、429 → RATE_LIMIT；空向量 → EMPTY_RESPONSE", async () => {
+    const adapter = embedAdapter(async () => errorResponse(401, "unauthorized"));
+    await expect(adapter.embed!({ model: "m", input: "x" })).rejects.toMatchObject({ code: "AUTH" });
+    const limited = embedAdapter(async () => errorResponse(429, "slow down"));
+    await expect(limited.embed!({ model: "m", input: "x" })).rejects.toMatchObject({ code: "RATE_LIMIT" });
+    const empty = embedAdapter(async () => jsonResponse({ data: [] }));
+    await expect(empty.embed!({ model: "m", input: "x" })).rejects.toMatchObject({ code: "EMPTY_RESPONSE" });
+    const garbage = embedAdapter(async () => jsonResponse({ data: [{ embedding: "base64str" }] }));
+    await expect(garbage.embed!({ model: "m", input: "x" })).rejects.toMatchObject({ code: "EMPTY_RESPONSE" });
+  });
+});

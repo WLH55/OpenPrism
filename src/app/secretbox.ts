@@ -49,7 +49,11 @@ export interface ModelConfig {
   /** 上下文窗口 tokens（压缩器判压用）；缺省 = harness 默认 64K */
   contextWindow?: number;
   keyEnc?: string;
+  /** 提供方用途（2026-09-18）：chat=对话/提取，embedding=记忆向量；缺省 chat */
+  kind?: ModelProviderKind;
 }
+
+export type ModelProviderKind = "chat" | "embedding";
 
 export interface ModelProviderView {
   id: string;
@@ -58,6 +62,7 @@ export interface ModelProviderView {
   model: string;
   contextWindow: number | null;
   hasKey: boolean;
+  kind: ModelProviderKind;
 }
 
 const PLATFORM_PATTERNS: [RegExp, string][] = [
@@ -95,6 +100,7 @@ interface ProviderRow {
   context_window: number | null;
   key_enc: string | null;
   created_ts: number;
+  kind: string | null;
 }
 
 function rowToConfig(row: ProviderRow): ModelConfig {
@@ -105,6 +111,7 @@ function rowToConfig(row: ProviderRow): ModelConfig {
     model: row.model,
     ...(row.context_window !== null ? { contextWindow: row.context_window } : {}),
     ...(row.key_enc !== null ? { keyEnc: row.key_enc } : {}),
+    kind: row.kind === "embedding" ? "embedding" : "chat",
   };
 }
 
@@ -122,19 +129,20 @@ function activateIfFirst(db: DatabaseSync, uid: string, id: string): void {
 export function addModelProvider(
   db: DatabaseSync,
   uid: string,
-  input: { baseURL: string; model: string; contextWindow?: number | null; keyEnc?: string; platform?: string },
+  input: { baseURL: string; model: string; contextWindow?: number | null; keyEnc?: string; platform?: string; kind?: ModelProviderKind },
 ): ModelConfig & { id: string } {
   const config: ModelConfig = {
     baseURL: input.baseURL,
     model: input.model,
     ...(input.contextWindow !== undefined && input.contextWindow !== null ? { contextWindow: input.contextWindow } : {}),
     ...(input.keyEnc !== undefined ? { keyEnc: input.keyEnc } : {}),
+    ...(input.kind !== undefined ? { kind: input.kind } : {}),
   };
   const id = randomUUID();
   const platform = input.platform?.trim() !== "" && input.platform !== undefined ? input.platform.trim() : platformFromBaseURL(input.baseURL);
   db.prepare(
-    "INSERT INTO model_providers (id, uid, platform, base_url, model, context_window, key_enc, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(id, uid, platform, config.baseURL, config.model, config.contextWindow ?? null, config.keyEnc ?? null, Date.now());
+    "INSERT INTO model_providers (id, uid, platform, base_url, model, context_window, key_enc, created_ts, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(id, uid, platform, config.baseURL, config.model, config.contextWindow ?? null, config.keyEnc ?? null, Date.now(), config.kind ?? "chat");
   activateIfFirst(db, uid, id);
   return { ...config, id, platform };
 }
@@ -143,7 +151,7 @@ export function updateModelProvider(
   db: DatabaseSync,
   uid: string,
   id: string,
-  patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string },
+  patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: ModelProviderKind },
 ): void {
   const row = getRow(db, uid, id);
   if (!row) throw new Error(`model provider "${id}" 不存在`);
@@ -152,19 +160,21 @@ export function updateModelProvider(
     model: patch.model ?? row.model,
     contextWindow: patch.contextWindow !== undefined ? patch.contextWindow : row.context_window,
     keyEnc: patch.keyEnc !== undefined ? patch.keyEnc : row.key_enc,
+    kind: patch.kind ?? (row.kind === "embedding" ? "embedding" : "chat"),
   };
   const platform = patch.baseURL !== undefined ? platformFromBaseURL(next.baseURL) : row.platform;
   db.prepare(
-    "UPDATE model_providers SET base_url = ?, model = ?, context_window = ?, key_enc = ?, platform = ? WHERE id = ? AND uid = ?",
-  ).run(next.baseURL, next.model, next.contextWindow, next.keyEnc, platform, id, uid);
+    "UPDATE model_providers SET base_url = ?, model = ?, context_window = ?, key_enc = ?, platform = ?, kind = ? WHERE id = ? AND uid = ?",
+  ).run(next.baseURL, next.model, next.contextWindow, next.keyEnc, platform, next.kind, id, uid);
 }
 
 export function removeModelProvider(db: DatabaseSync, uid: string, id: string): void {
   const result = db.prepare("DELETE FROM model_providers WHERE id = ? AND uid = ?").run(id, uid);
   if (result.changes === 0) throw new Error(`model provider "${id}" 不存在`);
-  // 引用清理（防悬空 409）：会话级绑定与伙伴默认模型一并置空（回落全局激活）
+  // 引用清理（防悬空 409）：会话级绑定与伙伴默认模型一并置空（回落全局激活）；记忆 embedding 绑定同此
   db.prepare("UPDATE conversations SET model_provider_id = NULL WHERE uid = ? AND model_provider_id = ?").run(uid, id);
   db.prepare("UPDATE agents SET model_provider_id = NULL WHERE uid = ? AND model_provider_id = ?").run(uid, id);
+  db.prepare("UPDATE memory_meta SET embedding_provider_id = NULL WHERE uid = ? AND embedding_provider_id = ?").run(uid, id);
   const active = db.prepare("SELECT provider_id FROM model_active WHERE uid = ?").get(uid) as
     | { provider_id: string }
     | undefined;
@@ -189,6 +199,7 @@ export function listModelProviders(db: DatabaseSync, uid: string): ModelProvider
     model: row.model,
     contextWindow: row.context_window,
     hasKey: row.key_enc !== null,
+    kind: row.kind === "embedding" ? "embedding" : "chat",
   }));
 }
 

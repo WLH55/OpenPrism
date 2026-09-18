@@ -1,7 +1,7 @@
 // Mock LlmAdapter（设计 §10）：脚本化返回文本/工具调用序列/各 code 失败——测试零网络。
 
 import type { AssistantMessage, Usage } from "../types";
-import type { LlmAdapter, LlmCallOptions, LlmRequest, LlmResponse } from "./adapter";
+import type { LlmAdapter, LlmCallOptions, LlmEmbeddingRequest, LlmRequest, LlmResponse } from "./adapter";
 import { llmFailure } from "./errors";
 
 export type MockScriptStep =
@@ -21,13 +21,31 @@ export interface MockLlmAdapter {
   adapter: LlmAdapter;
   /** 每次 complete 的请求快照（深拷贝），供断言 */
   requests: LlmRequest[];
+  /** 每次 embed 的请求快照（未注入 embed 时为空） */
+  embedRequests: LlmEmbeddingRequest[];
 }
 
-export function createMockLlmAdapter(script: MockScriptStep[]): MockLlmAdapter {
+/**
+ * embedImpl 缺省 = adapter 无 embed 能力（embed 是可选成员）；注入后原样代理，
+ * 向量序列/抛错行为由测试自行控制（与 complete 的脚本注入同一模式）。
+ */
+export function createMockLlmAdapter(
+  script: MockScriptStep[],
+  embed?: (request: LlmEmbeddingRequest) => Promise<number[]>,
+): MockLlmAdapter {
   const requests: LlmRequest[] = [];
+  const embedRequests: LlmEmbeddingRequest[] = [];
   let cursor = 0;
   const adapter: LlmAdapter = {
     name: "mock",
+    ...(embed
+      ? {
+          async embed(request: LlmEmbeddingRequest): Promise<{ model: string; vector: number[] }> {
+            embedRequests.push(JSON.parse(JSON.stringify(request)) as LlmEmbeddingRequest);
+            return { model: request.model, vector: await embed(request) };
+          },
+        }
+      : {}),
     async complete(request: LlmRequest, options?: LlmCallOptions): Promise<LlmResponse> {
       requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
       const step = script[cursor];
@@ -81,5 +99,5 @@ export function createMockLlmAdapter(script: MockScriptStep[]): MockLlmAdapter {
       };
     },
   };
-  return { adapter, requests };
+  return { adapter, requests, embedRequests };
 }

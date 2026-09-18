@@ -11,7 +11,7 @@ import { AgentStore, type AgentBinding } from "./agents";
 import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
-import { createSavePreferenceTool, createSearchMemoryTool } from "./memory";
+import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
 import { createTaskTools } from "./tasks";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
@@ -39,6 +39,8 @@ export interface ConversationDeps {
   skills: SkillStoreLike;
   mcps: McpRegistry;
   memory: MemoryStoreLike;
+  /** 向量召回预查（2026-09-18）；缺省/返回 null = 语义召回不可用，注入退纯词法 */
+  memoryVector?: MemoryVectorLike;
   /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
   tasks?: TaskStoreLike;
   /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
@@ -50,8 +52,14 @@ export interface TaskStoreLike {
 }
 
 export interface MemoryStoreLike {
-  /** 条目化召回注入块（纯函数：输入=库内条目+query） */
-  recallBlockSync(uid: string, query?: string): string;
+  /** 条目化召回注入块（纯函数：输入=库内条目+query+向量命中） */
+  recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string;
+}
+
+/** 向量召回面（main 装配 memory-vector 服务；测试注入确定性实现） */
+export interface MemoryVectorLike {
+  /** null = 语义召回不可用（未配置/超时/失败），调用方退纯词法 */
+  recallHits(uid: string, query: string, options?: { scope?: "situational" | "all"; limit?: number }): Promise<MemoryVectorHit[] | null>;
 }
 
 /** 测试替身面（避免循环依赖具体类） */
@@ -123,6 +131,8 @@ function rowToEntry(row: ConversationRow): ConversationEntry {
 export class ConversationStore {
   private pool = new Map<string, Agent>();
   private assembling = new Map<string, Promise<Agent>>();
+  /** 本回合注入用的向量命中（send() 预查写入，systemPrompt 闭包同步读；key = uid:cid） */
+  private turnVectorHits = new Map<string, MemoryVectorHit[]>();
 
   constructor(
     private deps: ConversationDeps,
@@ -364,7 +374,15 @@ export class ConversationStore {
     }
     const memoryStore = this.deps.memory as unknown as import("./memory").MemoryStore;
     tools.push(createSavePreferenceTool({ store: memoryStore, uid, now }));
-    tools.push(createSearchMemoryTool({ store: memoryStore, uid }));
+    tools.push(
+      createSearchMemoryTool({
+        store: memoryStore,
+        uid,
+        ...(this.deps.memoryVector
+          ? { vectorRecall: (vectorUid: string, query: string) => this.deps.memoryVector!.recallHits(vectorUid, query, { scope: "all", limit: 20 }) }
+          : {}),
+      }),
+    );
     if (this.deps.tasks) {
       tools.push(...createTaskTools({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid, now }));
     }
@@ -404,7 +422,12 @@ export class ConversationStore {
 
   private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
     const current = this.syncCurrentAgent(uid, meta);
-    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string): string }).recallBlockSync(uid, this.lastUserTextSync(cid));
+    const vectorHits = this.turnVectorHits.get(`${uid}:${cid}`);
+    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
+      uid,
+      this.lastUserTextSync(cid),
+      vectorHits,
+    );
     const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
     const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
     return composeAssistantPrompt({
@@ -418,6 +441,12 @@ export class ConversationStore {
 
   async send(uid: string, cid: string, text: string): Promise<void> {
     const agent = await this.agent(uid, cid);
+    // 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
+    // query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
+    // null（未配置/超时/失败）→ 清掉旧命中，本回合退纯词法。
+    const hits = this.deps.memoryVector ? await this.deps.memoryVector.recallHits(uid, text, { scope: "situational" }) : null;
+    if (hits === null) this.turnVectorHits.delete(`${uid}:${cid}`);
+    else this.turnVectorHits.set(`${uid}:${cid}`, hits);
     agent.followup(text);
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);

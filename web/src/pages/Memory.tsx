@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { api2, type MemoryItemLoose, type MemoryOverviewLoose } from "../api";
+import { api2, type MemoryItemLoose, type MemoryOverviewLoose, type MemoryTopicLoose } from "../api";
 
-const KIND_LABEL: Record<string, string> = { profile: "画像", preference: "偏好", fact: "事实", task: "任务" };
+const KIND_LABEL: Record<string, string> = { profile: "画像", preference: "偏好", fact: "事实", task: "任务", interest: "兴趣" };
 const ORIGIN_LABEL: Record<string, string> = { explicit: "显式", extracted: "后台", manual: "手动" };
 const STATUS_TABS: { key: string; label: string; icon: string }[] = [
   { key: "active", label: "生效中", icon: "✅" },
@@ -15,6 +15,7 @@ const KIND_TABS: { key: string; label: string }[] = [
   { key: "preference", label: "偏好" },
   { key: "fact", label: "事实" },
   { key: "task", label: "任务" },
+  { key: "interest", label: "兴趣" },
 ];
 
 function fmtTime(ts: number): string {
@@ -32,9 +33,16 @@ export function Memory() {
   const [adding, setAdding] = useState(false);
   const [addForm, setAddForm] = useState({ kind: "fact", content: "", importance: 3, topic: "" });
   const [editing, setEditing] = useState<{ id: string; content: string; importance: number; topic: string } | null>(null);
+  const [topics, setTopics] = useState<MemoryTopicLoose[]>([]);
+  const [threshold, setThreshold] = useState(3);
 
   const reload = useCallback(async () => {
-    setOv(await api2.getMemory());
+    const overview = await api2.getMemory();
+    setOv(overview);
+    if (overview.config) setThreshold(overview.config.interestThreshold);
+  }, []);
+  const reloadTopics = useCallback(async () => {
+    setTopics((await api2.listMemoryTopics()).topics);
   }, []);
   const reloadItems = useCallback(async () => {
     const r = await api2.listMemoryItems({ ...(status ? { status } : {}), ...(kind ? { kind } : {}), limit: 200 });
@@ -42,7 +50,8 @@ export function Memory() {
   }, [status, kind]);
   useEffect(() => {
     void reload().catch(() => undefined);
-  }, [reload]);
+    void reloadTopics().catch(() => undefined);
+  }, [reload, reloadTopics]);
   useEffect(() => {
     void reloadItems().catch(() => undefined);
   }, [reloadItems]);
@@ -51,10 +60,10 @@ export function Memory() {
     setBusy(true);
     try {
       setMessage(await fn());
-      await Promise.all([reload(), reloadItems()]);
+      await Promise.all([reload(), reloadItems(), reloadTopics()]);
     } catch (e) {
       const msg = (e as Error).message;
-      setMessage(msg === "model_not_configured" ? "先去「模型接入」页配置模型" : `操作失败：${msg}`);
+      setMessage(msg === "model_not_configured" ? "先去「模型接入」页配置模型" : msg === "已取消" ? "" : `操作失败：${msg}`);
     } finally {
       setBusy(false);
     }
@@ -129,6 +138,55 @@ export function Memory() {
         </div>
       </header>
       {message && <p className="mb-4 text-sm text-ink3">{message}</p>}
+
+      {/* 主题计数（同一主题被多次谈起 → 自动变成长期兴趣） */}
+      {topics.length > 0 && (
+        <section className="mb-4 rounded-xl border border-line bg-surface p-4">
+          <div className="mb-2 flex items-baseline justify-between">
+            <div className="text-sm font-semibold text-ink">关注中的主题</div>
+            <div className="text-[11px] text-ink3">谈满 {threshold} 次自动成为兴趣记忆</div>
+          </div>
+          <ul className="space-y-1.5">
+            {topics.map((topic) => (
+              <li key={topic.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+                <span className="font-medium text-ink">{topic.topic}</span>
+                <span className="text-[11px] text-ink3">
+                  {topic.hits}/{threshold}
+                  {topic.hits >= threshold ? " · 可晋升" : ""}
+                  {topic.aliases.length > 0 ? ` · 别名 ${topic.aliases.length}` : ""}
+                </span>
+                <span className="ml-auto flex gap-2 text-[12px]">
+                  <button
+                    className="text-accent hover:underline disabled:opacity-60"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        await api2.promoteMemoryTopic(topic.id);
+                        return `已把「${topic.topic}」加入兴趣记忆`;
+                      })()
+                    }
+                  >
+                    成为兴趣
+                  </button>
+                  <button
+                    className="text-warm hover:underline disabled:opacity-60"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        if (!window.confirm(`不再追踪「${topic.topic}」？此后不会再自动计数或晋升。`)) throw new Error("已取消");
+                        await api2.forgetMemoryTopic(topic.id);
+                        return "已不再追踪";
+                      })()
+                    }
+                  >
+                    不再追踪
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {/* 添加弹层 */}
       {adding && (
@@ -333,7 +391,8 @@ export function Memory() {
       )}
 
       <p className="mt-5 text-xs leading-relaxed text-ink3">
-        对话中自动注入：画像与偏好常驻，事实与任务按当前话题临时召回。每轮对话后约 90 秒后台自动提取，每晚自动整理（合并重复、过期归档）。
+        对话中自动注入：画像、偏好与兴趣常驻，事实与任务按当前话题临时召回（配置了语义召回提供方时，字面不同的说法也能召回）。
+        每轮对话后约 90 秒后台自动提取，每晚自动整理（合并重复、过期归档、补算向量）。
         {ov?.meta.lastExtractTs ? ` 上次提取 ${fmtTime(ov.meta.lastExtractTs)}${nextExtract}。` : ""}
         删除的记忆不会再被后台学回来；你手动编辑过的条目后台也不会覆盖。
       </p>
