@@ -4,7 +4,7 @@
 
 import type { EnvFetchResponse, PlatformEnv } from "../env";
 import type { AssistantMessage, Message, ToolCallBlock, Usage } from "../types";
-import type { LlmAdapter, LlmCallOptions, LlmRequest, LlmResponse } from "./adapter";
+import type { LlmAdapter, LlmCallOptions, LlmEmbeddingRequest, LlmEmbeddingResponse, LlmRequest, LlmResponse } from "./adapter";
 import { isAbortLike, isLlmFailure, llmFailure, looksLikeContextOverflow, looksLikeQuota } from "./errors";
 import { IncrementalUtf8Decoder } from "./utf8";
 
@@ -116,9 +116,52 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
   const useStream = config.stream ?? true;
   const idleTimeoutMs = config.idleTimeoutMs ?? 120_000;
   const url = config.baseURL.replace(/\/+$/, "") + "/chat/completions";
+  const embeddingsUrl = config.baseURL.replace(/\/+$/, "") + "/embeddings";
 
   return {
     name: "openai-compat",
+    async embed(request: LlmEmbeddingRequest, options?: LlmCallOptions): Promise<LlmEmbeddingResponse> {
+      const callerSignal = options?.signal;
+      const controller = new AbortController();
+      const onCallerAbort = () => controller.abort();
+      if (callerSignal) {
+        if (callerSignal.aborted) controller.abort();
+        else callerSignal.addEventListener("abort", onCallerAbort);
+      }
+      try {
+        let response: EnvFetchResponse;
+        try {
+          response = await env.fetch(embeddingsUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${config.apiKey}`,
+              ...config.extraHeaders,
+            },
+            // encoding_format 显式 float：个别兼容端点默认返回 base64，这里统一要浮点数组
+            body: JSON.stringify({ model: request.model, input: request.input, encoding_format: "float" }),
+            signal: controller.signal,
+          });
+        } catch (error) {
+          if (callerSignal?.aborted || isAbortLike(error)) {
+            throw llmFailure("ABORTED", "embedding request aborted");
+          }
+          throw llmFailure("TRANSPORT", `embedding transport failure: ${String((error as Error)?.message ?? error)}`);
+        }
+        if (!response.ok) await mapHttpError(response);
+        const json = (await response.json().catch(() => null)) as { data?: { embedding?: unknown }[]; model?: unknown } | null;
+        const vector = json?.data?.[0]?.embedding;
+        if (!Array.isArray(vector) || vector.length === 0 || !vector.every((n) => typeof n === "number")) {
+          throw llmFailure("EMPTY_RESPONSE", "embedding response has no numeric vector");
+        }
+        return {
+          model: typeof json?.model === "string" ? json.model : request.model,
+          vector: vector as number[],
+        };
+      } finally {
+        callerSignal?.removeEventListener("abort", onCallerAbort);
+      }
+    },
     async complete(request: LlmRequest, options?: LlmCallOptions): Promise<LlmResponse> {
       const callerSignal = options?.signal;
       const controller = new AbortController();

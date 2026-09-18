@@ -27,8 +27,9 @@ import { ModelNotConfiguredError, type ConversationStore } from "./conversations
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
-import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
+import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
 import type { MemoryExtractor } from "./memory-extract";
+import { forgetTopic, listUnpromotedTopics, promoteTopicManually, restoreTopic } from "./memory-topics";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -47,6 +48,10 @@ export interface ServerDeps {
   modelTester?(uid: string, config: ModelConfig | null): Promise<void>;
   /** 记忆提取/整理用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（extract 返回 409）；测试注入 mock */
   adapterFor?(uid: string): Promise<{ adapter: LlmAdapter; model: string } | null>;
+  /** embedding 提供方连接测试（发一次最小 embed 请求）；测试注入 fake（零网络） */
+  embeddingTester?(uid: string, providerId: string): Promise<void>;
+  /** 新条目即时嵌入（手动晋升 interest 用，与提取管线共用实现）；缺省 = 只写条目，等夜间回填 */
+  embedNewItems?(uid: string, items: MemoryItem[]): Promise<void> | void;
   agents: AgentStore;
   skills: SkillStore;
   mcps: McpRegistry;
@@ -266,6 +271,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (!Number.isInteger(n) || n < 1000) throw new Error("contextWindow 需为 ≥1000 的整数（tokens）");
     return n;
   };
+  /** 提供方用途归一：undefined=不改/缺省（chat） */
+  const parseProviderKind = (input: unknown): "chat" | "embedding" | undefined => {
+    if (input === undefined) return undefined;
+    const s = String(input).trim();
+    if (s === "" || s === "chat") return "chat";
+    if (s === "embedding") return "embedding";
+    throw new Error("kind 只支持 chat | embedding");
+  };
   const validateBaseURL = (baseURL: string): void => {
     if (!/^https?:\/\//.test(baseURL)) throw new Error("baseURL 需以 http(s):// 开头");
   };
@@ -274,13 +287,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { activeId: activeModelId(deps.db, uid), providers: listModelProviders(deps.db, uid) });
   }
   if (path === "/api/models" && method === "POST") {
-    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string };
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string; kind?: unknown };
     const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
     const model = String(body.model ?? "").trim();
     try {
       validateBaseURL(baseURL);
       if (model === "") throw new Error("model 必填");
       const contextWindow = parseContextWindow(body.contextWindow);
+      const kind = parseProviderKind(body.kind);
       const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
       const created = addModelProvider(deps.db, uid, {
         baseURL,
@@ -288,6 +302,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         ...(contextWindow !== undefined ? { contextWindow } : {}),
         ...(apiKey !== "" ? { keyEnc: seal(deps.masterKey, apiKey) } : {}),
         ...(typeof body.platform === "string" && body.platform.trim() !== "" ? { platform: body.platform.trim() } : {}),
+        ...(kind !== undefined ? { kind } : {}),
       });
       return sendJson(res, 200, { id: created.id });
     } catch (error) {
@@ -300,8 +315,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const sub = modelsMatch[2] ?? "";
     try {
       if (sub === "" && method === "PUT") {
-        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown };
-        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string } = {};
+        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; kind?: unknown };
+        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: "chat" | "embedding" } = {};
         if (body.baseURL !== undefined) {
           const baseURL = String(body.baseURL).trim().replace(/\/+$/, "");
           validateBaseURL(baseURL);
@@ -314,6 +329,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         }
         const contextWindow = parseContextWindow(body.contextWindow);
         if (contextWindow !== undefined) patch.contextWindow = contextWindow;
+        const kind = parseProviderKind(body.kind);
+        if (kind !== undefined) patch.kind = kind;
         const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
         if (apiKey !== "") patch.keyEnc = seal(deps.masterKey, apiKey);
         updateModelProvider(deps.db, uid, providerId, patch);
@@ -330,9 +347,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       if (sub === "/test" && method === "POST") {
         const config = readModelProviderConfig(deps.db, uid, providerId);
         if (!config) return sendError(res, 404, `model provider "${providerId}" 不存在`);
-        const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
         try {
-          await tester(uid, config);
+          if (config.kind === "embedding") {
+            if (!deps.embeddingTester) return sendError(res, 409, "embedding_tester_unavailable");
+            await deps.embeddingTester(uid, providerId);
+          } else {
+            const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
+            await tester(uid, config);
+          }
           return sendJson(res, 200, { ok: true });
         } catch (error) {
           return sendJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error).slice(0, 300) });
@@ -623,7 +645,36 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (path === "/api/memory" && method === "GET") {
     const counts = deps.memory.countByStatus(uid);
     const meta = deps.memory.metaRow(uid);
-    return sendJson(res, 200, { counts, meta });
+    return sendJson(res, 200, {
+      counts,
+      meta,
+      config: { interestThreshold: deps.memory.effectiveInterestThreshold(uid), embeddingProviderId: meta.embeddingProviderId ?? null },
+    });
+  }
+  if (path === "/api/memory/config" && method === "PATCH") {
+    const body = (await readBody(req)) as { interestThreshold?: unknown; embeddingProviderId?: unknown };
+    const patch: { interestThreshold?: number | null; embeddingProviderId?: string | null } = {};
+    if (body.interestThreshold !== undefined) {
+      if (body.interestThreshold === null) patch.interestThreshold = null;
+      else {
+        const n = Number(body.interestThreshold);
+        if (!Number.isInteger(n) || n < 1 || n > 20) return sendError(res, 400, "interestThreshold 需为 1–20 的整数");
+        patch.interestThreshold = n;
+      }
+    }
+    if (body.embeddingProviderId !== undefined) {
+      const id = body.embeddingProviderId === null ? null : String(body.embeddingProviderId).trim();
+      if (id !== null) {
+        const provider = listModelProviders(deps.db, uid).find((p) => p.id === id);
+        if (!provider) return sendError(res, 404, `model provider "${id}" 不存在`);
+        if (provider.kind !== "embedding") return sendError(res, 400, "绑定的提供方需为 embedding 用途");
+      }
+      patch.embeddingProviderId = id;
+    }
+    deps.memory.ensureMetaRow(uid);
+    deps.memory.patchMeta(uid, patch);
+    const meta = deps.memory.metaRow(uid);
+    return sendJson(res, 200, { ok: true, config: { interestThreshold: deps.memory.effectiveInterestThreshold(uid), embeddingProviderId: meta.embeddingProviderId ?? null } });
   }
   if (path === "/api/memory/items" && method === "GET") {
     const kindParam = url.searchParams.get("kind");
@@ -701,6 +752,39 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": 'attachment; filename="openprism-memory.json"' });
     res.end(body);
     return;
+  }
+
+  // ── 主题计数（2026-09-18）：未晋升主题列表 / 手动晋升 / 不再追踪 / 撤销追踪 ──
+  if (path === "/api/memory/topics" && method === "GET") {
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? "100")) || 100);
+    const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+    const topics = listUnpromotedTopics(deps.db, uid, limit, offset);
+    return sendJson(res, 200, { topics, total: topics.length, threshold: deps.memory.effectiveInterestThreshold(uid) });
+  }
+  const memoryTopicMatch = /^\/api\/memory\/topics\/([^/]+)(\/promote|\/restore)?$/.exec(path);
+  if (memoryTopicMatch) {
+    const key = decodeURIComponent(memoryTopicMatch[1]!);
+    const action = memoryTopicMatch[2] ?? "";
+    if (action === "" && method === "DELETE") {
+      forgetTopic(deps.db, uid, key, deps.env.now());
+      return sendJson(res, 200, { ok: true });
+    }
+    if (action === "/promote" && method === "POST") {
+      const stat = await promoteTopicManually({
+        db: deps.db,
+        now: deps.env.now,
+        memory: deps.memory,
+        uid,
+        key,
+        ...(deps.embedNewItems ? { embedNewItems: deps.embedNewItems } : {}),
+      });
+      if (!stat) return sendError(res, 404, `topic "${key}" 不存在或已不再追踪`);
+      return sendJson(res, 200, { ok: true, topic: stat.topic });
+    }
+    if (action === "/restore" && method === "POST") {
+      restoreTopic(deps.db, uid, key);
+      return sendJson(res, 200, { ok: true });
+    }
   }
 
   // ── 账本直写（ui 来源） ────────────────────────────────

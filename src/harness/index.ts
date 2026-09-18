@@ -27,7 +27,7 @@ export {
 } from "./session/project";
 export { countTurns, currentGeneration, retryBudgetUsed, lastRequestHeader } from "./session/queries";
 
-export type { LlmAdapter, LlmRequest, LlmResponse, LlmCallOptions, ToolPublicSchema } from "./llm/adapter";
+export type { LlmAdapter, LlmRequest, LlmResponse, LlmCallOptions, LlmEmbeddingRequest, LlmEmbeddingResponse, ToolPublicSchema } from "./llm/adapter";
 export {
   llmFailure,
   isLlmFailure,

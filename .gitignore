@@ -60,3 +60,4 @@ Thumbs.db
 .dsh-e2e/
 .zcode/
 plugins/
+e2e-data/

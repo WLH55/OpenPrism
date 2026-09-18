@@ -19,6 +19,7 @@ import { SkillStore } from "./skills";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
 import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extract";
+import { createMemoryVector } from "./memory-vector";
 import { Scheduler, TaskStore, type TaskDef } from "./tasks";
 import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
@@ -78,6 +79,25 @@ async function main(): Promise<void> {
   migrateLegacyMemory(db, { now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const notifications = new NotificationStore({ db, now: () => Date.now() });
 
+  // 向量召回服务（2026-09-18）：embedding 提供方 = memory_meta.embedding_provider_id 现读（改绑定即时生效）
+  const embeddingFor = async (uid: string) => {
+    const providerId = memory.metaRow(uid).embeddingProviderId;
+    if (!providerId) return null;
+    const config = await readModelProviderConfig(db, uid, providerId);
+    if (!config || !config.keyEnc) return null;
+    return {
+      adapter: createOpenAICompatAdapter(nodeEnv, { baseURL: config.baseURL, apiKey: open(masterKey, config.keyEnc) }),
+      model: config.model,
+      providerId,
+    };
+  };
+  const memoryVector = createMemoryVector({
+    db,
+    now: () => Date.now(),
+    embeddingFor,
+    log: (line) => process.stdout.write(`${line}\n`),
+  });
+
   const conversations = new ConversationStore(
     {
       env: nodeEnv,
@@ -90,6 +110,7 @@ async function main(): Promise<void> {
       skills,
       mcps,
       memory,
+      memoryVector,
       tasks,
       onTurnDone: (uidTurn) => memoryExtractor.notify(uidTurn),
     },
@@ -122,8 +143,29 @@ async function main(): Promise<void> {
     };
   };
 
-  // 记忆提取管线（条目化，2026-09-10）：三 surface 水位线/指纹检测 + 决策制蒸馏 + 整理
-  const memoryExtractor = new MemoryExtractor({ db, now: () => Date.now(), memory, adapterFor });
+  // 记忆提取管线（条目化，2026-09-10）：三 surface 水位线/指纹检测 + 决策制蒸馏 + 整理；
+  // 2026-09-18 增：语义候选（旧条目超限时按向量检索）+ 新条目向量写入
+  const memoryExtractor = new MemoryExtractor({
+    db,
+    now: () => Date.now(),
+    memory,
+    adapterFor,
+    vectorCandidates: async (uid, query, limit) => {
+      const hits = await memoryVector.recallHits(uid, query, { scope: "all", limit });
+      if (hits === null) return null;
+      return memory.getItemsByIds(uid, hits.map((h) => h.id));
+    },
+    embedNewItems: (uid, items) => memoryVector.embedNewItems(uid, items),
+  });
+
+  // embedding 提供方连接测试（设置页"测试"按钮对 kind=embedding 的提供方）
+  const embeddingTester = async (uid: string, providerId: string): Promise<void> => {
+    const config = await readModelProviderConfig(db, uid, providerId);
+    if (!config || !config.keyEnc) throw new Error("embedding 提供方未配置 API Key");
+    const adapter = createOpenAICompatAdapter(nodeEnv, { baseURL: config.baseURL, apiKey: open(masterKey, config.keyEnc) });
+    if (!adapter.embed) throw new Error("该提供方不支持 embedding 调用");
+    await adapter.embed({ model: config.model, input: "connection test" });
+  };
 
   const staticDir = resolve("web/dist");
   const server = createAppServer({
@@ -136,6 +178,8 @@ async function main(): Promise<void> {
     conversations,
     ledgerFor,
     adapterFor,
+    embeddingTester,
+    embedNewItems: (uid, items) => memoryVector.embedNewItems(uid, items),
     agents,
     skills,
     mcps,
@@ -206,6 +250,13 @@ async function main(): Promise<void> {
         );
       } catch (error) {
         process.stdout.write(`[openprism] memory consolidate (${reason}) ${user.username} failed: ${String((error as Error).message)}\n`);
+      }
+      // 向量回填（2026-09-18）：整理后顺带补缺失向量（每轮限速 200 条；未配置 embedding 时内部直返 0）
+      try {
+        const filled = await memoryVector.backfill(user.uid);
+        if (filled > 0) process.stdout.write(`[openprism] memory embeddings backfill (${reason}) ${user.username}: +${filled}\n`);
+      } catch (error) {
+        process.stdout.write(`[openprism] memory embeddings backfill (${reason}) ${user.username} failed: ${String((error as Error).message)}\n`);
       }
     }
   }

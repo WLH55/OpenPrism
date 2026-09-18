@@ -26,6 +26,17 @@ export interface LlmResponse {
   finishReason?: string;
 }
 
+/** embedding 调用（记忆向量召回用）：单段文本 → 一个向量 */
+export interface LlmEmbeddingRequest {
+  model: string;
+  input: string;
+}
+
+export interface LlmEmbeddingResponse {
+  model: string;
+  vector: number[];
+}
+
 export interface LlmCallOptions {
   signal?: AbortSignal;
   /** 流式文本增量：只走活体事件流，不落日志（设计 §9） */
@@ -37,4 +48,6 @@ export interface LlmCallOptions {
 export interface LlmAdapter {
   name: string;
   complete(request: LlmRequest, options?: LlmCallOptions): Promise<LlmResponse>;
+  /** 可选：OpenAI 兼容 /embeddings；仅支持 embedding 的后端实现（错误同样归一 LlmFailure） */
+  embed?(request: LlmEmbeddingRequest, options?: LlmCallOptions): Promise<LlmEmbeddingResponse>;
 }

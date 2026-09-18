@@ -15,6 +15,8 @@ export interface ModelProvider {
   /** 上下文窗口 tokens；null = harness 默认 64K */
   contextWindow: number | null;
   hasKey: boolean;
+  /** 提供方用途：chat=对话/提取，embedding=记忆向量（2026-09-18） */
+  kind: string;
 }
 
 export interface ConversationEntry {
@@ -109,9 +111,9 @@ export const api = {
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
   getModels: () => request<{ activeId: string | null; providers: ModelProvider[] }>("/api/models"),
-  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string }) =>
+  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string; kind?: string }) =>
     request<{ id: string }>("/api/models", { method: "POST", body: JSON.stringify(input) }),
-  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null }) =>
+  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null; kind?: string }) =>
     request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
   activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
@@ -239,6 +241,18 @@ export const api2 = {
     request<{ reviewed: number; expired: number; demoted: number; merged: number; skipped?: string }>("/api/memory/consolidate", { method: "POST" }),
   exportMemoryUrl: () => "/api/memory/export",
 
+  // ── 主题计数与向量召回（2026-09-18） ──────────────────
+  listMemoryTopics: () =>
+    request<{ topics: MemoryTopicLoose[]; total: number; threshold: number }>("/api/memory/topics"),
+  promoteMemoryTopic: (key: string) =>
+    request<{ ok: boolean; topic: string }>(`/api/memory/topics/${encodeURIComponent(key)}/promote`, { method: "POST" }),
+  forgetMemoryTopic: (key: string) =>
+    request<{ ok: boolean }>(`/api/memory/topics/${encodeURIComponent(key)}`, { method: "DELETE" }),
+  restoreMemoryTopic: (key: string) =>
+    request<{ ok: boolean }>(`/api/memory/topics/${encodeURIComponent(key)}/restore`, { method: "POST" }),
+  patchMemoryConfig: (patch: { interestThreshold?: number | null; embeddingProviderId?: string | null }) =>
+    request<{ ok: boolean; config: MemoryConfigLoose }>("/api/memory/config", { method: "PATCH", body: JSON.stringify(patch) }),
+
   convMeta: (cid: string) => request<ConversationMetaLoose>(`/api/conversations/${cid}/meta`),
   setConversationModel: (cid: string, providerId: string | null) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/model`, { method: "PUT", body: JSON.stringify({ providerId }) }),
@@ -273,6 +287,19 @@ export interface TaskLoose {
 export interface MemoryOverviewLoose {
   counts: Record<string, number>;
   meta: { runs: number; lastExtractTs?: number; consolidatedTs?: number; scheduledTs?: number };
+  config?: MemoryConfigLoose;
+}
+export interface MemoryConfigLoose {
+  interestThreshold: number;
+  embeddingProviderId: string | null;
+}
+/** 未晋升主题（主题计数，2026-09-18）：hits 达 threshold 自动变兴趣记忆 */
+export interface MemoryTopicLoose {
+  id: string;
+  topic: string;
+  aliases: string[];
+  hits: number;
+  lastSeenTs: number;
 }
 export interface MemoryItemLoose {
   id: string;
