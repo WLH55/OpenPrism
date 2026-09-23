@@ -5,7 +5,9 @@ import {
   appendUser,
   hashPassword,
   loadUsers,
+  readUserFace,
   SessionStore,
+  updateUserFace,
   verifyPassword,
   type UserRecord,
 } from "../src/app/auth";
@@ -45,6 +47,36 @@ describe("用户注册表（users 表）", () => {
     expect([...map.keys()]).toEqual(["lathan", "mike"]);
     expect(map.get("lathan")?.uid).toBe("uuid-1");
     expect(await verifyPassword("p1", map.get("lathan")!.password)).toBe(true);
+  });
+});
+
+describe("用户形象（users 表）", () => {
+  it("默认空形象 → 保存 emoji/色盘/头像 → 读回一致；空串清空头像", async () => {
+    const db = testDb();
+    appendUser(db, { uid: "u-1", username: "lathan", password: await hashPassword("p1"), createdTs: 1000 });
+    expect(readUserFace(db, "u-1")).toEqual({ avatar: "", emoji: "", color: "" });
+    const saved = updateUserFace(db, "u-1", { emoji: "🦊", color: "#b0501e", avatar: "data:image/png;base64,AAAA" });
+    expect(saved).toEqual({ avatar: "data:image/png;base64,AAAA", emoji: "🦊", color: "#b0501e" });
+    expect(readUserFace(db, "u-1")).toEqual(saved);
+    expect(updateUserFace(db, "u-1", { avatar: "" }).avatar).toBe("");
+    expect(updateUserFace(db, "u-1", { emoji: "🐳" }).avatar).toBe(""); // 未提的字段不动
+  });
+
+  it("非法形象就地抛错：外链头像、坏色盘、超长 emoji、用户不存在", async () => {
+    const db = testDb();
+    appendUser(db, { uid: "u-2", username: "mike", password: await hashPassword("p2"), createdTs: 2000 });
+    expect(() => updateUserFace(db, "u-2", { avatar: "http://evil/a.png" })).toThrow(/data:image/);
+    expect(() => updateUserFace(db, "u-2", { color: "red" })).toThrow(/#rrggbb/);
+    expect(() => updateUserFace(db, "u-2", { emoji: "🦊".repeat(9) })).toThrow(/emoji 超过/);
+    expect(() => updateUserFace(db, "nope", { emoji: "🦊" })).toThrow(/不存在/);
+  });
+
+  it("loadUsers 带出形象：重启后头像与 emoji 仍在", async () => {
+    const db = testDb();
+    appendUser(db, { uid: "u-3", username: "sara", password: await hashPassword("p3"), createdTs: 3000 });
+    updateUserFace(db, "u-3", { emoji: "🌙", color: "#3d6b8a" });
+    const map = await loadUsers(db);
+    expect(map.get("sara")).toMatchObject({ emoji: "🌙", color: "#3d6b8a", avatar: "" });
   });
 });
 

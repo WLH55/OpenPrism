@@ -4,10 +4,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { gzipSync } from "node:zlib";
 import type { DatabaseSync } from "node:sqlite";
 import type { LlmAdapter, PlatformEnv } from "../harness/index";
 import { createOpenAICompatAdapter } from "../harness/index";
-import { appendUser, hashPassword, SessionStore, verifyPassword, type UserRecord } from "./auth";
+import { appendUser, hashPassword, SessionStore, verifyPassword } from "./auth";
 import {
   activeModelId,
   addModelProvider,
@@ -23,7 +24,9 @@ import {
 } from "./secretbox";
 import type { Ledger } from "./ledger";
 import { categoryView, listCategories, progressView, todayView } from "./fold";
-import { ModelNotConfiguredError, type ConversationStore } from "./conversations";
+import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
+import { parseAttachments } from "./attachments";
+import { faceOf, updateUserFace, type UserRecord } from "./auth";
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
@@ -67,6 +70,8 @@ export interface ServerDeps {
 
 const COOKIE_NAME = "op_session";
 const BODY_LIMIT = 1024 * 1024;
+/** 发消息允许带附件（图片 base64），单独放宽；其余端点仍守 1MB */
+const MESSAGE_BODY_LIMIT = 24 * 1024 * 1024;
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, setCookie?: string): void {
@@ -77,16 +82,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown, setCookie?
   res.end(JSON.stringify(body));
 }
 
-function sendError(res: ServerResponse, status: number, error: string): void {
-  sendJson(res, status, { error });
+function sendError(res: ServerResponse, status: number, error: string, code?: string): void {
+  sendJson(res, status, code === undefined ? { error } : { error, code });
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, limit: number = BODY_LIMIT): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > BODY_LIMIT) throw new Error("body too large");
+    if (size > limit) throw new Error("body too large");
     chunks.push(chunk as Buffer);
   }
   if (chunks.length === 0) return {};
@@ -131,9 +136,21 @@ const CONTENT_TYPES: Record<string, string> = {
   ".map": "application/json",
   ".woff2": "font/woff2",
   ".txt": "text/plain; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
 };
 
-async function serveStatic(deps: ServerDeps, res: ServerResponse, pathName: string): Promise<boolean> {
+/** 可 gzip 压缩的文本类扩展名（图片等二进制格式压缩无益） */
+const COMPRESSIBLE_EXTS = new Set([".html", ".js", ".css", ".json", ".svg", ".map", ".txt", ".webmanifest"]);
+
+/** 缓存策略（2026-09-23）：文件名带哈希的构建产物可长缓存；入口与清单不缓存；其余静态文件缓存 7 天 */
+function cacheControlFor(pathName: string, file: string): string {
+  if (pathName.startsWith("/assets/")) return "public, max-age=31536000, immutable";
+  const ext = file.slice(file.lastIndexOf("."));
+  if (ext === ".html" || ext === ".webmanifest") return "no-cache";
+  return "public, max-age=604800";
+}
+
+async function serveStatic(deps: ServerDeps, req: IncomingMessage, res: ServerResponse, pathName: string): Promise<boolean> {
   if (!deps.staticDir) return false;
   const rel = pathName === "/" ? "index.html" : pathName.slice(1);
   const file = resolve(deps.staticDir, rel);
@@ -143,8 +160,21 @@ async function serveStatic(deps: ServerDeps, res: ServerResponse, pathName: stri
     if (!info.isFile()) return false;
     const data = await readFile(file);
     const ext = file.slice(file.lastIndexOf("."));
-    res.writeHead(200, { "Content-Type": CONTENT_TYPES[ext] ?? "application/octet-stream" });
-    res.end(data);
+    const headers: Record<string, string> = {
+      "Content-Type": CONTENT_TYPES[ext] ?? "application/octet-stream",
+      "Cache-Control": cacheControlFor(pathName, file),
+    };
+    // 文本类资源按 Accept-Encoding 协商 gzip（构建产物 400KB+，手机流量与首屏都受益）
+    const compressible = COMPRESSIBLE_EXTS.has(ext);
+    if (compressible) headers["Vary"] = "Accept-Encoding";
+    if (compressible && /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""))) {
+      headers["Content-Encoding"] = "gzip";
+      res.writeHead(200, headers);
+      res.end(gzipSync(data));
+    } else {
+      res.writeHead(200, headers);
+      res.end(data);
+    }
     return true;
   } catch {
     return false;
@@ -208,7 +238,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   // 静态资源（web/dist）：登录页本身无需登录；认证门只管 /api/*
-  if (method === "GET" && !path.startsWith("/api") && (await serveStatic(deps, res, path))) return;
+  if (method === "GET" && !path.startsWith("/api") && (await serveStatic(deps, req, res, path))) return;
 
   // ── 认证（无需登录） ───────────────────────────────────
   if (method === "POST" && path === "/api/auth/register") {
@@ -259,7 +289,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (!uid || !user) return sendError(res, 401, "unauthorized");
 
   if (method === "GET" && path === "/api/auth/me") {
-    return sendJson(res, 200, { uid, username: user.username });
+    return sendJson(res, 200, { uid, username: user.username, face: faceOf(user) });
+  }
+
+  // 个人资料：形象（头像图片 / emoji / 色盘）读写；用户名与口令不改
+  if (path === "/api/auth/profile" && method === "PUT") {
+    const body = (await readBody(req)) as { avatar?: string; emoji?: string; color?: string };
+    const patch: { avatar?: string; emoji?: string; color?: string } = {};
+    for (const key of ["avatar", "emoji", "color"] as const) {
+      if (body[key] !== undefined) patch[key] = String(body[key]);
+    }
+    try {
+      const face = updateUserFace(deps.db, uid, patch);
+      user.avatar = face.avatar === "" ? undefined : face.avatar;
+      user.emoji = face.emoji;
+      user.color = face.color;
+      return sendJson(res, 200, { uid, username: user.username, face });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
   }
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
@@ -273,6 +321,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       throw new Error(kind === "embedding" ? "contextWindow 需为正整数（tokens）" : "contextWindow 需为 ≥1000 的整数（tokens）");
     }
     return n;
+  };
+  /** 多模态开关归一：undefined=不改/缺省（false）；只收布尔与其字面量 */
+  const parseMultimodal = (input: unknown): boolean | undefined => {
+    if (input === undefined) return undefined;
+    if (typeof input === "boolean") return input;
+    if (input === "true" || input === "1" || input === 1) return true;
+    if (input === "false" || input === "0" || input === 0) return false;
+    throw new Error("multimodal 需要布尔值");
   };
   /** 提供方用途归一：undefined=不改/缺省（chat） */
   const parseProviderKind = (input: unknown): "chat" | "embedding" | undefined => {
@@ -290,7 +346,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { activeId: activeModelId(deps.db, uid), providers: listModelProviders(deps.db, uid) });
   }
   if (path === "/api/models" && method === "POST") {
-    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string; kind?: unknown };
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string; kind?: unknown; multimodal?: unknown };
     const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
     const model = String(body.model ?? "").trim();
     try {
@@ -298,6 +354,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       if (model === "") throw new Error("model 必填");
       const kind = parseProviderKind(body.kind);
       const contextWindow = parseContextWindow(body.contextWindow, kind ?? "chat");
+      const multimodal = parseMultimodal(body.multimodal);
       const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
       const created = addModelProvider(deps.db, uid, {
         baseURL,
@@ -306,6 +363,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         ...(apiKey !== "" ? { keyEnc: seal(deps.masterKey, apiKey) } : {}),
         ...(typeof body.platform === "string" && body.platform.trim() !== "" ? { platform: body.platform.trim() } : {}),
         ...(kind !== undefined ? { kind } : {}),
+        // embedding 用途不接受图片，开关只对对话模型有意义
+        ...(multimodal !== undefined ? { multimodal: (kind ?? "chat") === "chat" ? multimodal : false } : {}),
       });
       return sendJson(res, 200, { id: created.id });
     } catch (error) {
@@ -318,8 +377,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const sub = modelsMatch[2] ?? "";
     try {
       if (sub === "" && method === "PUT") {
-        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; kind?: unknown };
-        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: "chat" | "embedding" } = {};
+        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; kind?: unknown; multimodal?: unknown };
+        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: "chat" | "embedding"; multimodal?: boolean } = {};
         if (body.baseURL !== undefined) {
           const baseURL = String(body.baseURL).trim().replace(/\/+$/, "");
           validateBaseURL(baseURL);
@@ -340,12 +399,17 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         }
         if (kind !== undefined) patch.kind = kind;
         if (contextWindow !== undefined) patch.contextWindow = contextWindow;
+        const multimodal = parseMultimodal(body.multimodal);
+        if (multimodal !== undefined) patch.multimodal = effectiveKind === "chat" ? multimodal : false;
         const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
         if (apiKey !== "") patch.keyEnc = seal(deps.masterKey, apiKey);
         updateModelProvider(deps.db, uid, providerId, patch);
+        // 该提供方的窗口/多模态开关变了：弃池受影响的会话，下一回合按新配置重装配
+        deps.conversations.evictProviderConversations(uid, providerId);
         return sendJson(res, 200, { ok: true });
       }
       if (sub === "" && method === "DELETE") {
+        deps.conversations.evictProviderConversations(uid, providerId); // 先弃池再删行（删后无从解析有效模型）
         removeModelProvider(deps.db, uid, providerId);
         return sendJson(res, 200, { ok: true });
       }
@@ -425,21 +489,40 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const sub = convMatch[2] ?? "";
 
     if (sub === "/events" && method === "GET") {
-      const rows = deps.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq").all(cid) as unknown as {
-        event_json: string;
-      }[];
-      return sendJson(res, 200, rows.map((row) => JSON.parse(row.event_json)));
+      // 归属校验（2026-09-23 越权修复）：会话不属于当前用户时按不存在处理，事件一个字节都不回
+      if (deps.conversations.ownerOf(cid) !== uid) return sendError(res, 404, "会话不存在");
+      // 分段参数（2026-09-23）：limit = 最近 N 条；before = 与 limit 连用的 seq 游标（取更早一段）
+      let before: number | undefined;
+      let limit: number | undefined;
+      if (url.searchParams.has("before")) {
+        const raw = Number(url.searchParams.get("before"));
+        if (!Number.isInteger(raw) || raw < 0) return sendError(res, 400, "before 需为非负整数");
+        before = raw;
+      }
+      if (url.searchParams.has("limit")) {
+        const raw = Number(url.searchParams.get("limit"));
+        if (!Number.isInteger(raw) || raw < 1 || raw > 200) return sendError(res, 400, "limit 需为 1-200 的整数");
+        limit = raw;
+      }
+      return sendJson(res, 200, deps.conversations.readEvents(cid, { before, limit }));
     }
 
     if (sub === "/messages" && method === "POST") {
-      const body = (await readBody(req)) as { text?: string };
+      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown };
       const text = String(body.text ?? "").trim();
-      if (text === "") return sendError(res, 400, "text 必填");
+      let attachments;
       try {
-        await deps.conversations.send(uid, cid, text);
+        attachments = parseAttachments(body.attachments).blocks;
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+      if (text === "" && attachments.length === 0) return sendError(res, 400, "text 或 attachments 必填");
+      try {
+        await deps.conversations.send(uid, cid, text, attachments);
         return sendJson(res, 202, { ok: true });
       } catch (error) {
-        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured");
+        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         throw error;
       }
     }
@@ -485,6 +568,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         await deps.conversations.switchAgent(uid, cid, String(body.agentId ?? ""));
         return sendJson(res, 200, { ok: true });
       } catch (error) {
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         return sendError(res, 404, String((error as Error).message));
       }
     }
@@ -499,6 +583,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         await deps.conversations.switchModel(uid, cid, providerId);
         return sendJson(res, 200, { ok: true });
       } catch (error) {
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         return sendError(res, 404, String((error as Error).message));
       }
     }

@@ -17,6 +17,15 @@ export interface ModelProvider {
   hasKey: boolean;
   /** 提供方用途：chat=对话/提取，embedding=记忆向量（2026-09-18） */
   kind: string;
+  /** 该模型是否支持图片识别（多模态）：对话里发图的前提 */
+  multimodal: boolean;
+}
+
+/** 用户形象（头像图片 data URL / emoji / 色盘） */
+export interface FaceLoose {
+  avatar: string;
+  emoji: string;
+  color: string;
 }
 
 export interface ConversationEntry {
@@ -54,18 +63,27 @@ export interface TodayView {
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
+/** 内容块宽松视图：文本 / 图片（base64）/ 文本附件 / 工具调用 */
+export interface BlockLoose {
+  type: string;
+  text?: string;
+  mediaType?: string;
+  data?: string;
+  name?: string;
+}
+
 export interface SessionEventLoose {
   type: string;
   seq?: number;
   ts?: number;
   channel?: string;
-  message?: { role: string; content: { type: string; text?: string }[]; reasoning?: string; interrupted?: boolean };
+  message?: { role: string; content: BlockLoose[]; reasoning?: string; interrupted?: boolean };
   id?: string;
   name?: string;
   args?: unknown;
   isError?: boolean;
   code?: string;
-  content?: { type: string; text?: string }[];
+  content?: BlockLoose[];
   reason?: string;
 }
 
@@ -78,7 +96,7 @@ export interface LiveEventLoose {
   id?: string;
   name?: string;
   isError?: boolean;
-  content?: { type: string; text?: string }[];
+  content?: BlockLoose[];
   code?: string;
   reason?: string;
   error?: string;
@@ -91,14 +109,33 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     let error = `HTTP ${res.status}`;
+    let code: string | undefined;
     try {
-      error = ((await res.json()) as { error?: string }).error ?? error;
+      const body = (await res.json()) as { error?: string; code?: string };
+      error = body.error ?? error;
+      code = body.code;
     } catch {
       /* 保持状态码文案 */
     }
-    throw Object.assign(new Error(error), { status: res.status });
+    throw Object.assign(new Error(error), { status: res.status, code });
   }
   return (await res.json()) as T;
+}
+
+export interface MeLoose {
+  username: string;
+  face: FaceLoose;
+}
+
+/** 一条待发附件（浏览器加工后的形态） */
+export interface AttachmentInput {
+  kind: "image" | "file";
+  name: string;
+  mediaType: string;
+  /** kind=image：base64 裸数据 */
+  dataBase64?: string;
+  /** kind=file：正文 */
+  text?: string;
 }
 
 export const api = {
@@ -107,13 +144,15 @@ export const api = {
   login: (username: string, password: string) =>
     request<{ uid: string; username: string }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  me: () => request<{ uid: string; username: string }>("/api/auth/me"),
+  me: () => request<MeLoose>("/api/auth/me"),
+  updateProfile: (patch: { avatar?: string; emoji?: string; color?: string }) =>
+    request<MeLoose>("/api/auth/profile", { method: "PUT", body: JSON.stringify(patch) }),
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
   getModels: () => request<{ activeId: string | null; providers: ModelProvider[] }>("/api/models"),
-  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string; kind?: string }) =>
+  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string; kind?: string; multimodal?: boolean }) =>
     request<{ id: string }>("/api/models", { method: "POST", body: JSON.stringify(input) }),
-  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null; kind?: string }) =>
+  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null; kind?: string; multimodal?: boolean }) =>
     request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
   activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
@@ -124,9 +163,19 @@ export const api = {
     request<ConversationEntry>("/api/conversations", { method: "POST", body: JSON.stringify(title ? { title } : {}) }),
   deleteConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}`, { method: "DELETE" }),
   autoTitle: (cid: string) => request<{ ok: boolean; title?: string }>(`/api/conversations/${cid}/title`, { method: "POST" }),
-  conversationEvents: (cid: string) => request<SessionEventLoose[]>(`/api/conversations/${cid}/events`),
-  sendMessage: (cid: string, text: string) =>
-    request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, { method: "POST", body: JSON.stringify({ text }) }),
+  /** 分段加载（2026-09-23）：limit = 最近 N 条；before = seq 游标（取更早一段）；都不传 = 全量 */
+  conversationEvents: (cid: string, options?: { before?: number; limit?: number }): Promise<SessionEventLoose[]> => {
+    const params = new URLSearchParams();
+    if (options?.before !== undefined) params.set("before", String(options.before));
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const query = params.toString();
+    return request<SessionEventLoose[]>(`/api/conversations/${cid}/events${query ? `?${query}` : ""}`);
+  },
+  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = []) =>
+    request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, {
+      method: "POST",
+      body: JSON.stringify(attachments.length > 0 ? { text, attachments } : { text }),
+    }),
 
   today: () => request<TodayView>(`/api/today?tz=${-new Date().getTimezoneOffset()}`),
   quickFlow: (input: { category: string; note?: string; value?: number; unit?: string }) =>

@@ -8,7 +8,12 @@ import {
   selectShadowInterval,
   type CompactDeps,
 } from "../src/harness/context/compact";
-import { heuristicMessageTokens, heuristicRequestTokens, heuristicTextTokens } from "../src/harness/context/meter";
+import {
+  IMAGE_HEURISTIC_TOKENS,
+  heuristicMessageTokens,
+  heuristicRequestTokens,
+  heuristicTextTokens,
+} from "../src/harness/context/meter";
 import { createAgent } from "../src/harness/core/agent";
 import { llmFailure } from "../src/harness/llm/errors";
 import { createMockLlmAdapter, type MockScriptStep } from "../src/harness/llm/mock";
@@ -57,6 +62,13 @@ describe("启发式计量", () => {
     expect(heuristicRequestTokens("abcd", [], [user("abcd")])).toBe(1 + 9);
     const tools = [{ name: "t", description: "d", parameters: { type: "object" } }];
     expect(heuristicRequestTokens("", tools, [])).toBe(heuristicTextTokens(JSON.stringify(tools)));
+  });
+
+  it("图片按单图固定视觉开销计（与 base64 长度无关）；文本附件按正文长度计", () => {
+    const image: UserMessage = { role: "user", content: [{ type: "image", mediaType: "image/webp", data: "A".repeat(400_000) }] };
+    expect(heuristicMessageTokens(image)).toBe(4 + 4 + IMAGE_HEURISTIC_TOKENS);
+    const file: UserMessage = { role: "user", content: [{ type: "file", name: "a.txt", mediaType: "text/plain", text: "abcd" }] };
+    expect(heuristicMessageTokens(file)).toBe(4 + 4 + 1);
   });
 });
 

@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { LlmAdapter } from "../harness/index";
+import { flattenText, type LlmAdapter, type UserMessage } from "../harness/index";
 import {
   MemoryStore,
   KIND_LABELS,
@@ -371,12 +371,8 @@ export class MemoryExtractor {
     const msgs: Msg[] = [];
     for (const row of rows) {
       try {
-        const event = JSON.parse(row.event_json) as { message?: { role?: string; content?: { type: string; text?: string }[] } };
-        const text = (event.message?.content ?? [])
-          .filter((b) => b.type === "text")
-          .map((b) => b.text ?? "")
-          .join("")
-          .trim();
+        const event = JSON.parse(row.event_json) as { message?: UserMessage };
+        const text = (event.message ? flattenText(event.message) : "").trim();
         if (text === "") continue;
         msgs.push({ eid: row.eid, cid: row.cid, ts: row.ts, role: event.message?.role ?? row.role ?? "user", text });
       } catch {
@@ -416,8 +412,8 @@ export class MemoryExtractor {
         .reverse()
         .map((row) => {
           try {
-            const event = JSON.parse(row.event_json) as { message?: { content?: { type: string; text?: string }[] } };
-            return (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+            const event = JSON.parse(row.event_json) as { message?: UserMessage };
+            return event.message ? flattenText(event.message) : "";
           } catch {
             return "";
           }

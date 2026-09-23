@@ -1,9 +1,11 @@
 // 批次1·server：HTTP 集成（真实 node:http 监听随机端口 + 全 mock adapter，零网络外呼；存储 = :memory: SQLite）。
 // 覆盖：注册/登录/401 门、会话消息驱动 Turn、SSE 首事件、/api/today 折叠、快速记录/作废/打卡、模型配置不回 Key。
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { get as httpGet } from "node:http";
+import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
 import { SessionStore, type UserRecord } from "../src/app/auth";
@@ -17,7 +19,7 @@ import { MemoryExtractor } from "../src/app/memory-extract";
 import { TaskStore } from "../src/app/tasks";
 import { NotificationStore } from "../src/app/notify";
 import { SqliteSessionLog } from "../src/app/session-log";
-import type { TaskDef } from "../src/app/tasks";
+import type { TaskDef, TaskRunTrigger } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
@@ -25,7 +27,10 @@ import { sleep } from "./helpers";
 
 let root: string;
 let baseUrl: string;
+let staticUrl: string;
 let cookie: string;
+/** 会话装配读到的模型能力开关：本文件的图片消息用例按需翻转（模拟「模型接入」里的多模态勾选） */
+let multimodalModel = false;
 const db = testDb();
 const users = new Map<string, UserRecord>();
 const ledgers = new Map<string, Promise<Ledger>>();
@@ -78,7 +83,7 @@ beforeAll(async () => {
       env: nodeEnv,
       sessionLog: (key) => Promise.resolve(SqliteSessionLog.open(db, key, () => Date.now())),
       ledgerFor,
-      modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
+      modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1", ...(multimodalModel ? { multimodal: true } : {}) }),
       adapterFactory: () => adapter as LlmAdapter,
       now: () => Date.now(),
       agents,
@@ -89,7 +94,7 @@ beforeAll(async () => {
     db,
   );
 
-  const server = createAppServer({
+  const serverDeps = {
     env: nodeEnv,
     db,
     masterKey,
@@ -106,14 +111,26 @@ beforeAll(async () => {
     memoryExtractor,
     tasks,
     notifications,
-    taskRunner: async (uidRun, task: TaskDef, run) => {
+    taskRunner: async (uidRun: string, task: TaskDef, run: TaskRunTrigger) => {
       await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（${run.kind}）${task.instruction}` });
     },
-  });
+  };
+  const server = createAppServer(serverDeps);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
   baseUrl = `http://127.0.0.1:${address.port}`;
-  shutdown = () => new Promise<void>((resolve) => server.close(() => resolve()));
+
+  // 静态托管专用实例：同一份 deps 挂临时静态目录（gzip 与缓存头断言用）
+  const staticRoot = join(root, "static");
+  await mkdir(join(staticRoot, "assets"), { recursive: true });
+  await writeFile(join(staticRoot, "index.html"), "<!doctype html><title>OpenPrism</title>");
+  await writeFile(join(staticRoot, "assets", "app-abc123.js"), 'console.log("op");\n'.repeat(400));
+  await writeFile(join(staticRoot, "manifest.webmanifest"), JSON.stringify({ name: "OpenPrism" }));
+  await writeFile(join(staticRoot, "icon.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const staticServer = createAppServer({ ...serverDeps, staticDir: staticRoot });
+  await new Promise<void>((resolve) => staticServer.listen(0, "127.0.0.1", resolve));
+  staticUrl = `http://127.0.0.1:${(staticServer.address() as { port: number }).port}`;
+  shutdown = () => new Promise<void>((resolve) => server.close(() => staticServer.close(() => resolve())));
 
   // 唯一注册用户，cookie 供全部用例复用
   const res = await fetch(`${baseUrl}/api/auth/register`, json({ username: "lathan", password: "hunter2" }));
@@ -556,5 +573,221 @@ describe("HTTP API 批次4（盘面/成长/合并归档/硬化）", () => {
     const listAfter = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { activeId: string | null; providers: unknown[] };
     expect(listAfter.providers).toHaveLength(1);
     expect(listAfter.activeId).toBe(addA.id); // 删激活行 → 回落到剩余的最近一个
+  });
+});
+
+describe("HTTP API 批次5（多模态图片与个人资料）", () => {
+  /** 合法 PNG 头 + 填充：附件校验只认签名，测试不依赖真实图片解码 */
+  const PNG_BASE64 = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(8, 1)]).toString("base64");
+  const post = (path: string, body: unknown): Promise<Response> =>
+    fetch(`${baseUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(body) });
+  const put = (path: string, body: unknown): Promise<Response> =>
+    fetch(`${baseUrl}${path}`, { method: "PUT", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(body) });
+
+  it("个人资料：me 默认空形象 → 保存 emoji/色盘/头像 → me 反映；外链头像 400；空串清空", async () => {
+    const before = (await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json()) as {
+      face: { avatar: string; emoji: string; color: string };
+    };
+    expect(before.face).toEqual({ avatar: "", emoji: "", color: "" });
+
+    const saved = (await (await put("/api/auth/profile", { emoji: "🦊", color: "#b0501e", avatar: "data:image/png;base64,AAAA" })).json()) as {
+      username: string;
+      face: { avatar: string; emoji: string; color: string };
+    };
+    expect(saved.username).toBe("lathan");
+    expect(saved.face).toEqual({ avatar: "data:image/png;base64,AAAA", emoji: "🦊", color: "#b0501e" });
+
+    const after = (await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json()) as { face: unknown };
+    expect(after.face).toEqual(saved.face);
+
+    expect((await put("/api/auth/profile", { avatar: "http://evil/a.png" })).status).toBe(400);
+    const cleared = (await (await put("/api/auth/profile", { avatar: "" })).json()) as { face: { avatar: string } };
+    expect(cleared.face.avatar).toBe("");
+  });
+
+  it("模型多模态开关：新增带标记 → 列表带出 → PUT 可改；embedding 用途强制关掉；非布尔 400", async () => {
+    const vision = (await (await post("/api/models", { baseURL: "https://api.openai.com/v1", model: "gpt-5.2", multimodal: true })).json()) as {
+      id: string;
+    };
+    const listed = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as {
+      providers: { id: string; multimodal: boolean; kind: string }[];
+    };
+    expect(listed.providers.find((p) => p.id === vision.id)).toMatchObject({ multimodal: true, kind: "chat" });
+
+    expect((await put(`/api/models/${vision.id}`, { multimodal: false })).status).toBe(200);
+    const off = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as {
+      providers: { id: string; multimodal: boolean }[];
+    };
+    expect(off.providers.find((p) => p.id === vision.id)!.multimodal).toBe(false);
+    expect((await put(`/api/models/${vision.id}`, { multimodal: true })).status).toBe(200);
+
+    const embedding = (await (
+      await post("/api/models", { baseURL: "https://api.jina.ai/v1", model: "jina-embeddings-v5-text-small", kind: "embedding", multimodal: true })
+    ).json()) as { id: string };
+    const withEmbedding = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as {
+      providers: { id: string; multimodal: boolean; kind: string }[];
+    };
+    expect(withEmbedding.providers.find((p) => p.id === embedding.id)).toMatchObject({ multimodal: false, kind: "embedding" });
+
+    expect((await post("/api/models", { baseURL: "https://x.example.com/v1", model: "x", multimodal: "也许" })).status).toBe(400);
+
+    // 清理：删掉本用例新增的两行，后面的用例按原有供应商列表断言
+    await fetch(`${baseUrl}/api/models/${vision.id}`, { method: "DELETE", headers: { cookie } });
+    await fetch(`${baseUrl}/api/models/${embedding.id}`, { method: "DELETE", headers: { cookie } });
+  });
+
+  it("图片消息：模型没勾多模态 → 409 model_not_multimodal；勾上后图片块随消息落库", async () => {
+    const attachment = { kind: "image", name: "shot.png", mediaType: "image/png", dataBase64: PNG_BASE64 };
+    const plainConv = (await (await post("/api/conversations", {})).json()) as { id: string };
+
+    const rejected = await post(`/api/conversations/${plainConv.id}/messages`, { text: "看看这张", attachments: [attachment] });
+    expect(rejected.status).toBe(409);
+    expect(((await rejected.json()) as { code?: string }).code).toBe("model_not_multimodal");
+    const eventsAfterReject = (await (await fetch(`${baseUrl}/api/conversations/${plainConv.id}/events`, { headers: { cookie } })).json()) as unknown[];
+    expect(eventsAfterReject).toHaveLength(0); // 回合没开始，一条事件都不落
+
+    const malformed = await post(`/api/conversations/${plainConv.id}/messages`, {
+      text: "坏附件",
+      attachments: [{ kind: "image", name: "a.png", mediaType: "image/png", dataBase64: "!!!not base64!!!" }],
+    });
+    expect(malformed.status).toBe(400);
+    expect(((await post(`/api/conversations/${plainConv.id}/messages`, { text: "空消息", attachments: [{ kind: "file", name: "a.md", mediaType: "text/markdown", text: " " }] })).status)).toBe(400);
+
+    multimodalModel = true;
+    try {
+      const visionConv = (await (await post("/api/conversations", {})).json()) as { id: string };
+      const accepted = await post(`/api/conversations/${visionConv.id}/messages`, {
+        text: "看看这张",
+        attachments: [attachment, { kind: "file", name: "note.md", mediaType: "text/markdown", text: "# 备注" }],
+      });
+      expect(accepted.status).toBe(202);
+
+      let events: { type: string; message?: { content: unknown[] } }[] = [];
+      for (let i = 0; i < 120; i++) {
+        await sleep(25);
+        events = (await (await fetch(`${baseUrl}/api/conversations/${visionConv.id}/events`, { headers: { cookie } })).json()) as typeof events;
+        if (events.some((e) => e.type === "turn/end")) break;
+      }
+      const userEvent = events.find((e) => e.type === "user/message")!;
+      expect(userEvent.message!.content).toEqual([
+        { type: "text", text: "看看这张" },
+        { type: "image", mediaType: "image/png", data: PNG_BASE64 },
+        { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 备注" },
+      ]);
+    } finally {
+      multimodalModel = false;
+    }
+  });
+
+  it("历史里有图片时切换模型/伙伴到不支持图片的模型 → 409", async () => {
+    multimodalModel = true;
+    try {
+      const conv = (await (await post("/api/conversations", {})).json()) as { id: string };
+      expect(
+        (
+          await post(`/api/conversations/${conv.id}/messages`, {
+            text: "看图",
+            attachments: [{ kind: "image", name: "shot.png", mediaType: "image/png", dataBase64: PNG_BASE64 }],
+          })
+        ).status,
+      ).toBe(202);
+      for (let i = 0; i < 120; i++) {
+        await sleep(25);
+        const events = (await (await fetch(`${baseUrl}/api/conversations/${conv.id}/events`, { headers: { cookie } })).json()) as { type: string }[];
+        if (events.some((e) => e.type === "turn/end")) break;
+      }
+      multimodalModel = false;
+      const plain = (await (await post("/api/models", { baseURL: "https://api.deepseek.com", model: "deepseek-chat" })).json()) as { id: string };
+      const switched = await put(`/api/conversations/${conv.id}/model`, { providerId: plain.id });
+      expect(switched.status).toBe(409);
+      expect(((await switched.json()) as { code?: string }).code).toBe("model_not_multimodal");
+      await fetch(`${baseUrl}/api/models/${plain.id}`, { method: "DELETE", headers: { cookie } });
+    } finally {
+      multimodalModel = false;
+    }
+  });
+});
+
+describe("静态托管与会话事件分段（2026-09-23 手机浏览器适配）", () => {
+  /** 裸 HTTP 请求：不经 fetch 的透明解压，直接看原始响应头与字节 */
+  const rawGet = (urlStr: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: Buffer }>((resolve, reject) => {
+      httpGet(urlStr, { headers }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(chunk as Buffer));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }));
+        res.on("error", reject);
+      }).on("error", reject);
+    });
+
+  it("gzip：Accept-Encoding 带 gzip 时文本资源压缩返回，Vary 与长缓存头正确", async () => {
+    const res = await rawGet(`${staticUrl}/assets/app-abc123.js`, { "Accept-Encoding": "gzip" });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-encoding"]).toBe("gzip");
+    expect(res.headers["vary"]).toBe("Accept-Encoding");
+    expect(res.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+    expect(gunzipSync(res.body).toString("utf8")).toBe('console.log("op");\n'.repeat(400));
+  });
+
+  it("不带 Accept-Encoding 时原样返回；PNG 二进制不压缩", async () => {
+    const js = await rawGet(`${staticUrl}/assets/app-abc123.js`);
+    expect(js.status).toBe(200);
+    expect(js.headers["content-encoding"]).toBeUndefined();
+    expect(js.body.toString("utf8")).toBe('console.log("op");\n'.repeat(400));
+    const png = await rawGet(`${staticUrl}/icon.png`, { "Accept-Encoding": "gzip" });
+    expect(png.headers["content-encoding"]).toBeUndefined();
+    expect(png.headers["content-type"]).toBe("image/png");
+    expect(png.headers["cache-control"]).toBe("public, max-age=604800");
+  });
+
+  it("入口与清单不缓存；webmanifest 的 Content-Type 正确", async () => {
+    const html = await rawGet(`${staticUrl}/`);
+    expect(html.status).toBe(200);
+    expect(String(html.headers["content-type"])).toContain("text/html");
+    expect(html.headers["cache-control"]).toBe("no-cache");
+    const manifest = await rawGet(`${staticUrl}/manifest.webmanifest`, { "Accept-Encoding": "gzip" });
+    expect(String(manifest.headers["content-type"])).toContain("application/manifest+json");
+    expect(manifest.headers["cache-control"]).toBe("no-cache");
+  });
+
+  it("events 归属校验：他人会话 404，本人 200", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: "{}" })
+    ).json()) as { id: string };
+    const mine = await fetch(`${baseUrl}/api/conversations/${created.id}/events`, { headers: { cookie } });
+    expect(mine.status).toBe(200);
+
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "intruder-1", password: "hunter2" }));
+    expect(reg.status).toBe(200);
+    const intruderCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const other = await fetch(`${baseUrl}/api/conversations/${created.id}/events`, { headers: { cookie: intruderCookie } });
+    expect(other.status).toBe(404);
+    expect(await other.text()).not.toContain("user/message");
+  });
+
+  it("events 分段：limit 取最近、before 向上翻页、非法参数 400", async () => {
+    const cid = "paging-conv-1";
+    db.prepare("INSERT INTO conversations (cid, uid, title, created_ts) VALUES (?, ?, '分段', 1000)").run(cid, users.get("lathan")!.uid);
+    const insert = db.prepare(
+      "INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES (?, ?, 'user/message', ?, 'user', ?)",
+    );
+    for (let i = 0; i < 7; i++) {
+      insert.run(cid, i, i, JSON.stringify({ type: "user/message", seq: i, ts: i, message: { role: "user", content: [{ type: "text", text: "m" + i }] } }));
+    }
+    const seqsOf = async (query: string) => {
+      const res = await fetch(`${baseUrl}/api/conversations/${cid}/events${query}`, { headers: { cookie } });
+      const body = (await res.json()) as { seq: number }[] | { error: string };
+      // 400 用例的 body 是 {error}，只有 200 才是事件数组
+      return { status: res.status, seqs: Array.isArray(body) ? body.map((e) => e.seq) : [] };
+    };
+    expect(await seqsOf("")).toEqual({ status: 200, seqs: [0, 1, 2, 3, 4, 5, 6] });
+    expect(await seqsOf("?limit=3")).toEqual({ status: 200, seqs: [4, 5, 6] });
+    expect(await seqsOf("?limit=3&before=4")).toEqual({ status: 200, seqs: [1, 2, 3] });
+    expect(await seqsOf("?limit=5&before=1")).toEqual({ status: 200, seqs: [0] });
+    expect(await seqsOf("?limit=5&before=0")).toEqual({ status: 200, seqs: [] });
+    expect((await seqsOf("?limit=0")).status).toBe(400);
+    expect((await seqsOf("?limit=201")).status).toBe(400);
+    expect((await seqsOf("?before=-1")).status).toBe(400);
+    expect((await seqsOf("?before=abc")).status).toBe(400);
   });
 });

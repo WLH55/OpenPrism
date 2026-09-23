@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
 import { Ledger, type FlowRecord } from "../src/app/ledger";
-import { ConversationStore, ModelNotConfiguredError } from "../src/app/conversations";
+import { ConversationStore, ModelNotConfiguredError, ModelNotMultimodalError } from "../src/app/conversations";
 import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
@@ -276,6 +276,109 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
   });
 });
 
+describe("ConversationStore（多模态图片输入）", () => {
+  const image = (data = "QUJD") => ({ type: "image" as const, mediaType: "image/webp", data });
+  const textStep = () => ({ kind: "fn" as const, fn: async () => ({ message: { role: "assistant" as const, content: [{ type: "text" as const, text: "ok" }] } }) });
+
+  it("模型没勾多模态：带图 send 就地拒绝，且一条事件都不产生（回合未开始）", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await expect(store.send(UID, entry.id, "看看这张", [image()])).rejects.toBeInstanceOf(ModelNotMultimodalError);
+    const count = db.prepare("SELECT COUNT(*) AS n FROM conversation_events").get() as unknown as { n: number };
+    expect(count.n).toBe(0);
+  });
+
+  it("模型勾了多模态：图片块随消息落日志，请求里原样重建（文本 + 图片 + 文本附件）", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([textStep()]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, multimodal: true });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "这是什么", [image("QUJD"), { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" }]);
+    await (await store.agent(UID, entry.id)).whenIdle();
+
+    expect(mock.requests[0]!.messages[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "这是什么" },
+        { type: "image", mediaType: "image/webp", data: "QUJD" },
+        { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" },
+      ],
+    });
+    const events = (await deps.base.sessionLog(entry.id)).readAll();
+    const userEvent = events.find((e) => e.type === "user/message") as Extract<typeof events[number], { type: "user/message" }>;
+    expect(userEvent.message.content).toHaveLength(3);
+  });
+
+  it("历史里有图片时切到不支持的模型 → 拒绝；没有图片的会话正常切", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([textStep(), textStep()]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, multimodal: true }, true);
+    const vision = addModelProvider(db, UID, { baseURL: MODEL.baseURL, model: "vision-1", multimodal: true });
+    const plain = addModelProvider(db, UID, { baseURL: MODEL.baseURL, model: "plain-1" });
+    const store = deps.makeStore();
+
+    const withImage = await store.create(UID);
+    await store.switchModel(UID, withImage.id, vision.id);
+    await store.send(UID, withImage.id, "看图", [image()]);
+    await (await store.agent(UID, withImage.id)).whenIdle();
+    await expect(store.switchModel(UID, withImage.id, plain.id)).rejects.toBeInstanceOf(ModelNotMultimodalError);
+
+    const textOnly = await store.create(UID);
+    await expect(store.switchModel(UID, textOnly.id, plain.id)).resolves.toBeUndefined();
+  });
+
+  it("切换伙伴时，新伙伴默认模型不支持图片也会被拦（会话没绑模型）", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([textStep()]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, multimodal: true }, true);
+    const vision = addModelProvider(db, UID, { baseURL: MODEL.baseURL, model: "vision-1", multimodal: true });
+    const plain = addModelProvider(db, UID, { baseURL: MODEL.baseURL, model: "plain-1" });
+    const blocker = await deps.agents.create(UID, {
+      name: "纯文字伙伴",
+      persona: "# 纯文字",
+      identity: { description: "", emoji: "", color: "", language: "", modelProviderId: plain.id },
+    });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.switchModel(UID, entry.id, vision.id);
+    await store.send(UID, entry.id, "看图", [image()]);
+    await (await store.agent(UID, entry.id)).whenIdle();
+    await store.switchModel(UID, entry.id, null); // 解绑后伙伴默认生效
+    // 解绑后有效模型 = 伙伴默认（纯文字）→ 这里本身就该被拦：图片还在历史里
+    await expect(store.switchAgent(UID, entry.id, blocker.id)).rejects.toBeInstanceOf(ModelNotMultimodalError);
+  });
+
+  it("兜底拦截：装配后模型被改回非多模态（伙伴默认模型变更弃池）→ 下一回合发请求前失败并说明原因", async () => {
+    const db = testDb();
+    const config: ModelConfig = { ...MODEL, multimodal: true };
+    const deps = makeDeps(db, createMockLlmAdapter([textStep()]).adapter as LlmAdapter, config);
+    const speaker = await deps.agents.create(UID, { name: "看图伙伴", persona: "# 看图" });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.switchAgent(UID, entry.id, speaker.id);
+    await store.send(UID, entry.id, "看图", [image()]);
+    await (await store.agent(UID, entry.id)).whenIdle();
+
+    config.multimodal = false; // 提供方设置被改回纯文字
+    store.evictAgentConversations(UID, speaker.id);
+    const agent = await store.agent(UID, entry.id);
+    const errors: string[] = [];
+    agent.subscribe((event) => {
+      if (event.type === "error") errors.push(event.error);
+    });
+    agent.followup("再说一句");
+    await agent.whenIdle();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("不支持图片识别");
+    const last = agent.sessionLog.readAll().at(-1) as { type: string; reason?: string };
+    expect(last).toMatchObject({ type: "turn/end", reason: "error" });
+  });
+});
+
 describe("ConversationStore（会话管理：删除 / 自动命名 / 定时提醒会话）", () => {
   it("remove：会话行与九事件一并删除；重复删抛错", async () => {
     const db = testDb();
@@ -385,5 +488,37 @@ describe("ConversationStore（批次3：任务会话）", () => {
     await (await store.taskAgent(UID, "tid-x", undefined)).whenIdle().catch(() => undefined);
     const count = store.collectSessionTexts(UID).length;
     expect(count).toBe(texts.length);
+  });
+});
+
+describe("ConversationStore（事件分段读取与归属，2026-09-23）", () => {
+  it("ownerOf：本人会话返回 uid，查无此行返回 undefined", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID, "归属测试");
+    expect(store.ownerOf(entry.id)).toBe(UID);
+    expect(store.ownerOf("no-such-cid")).toBeUndefined();
+  });
+
+  it("readEvents：无参数全量升序；limit 取最近；before 翻页更早一段；片段一律升序", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID, "分段测试");
+    const insert = db.prepare(
+      "INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES (?, ?, 'user/message', ?, 'user', ?)",
+    );
+    for (let i = 0; i < 7; i++) {
+      insert.run(entry.id, i, i, JSON.stringify({ type: "user/message", seq: i, ts: i, message: { role: "user", content: [{ type: "text", text: "m" + i }] } }));
+    }
+    const seqs = (events: { seq: number }[]) => events.map((e) => e.seq);
+    expect(seqs(store.readEvents(entry.id))).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(seqs(store.readEvents(entry.id, { limit: 3 }))).toEqual([4, 5, 6]);
+    expect(seqs(store.readEvents(entry.id, { limit: 3, before: 4 }))).toEqual([1, 2, 3]);
+    expect(seqs(store.readEvents(entry.id, { limit: 5, before: 1 }))).toEqual([0]);
+    expect(store.readEvents(entry.id, { limit: 5, before: 0 })).toEqual([]);
+    // 只传 before 不传 limit → 按缺省 50 条上限取
+    expect(seqs(store.readEvents(entry.id, { before: 6 }))).toEqual([0, 1, 2, 3, 4, 5]);
   });
 });

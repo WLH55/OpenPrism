@@ -178,10 +178,10 @@ export function Panels() {
         ))}
       </div>
 
-      {/* 汇总卡（随分类切换换色） */}
-      <div className="mb-5 grid grid-cols-3 gap-3">
-        {summaryCards.map(([label, num, unit]) => (
-          <div key={label} className="rounded-xl border border-line bg-surface px-4 py-3">
+      {/* 汇总卡（随分类切换换色；窄屏两列，第三张跨满行） */}
+      <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3">
+        {summaryCards.map(([label, num, unit], index) => (
+          <div key={label} className={index === 2 ? "col-span-2 rounded-xl border border-line bg-surface px-4 py-3 md:col-span-1" : "rounded-xl border border-line bg-surface px-4 py-3"}>
             <div className="text-xs text-ink2">{label}</div>
             <div className="num mt-1 text-xl font-semibold" style={{ color: label.startsWith("连续") ? "var(--warm)" : "var(--cat)" }}>
               {num}
@@ -225,10 +225,13 @@ export function Panels() {
           <h2 className="text-sm font-semibold text-ink">近 30 天热力图</h2>
           <span className="text-xs text-ink3">颜色深浅 = 当日记录数</span>
         </div>
-        <div id="heatmap">
+        {/* 固定 12px 格宽，30 天约 26 列，窄屏会超宽：容器内横向滚动，页面不撑破 */}
+        <div className="overflow-x-auto">
+          <div id="heatmap">
           {(view?.daily ?? []).map((d) => (
             <span key={d.date} className={`heat-${heatLevel(d.count)} rounded-[3px]`} title={`${d.date}：${d.count} 笔${d.total ? ` / ${d.total}` : ""}`} />
           ))}
+          </div>
         </div>
         <div className="mt-3 flex items-center justify-end gap-1.5 text-xs text-ink3">
           <span>少</span>

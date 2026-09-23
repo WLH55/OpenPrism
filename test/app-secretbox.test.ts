@@ -130,6 +130,22 @@ describe("模型供应商 CRUD（model_providers/model_active）", () => {
     expect(await readModelConfig(db, "u1")).toBeNull();
   });
 
+  it("多模态开关：新增带标记 → 列表与运行时配置都带；update 关掉后即时反映（缺省 false）", async () => {
+    const db = testDb();
+    const plain = addModelProvider(db, "u1", { baseURL: "https://api.deepseek.com", model: "deepseek-chat" });
+    const vision = addModelProvider(db, "u1", { baseURL: "https://api.openai.com/v1", model: "gpt-5.2", multimodal: true });
+    const views = await listModelProviders(db, "u1");
+    expect(views.find((v) => v.id === plain.id)!.multimodal).toBe(false);
+    expect(views.find((v) => v.id === vision.id)!.multimodal).toBe(true);
+    expect(readModelProviderConfig(db, "u1", vision.id)!.multimodal).toBe(true);
+    expect(readModelProviderConfig(db, "u1", plain.id)!.multimodal).toBeUndefined();
+
+    updateModelProvider(db, "u1", vision.id, { multimodal: false });
+    expect(readModelProviderConfig(db, "u1", vision.id)!.multimodal).toBeUndefined();
+    updateModelProvider(db, "u1", plain.id, { multimodal: true });
+    expect((await listModelProviders(db, "u1")).find((v) => v.id === plain.id)!.multimodal).toBe(true);
+  });
+
   it("readModelProviderConfig：按 id 取完整配置（含 keyEnc，测试连接用）", () => {
     const db = testDb();
     const a = addModelProvider(db, "u1", { baseURL: "https://api.deepseek.com", model: "deepseek-chat", keyEnc: seal(Buffer.alloc(32, 2), "sk-y") });

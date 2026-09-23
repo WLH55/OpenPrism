@@ -4,7 +4,10 @@ export type { PlatformEnv, EnvFetch, EnvFetchRequest, EnvFetchResponse, EnvReada
 export type {
   ContentBlock,
   TextBlock,
+  ImageBlock,
+  FileBlock,
   ToolCallBlock,
+  UserContent,
   Message,
   UserMessage,
   AssistantMessage,
@@ -12,6 +15,7 @@ export type {
   Usage,
   JsonSchema,
 } from "./types";
+export { flattenText, plainTextOf, hasImageBlocks, imageBlocksOf, fileBlocksOf, textBlocksOf, toolCallBlocksOf } from "./types";
 export { fnv1a } from "./util";
 
 export * from "./session/events";
@@ -51,6 +55,7 @@ export {
   heuristicMessageTokens,
   heuristicRequestTokens,
   codePointLength,
+  IMAGE_HEURISTIC_TOKENS,
 } from "./context/meter";
 export {
   compactConversation,
