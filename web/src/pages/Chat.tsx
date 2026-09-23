@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
 import { CheckSolidIcon, ChevronDownIcon, SwitchPartnerIcon } from "../icons";
 import { FaceAvatar } from "../components/FaceEditor";
+import { Markdown } from "../markdown";
 
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
@@ -377,8 +378,8 @@ export function Chat({
                     </div>
                   </details>
                 )}
-                <div className="whitespace-pre-wrap rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
-                  {item.text}
+                <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+                  <Markdown text={item.text} />
                 </div>
               </div>
             ) : (
@@ -405,7 +406,9 @@ export function Chat({
                 </details>
               )}
               {stream.text !== "" && (
-                <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">{stream.text}</div>
+                <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+                  <Markdown text={stream.text} />
+                </div>
               )}
             </div>
           )}
