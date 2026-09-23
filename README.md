@@ -37,6 +37,7 @@
 
 ## ✨ 最近更新
 
+- **手机浏览器适配与公网部署** — 窄屏（< 768px）自动切换：底部五项标签栏 + 左滑抽屉、聊天头部收纳、拍照直入上传；会话事件分段加载（最近 50 条起，触顶续取）；静态资源 gzip 与文件名哈希长缓存；应用清单与图标（添加到主屏幕）；修复会话事件接口的跨用户越权读取；部署与端口映射说明见 [docs/deployment.md](./docs/deployment.md)。
 - **记忆主题计数与向量召回** — 记忆条目附带的话题走三级归一（精确 → 字面模糊 → 模型裁决），计数达阈值自动晋升为"兴趣"条目；接入 embedding 提供方后，召回从纯字面升级为余弦扫描 + 词法结果按 RRF 名次融合，查询向量带缓存，启动时回填历史条目向量，向量侧失败自动退回纯字面召回。
 - **记忆机制条目化重构** — 长期记忆从四槽 markdown 换成条目库（`kind` × `status` × `origin`），采用条目模型；提取改为对话后约 90 秒去抖的后台蒸馏，决策制产出 add / update / delete，每晚 2–5 点窗口做一次整理（合并冗余、过期归档、陈旧降级）。
 - **存储引擎 SQLite 化（ADR 0008）** — 应用层持久层从 append-only JSONL 换成 SQLite（Node 内置 `node:sqlite`），13 张以上领域表；启动只载用户表，账本、会话、任务按 uid 懒加载；备份用 `VACUUM INTO`。切换前的 `*.jsonl` 数据在首次启动时导入一次，原文件保留。
@@ -194,7 +195,7 @@ sequenceDiagram
 | 多用户 | 注册登录（scrypt 慢哈希 + 常量时间比较），登录会话令牌重启不掉线；按 uid 隔离全部数据 |
 | BYOK | 多供应商列表，chat 与 embedding 分用途；adapter 每次调用现读配置；连接测试按钮发一次最小请求 |
 | 数据形态 | 一个 SQLite 文件 + 一把主密钥；备份用 `VACUUM INTO`；旧版 JSONL 首启自动导入 |
-| 部署 | 本机、局域网、公网共用同一份代码；环境变量 `OP_DATA` / `OP_PORT` / `OP_DB` |
+| 部署 | 本机、局域网、公网共用同一份代码；环境变量 `OP_DATA` / `OP_PORT` / `OP_DB`；手机浏览器窄屏自适应（底部标签栏 + 抽屉），见 [docs/deployment.md](./docs/deployment.md) |
 | 硬化 | 静态托管前缀校验防目录穿越、安全响应头、请求体 1 MiB 上限、注册与登录限速、Cookie `HttpOnly; SameSite=Lax` |
 
 ## 🚀 快速开始
@@ -216,6 +217,8 @@ pnpm start         # 启动服务，默认 http://127.0.0.1:8787
 ```
 
 打开 **http://127.0.0.1:8787** ，先注册一个账号，再到「模型接入」页填你自己的 `baseURL`、模型名与 Key（DeepSeek / GLM / Qwen / Moonshot / OpenRouter / 任何 OpenAI 兼容端点都可以），点一次连接测试，然后就能开聊了。
+
+手机（同一 Wi-Fi）直接访问 `http://<电脑局域网地址>:8787`，界面按窄屏自动切换；部署到服务器与路由器端口映射的步骤见 [docs/deployment.md](./docs/deployment.md)。
 
 > `pnpm start` 会用 `tsx` 直接跑 TypeScript 源码，不需要编译步骤。想让改动自动重启，用 `pnpm dev:server`。
 
@@ -260,7 +263,7 @@ pnpm dev:web      # Vite 开发服务器，前端热更新，按提示的地址�
 | 健康检查 | `GET /api/health` |
 | 认证 | `POST /api/auth/register`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me` |
 | 模型接入 | `GET\|POST /api/models`、`PUT\|DELETE /api/models/:id`、`PUT /api/models/:id/active`、`POST /api/models/:id/test` |
-| 会话 | `GET\|POST /api/conversations`、`DELETE /api/conversations/:cid`、`POST /api/conversations/:cid/title`、`GET /api/conversations/:cid/events`、`POST /api/conversations/:cid/messages`、`GET /api/conversations/:cid/stream`、`GET /api/conversations/:cid/meta`、`PUT /api/conversations/:cid/agent`、`PUT /api/conversations/:cid/model` |
+| 会话 | `GET\|POST /api/conversations`、`DELETE /api/conversations/:cid`、`POST /api/conversations/:cid/title`、`GET /api/conversations/:cid/events`（`?limit=&before=` 按 seq 分段，无参数全量）、`POST /api/conversations/:cid/messages`、`GET /api/conversations/:cid/stream`、`GET /api/conversations/:cid/meta`、`PUT /api/conversations/:cid/agent`、`PUT /api/conversations/:cid/model` |
 | 账本 | `GET /api/today`、`POST /api/flows`、`POST /api/void`、`POST /api/checkin` |
 | 面板 | `GET /api/panels`、`GET /api/panels/category/:name`、`GET /api/panels/progress`、`POST /api/panels/merge`、`POST /api/panels/archive`、`POST /api/panels/unarchive` |
 | 伙伴 | `GET\|POST /api/agents`、`GET\|DELETE /api/agents/:id`、`PUT /api/agents/:id/persona`、`PUT /api/agents/:id/identity`、`PUT /api/agents/:id/binding` |
@@ -340,7 +343,7 @@ pnpm test
 ## 🔒 安全说明
 
 - **Key 政策**：BYOK。Key 只以 AES-256-GCM 密文落盘，主密钥在 `data/secret.key`（已 gitignore，切勿入库或分享）；接口只回传"是否已配置"，永不回传明文。
-- **部署位置**：公网暴露前请确认已经配好反向代理与 HTTPS、限制注册入口，并按需收紧登录限速；自用场景建议只监听局域网或本机。
+- **部署位置**：公网暴露前请确认已经配好反向代理与 HTTPS、限制注册入口，并按需收紧登录限速；自用场景建议只监听局域网或本机。按明文 HTTP + 端口映射部署时，口令与聊天内容在网络上不加密，风险与加固路径见 [docs/deployment.md](./docs/deployment.md)。
 - **信任边界**：技能是改提示词（低危），MCP 是把数据外发给第三方（中危）——安装时告知一次，绑定即授权，运行中不逐次审批。公网形态禁用本地命令型 MCP。
 - **无审批与沙箱**：本项目的 harness 不含审批、沙箱、文件写入意图门（设计上刻意排除，理由见 ADR 0006）。应用层给模型的工具只有账本、技能、记忆与任务四组，没有执行任意命令或写任意文件的能力。
 - **数据主权**：全部数据在 `OP_DB` 指向的单个 SQLite 文件里，随时可整包带走。
@@ -374,6 +377,7 @@ pnpm typecheck     # 零错误
 | [docs/design/2026-09-app.md](./docs/design/2026-09-app.md) | 应用功能设计纪要，逐条决策与理由 |
 | [docs/design/2026-09-app-implemented.md](./docs/design/2026-09-app-implemented.md) | 实现汇报：每个功能的原理、代码位置与实现要点 |
 | [docs/architecture.md](./docs/architecture.md) | 三层架构图与消息链路、记忆管线 |
+| [docs/deployment.md](./docs/deployment.md) | 部署指南：服务器启动、手机接入、公网端口映射与风险、备份升级 |
 | [docs/2026-09-structure.md](./docs/2026-09-structure.md) | 逐文件代码结构说明 |
 | [CONTEXT.md](./CONTEXT.md) | 领域术语表（harness 与 app 两节） |
 | [docs/adr/](./docs/adr/) | 架构决策记录 |

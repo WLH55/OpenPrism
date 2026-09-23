@@ -13,7 +13,29 @@ export interface ToolCallBlock {
   arguments: unknown;
 }
 
-export type ContentBlock = TextBlock | ToolCallBlock;
+/** 图片（多模态输入）：data 为 base64 裸数据（不含 data: 前缀），adapter 拼成自家协议的图片部件 */
+export interface ImageBlock {
+  type: "image";
+  /** MIME 类型，如 image/png */
+  mediaType: string;
+  /** base64 裸数据 */
+  data: string;
+}
+
+/** 文本附件（上传的文件）：正文随块入日志，模型与界面都能重建 */
+export interface FileBlock {
+  type: "file";
+  /** 原始文件名 */
+  name: string;
+  /** MIME 类型，如 text/markdown */
+  mediaType: string;
+  text: string;
+}
+
+export type ContentBlock = TextBlock | ImageBlock | FileBlock | ToolCallBlock;
+
+/** 用户输入的两种写法：纯文本 / 带附件的块序列 */
+export type UserContent = string | ContentBlock[];
 
 export interface UserMessage {
   role: "user";
@@ -46,6 +68,47 @@ export function textBlocksOf(message: Message): TextBlock[] {
 
 export function toolCallBlocksOf(message: Message): ToolCallBlock[] {
   return message.content.filter((b): b is ToolCallBlock => b.type === "tool_call");
+}
+
+export function imageBlocksOf(message: Message): ImageBlock[] {
+  return message.content.filter((b): b is ImageBlock => b.type === "image");
+}
+
+export function fileBlocksOf(message: Message): FileBlock[] {
+  return message.content.filter((b): b is FileBlock => b.type === "file");
+}
+
+function fileSection(block: FileBlock): string {
+  return `【附件 ${block.name}】\n${block.text}`;
+}
+
+/** 文本与附件正文的拼接（不含图片）：adapter 的 wire 文本就用这一份 */
+export function plainTextOf(message: Message): string {
+  const parts: string[] = [];
+  for (const block of message.content) {
+    if (block.type === "text") parts.push(block.text);
+    else if (block.type === "file") parts.push(fileSection(block));
+  }
+  return parts.join("\n");
+}
+
+/**
+ * 消息的纯文本投影：文本原样、附件正文带文件名抬头并入、图片记为占位符。
+ * 供界面显示、会话标题、召回 query、记忆提取等所有"只需要文字"的场合使用。
+ */
+export function flattenText(message: Message): string {
+  const parts: string[] = [];
+  for (const block of message.content) {
+    if (block.type === "text") parts.push(block.text);
+    else if (block.type === "file") parts.push(fileSection(block));
+    else if (block.type === "image") parts.push(`【图片 ${block.mediaType}】`);
+  }
+  return parts.join("\n");
+}
+
+/** 消息里是否带图片（多模态能力拦截用） */
+export function hasImageBlocks(message: Message): boolean {
+  return message.content.some((b) => b.type === "image");
 }
 
 // 精确 usage（账单统计轨，设计 §5.1）：input 为请求总输入（含缓存命中），cacheRead 为命中部分。

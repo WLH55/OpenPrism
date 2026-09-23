@@ -5,6 +5,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { extractAgentName } from "./persona";
+import { validateFace } from "./avatar";
 
 /** 伙伴身份（向导第①步 + 心智的默认模型） */
 export interface AgentIdentity {
@@ -17,20 +18,14 @@ export interface AgentIdentity {
 }
 
 const LANGUAGES = ["", "zh", "en"];
-const AVATAR_RE = /^data:image\/(png|jpeg|webp|gif|svg\+xml);base64,[A-Za-z0-9+/=]+$/;
-const AVATAR_MAX = 200_000;
-const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 /** 身份字段校验（store 层守门，路由与测试共用）；非法即抛错 */
 export function validateIdentityPatch(patch: Partial<AgentIdentity & { name?: string }>): void {
   if (patch.name !== undefined && String(patch.name).length > 64) throw new Error("name 超过 64 字上限");
   if (patch.description !== undefined && String(patch.description).length > 500) throw new Error("description 超过 500 字上限");
-  if (patch.emoji !== undefined && String(patch.emoji).length > 16) throw new Error("emoji 超过 16 字上限");
   if (patch.name !== undefined && String(patch.name).trim() === "") throw new Error("name 不能为空");
-  if (patch.avatar !== undefined && patch.avatar !== "" && !AVATAR_RE.test(patch.avatar)) throw new Error("avatar 必须是 data:image/* base64");
-  if (patch.avatar !== undefined && patch.avatar.length > AVATAR_MAX) throw new Error(`avatar 超过 ${AVATAR_MAX} 字符上限`);
   if (patch.language !== undefined && !LANGUAGES.includes(patch.language)) throw new Error("language 只能是 '' | zh | en");
-  if (patch.color !== undefined && patch.color !== "" && !COLOR_RE.test(patch.color)) throw new Error("color 需要 #rrggbb");
+  validateFace(patch);
 }
 
 export interface AgentEntry {

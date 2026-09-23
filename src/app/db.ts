@@ -14,7 +14,10 @@ CREATE TABLE IF NOT EXISTS users (
   username   TEXT NOT NULL UNIQUE,
   salt       TEXT NOT NULL,
   pwd_hash   TEXT NOT NULL,
-  created_ts INTEGER NOT NULL
+  created_ts INTEGER NOT NULL,
+  avatar     TEXT,
+  emoji      TEXT NOT NULL DEFAULT '',
+  color      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -286,7 +289,8 @@ CREATE TABLE IF NOT EXISTS model_providers (
   model          TEXT NOT NULL,
   context_window INTEGER,
   key_enc        TEXT,
-  created_ts     INTEGER NOT NULL
+  created_ts     INTEGER NOT NULL,
+  multimodal     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_model_providers_uid ON model_providers(uid, created_ts);
 
@@ -407,6 +411,11 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "memory_meta", "interest_threshold", "INTEGER");
   ensureColumn(db, "memory_meta", "embedding_provider_id", "TEXT");
   ensureColumn(db, "model_providers", "kind", "TEXT NOT NULL DEFAULT 'chat'"); // 提供方用途（chat|embedding，2026-09-18）
+  ensureColumn(db, "model_providers", "multimodal", "INTEGER NOT NULL DEFAULT 0"); // 该模型是否支持图片识别（对话里发图的前提）
+  // 用户形象（头像/emoji/色盘，与 agents 同字段同校验）
+  ensureColumn(db, "users", "avatar", "TEXT");
+  ensureColumn(db, "users", "emoji", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "users", "color", "TEXT NOT NULL DEFAULT ''");
   ensureInterestKind(db); // 存量库 kind CHECK 补 interest（重建表，幂等）
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;

@@ -130,6 +130,27 @@ export const CheckSolidIcon = ({ className = "h-4 w-4" }: P) => (
     />
   </svg>
 );
+export const MenuIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M4 6h16M4 12h16M4 18h16" />
+  </svg>
+);
+export const CloseIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M18 6 6 18M6 6l12 12" />
+  </svg>
+);
+export const CameraIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z" />
+    <circle cx="12" cy="13" r="3" />
+  </svg>
+);
+export const SlidersIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M3 4h7m4 0h7M14 2v4M3 12h5m4 0h9M8 10v4M3 20h9m4 0h5M16 18v4" />
+  </svg>
+);
 export const InfoIcon = ({ className = "h-4 w-4" }: P) => (
   <svg className={className} viewBox="0 0 20 20" fill="currentColor">
     <path

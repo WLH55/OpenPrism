@@ -37,6 +37,13 @@
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
 
+/* 手机浏览器（2026-09-23）：地址栏收放跟随用 dvh；不支持 dvh 的内核退回 vh；
+   overscroll 收在容器内，避免页面整页橡皮筋把聊天滚走 */
+@supports not (height: 100dvh) {
+  .h-dvh { height: 100vh; }
+}
+body { overscroll-behavior-y: contain; }
+
 @layer base {
   body {
     margin: 0;

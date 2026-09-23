@@ -3,7 +3,7 @@
 // fetch 由 PlatformEnv 注入；usage 归一（prompt_tokens 为总输入，缓存命中单列 cacheRead）。
 
 import type { EnvFetchResponse, PlatformEnv } from "../env";
-import type { AssistantMessage, Message, ToolCallBlock, Usage } from "../types";
+import { flattenText, imageBlocksOf, plainTextOf, type AssistantMessage, type Message, type ToolCallBlock, type Usage } from "../types";
 import type { LlmAdapter, LlmCallOptions, LlmEmbeddingRequest, LlmEmbeddingResponse, LlmRequest, LlmResponse } from "./adapter";
 import { isAbortLike, isLlmFailure, llmFailure, looksLikeContextOverflow, looksLikeQuota } from "./errors";
 import { IncrementalUtf8Decoder } from "./utf8";
@@ -16,20 +16,28 @@ export interface OpenAICompatConfig {
   extraHeaders?: Record<string, string>;
 }
 
+type WireContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
 interface WireMessage {
   role: string;
-  content?: string;
+  content?: string | WireContentPart[];
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-function textOf(message: Message): string {
-  return message.content
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
+/** 用户消息线上内容：纯文字走字符串，含图片走部件数组（图片以 data URL 传） */
+function toWireUserContent(message: Message): string | WireContentPart[] {
+  const images = imageBlocksOf(message);
+  const text = plainTextOf(message);
+  if (images.length === 0) return text;
+  const parts: WireContentPart[] = [];
+  if (text !== "") parts.push({ type: "text", text });
+  for (const image of images) {
+    parts.push({ type: "image_url", image_url: { url: `data:${image.mediaType};base64,${image.data}` } });
+  }
+  return parts;
 }
 
 function toWireMessages(request: LlmRequest): WireMessage[] {
@@ -37,9 +45,9 @@ function toWireMessages(request: LlmRequest): WireMessage[] {
   if (request.system) out.push({ role: "system", content: request.system });
   for (const message of request.messages) {
     if (message.role === "user") {
-      out.push({ role: "user", content: textOf(message) });
+      out.push({ role: "user", content: toWireUserContent(message) });
     } else if (message.role === "assistant") {
-      const wire: WireMessage = { role: "assistant", content: textOf(message) };
+      const wire: WireMessage = { role: "assistant", content: flattenText(message) };
       const calls = message.content.filter((b): b is ToolCallBlock => b.type === "tool_call");
       if (calls.length > 0) {
         wire.tool_calls = calls.map((call) => ({
@@ -50,7 +58,7 @@ function toWireMessages(request: LlmRequest): WireMessage[] {
       }
       out.push(wire);
     } else {
-      out.push({ role: "tool", tool_call_id: message.callId, content: textOf(message) });
+      out.push({ role: "tool", tool_call_id: message.callId, content: flattenText(message) });
     }
   }
   return out;

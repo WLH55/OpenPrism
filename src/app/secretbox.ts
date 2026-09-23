@@ -51,6 +51,8 @@ export interface ModelConfig {
   keyEnc?: string;
   /** 提供方用途（2026-09-18）：chat=对话/提取，embedding=记忆向量；缺省 chat */
   kind?: ModelProviderKind;
+  /** 该模型是否支持图片识别（多模态）：对话里发图的前提；缺省 false */
+  multimodal?: boolean;
 }
 
 export type ModelProviderKind = "chat" | "embedding";
@@ -63,6 +65,7 @@ export interface ModelProviderView {
   contextWindow: number | null;
   hasKey: boolean;
   kind: ModelProviderKind;
+  multimodal: boolean;
 }
 
 const PLATFORM_PATTERNS: [RegExp, string][] = [
@@ -101,6 +104,7 @@ interface ProviderRow {
   key_enc: string | null;
   created_ts: number;
   kind: string | null;
+  multimodal: number;
 }
 
 function rowToConfig(row: ProviderRow): ModelConfig {
@@ -112,6 +116,7 @@ function rowToConfig(row: ProviderRow): ModelConfig {
     ...(row.context_window !== null ? { contextWindow: row.context_window } : {}),
     ...(row.key_enc !== null ? { keyEnc: row.key_enc } : {}),
     kind: row.kind === "embedding" ? "embedding" : "chat",
+    ...(row.multimodal === 1 ? { multimodal: true } : {}),
   };
 }
 
@@ -129,7 +134,7 @@ function activateIfFirst(db: DatabaseSync, uid: string, id: string): void {
 export function addModelProvider(
   db: DatabaseSync,
   uid: string,
-  input: { baseURL: string; model: string; contextWindow?: number | null; keyEnc?: string; platform?: string; kind?: ModelProviderKind },
+  input: { baseURL: string; model: string; contextWindow?: number | null; keyEnc?: string; platform?: string; kind?: ModelProviderKind; multimodal?: boolean },
 ): ModelConfig & { id: string } {
   const config: ModelConfig = {
     baseURL: input.baseURL,
@@ -137,12 +142,24 @@ export function addModelProvider(
     ...(input.contextWindow !== undefined && input.contextWindow !== null ? { contextWindow: input.contextWindow } : {}),
     ...(input.keyEnc !== undefined ? { keyEnc: input.keyEnc } : {}),
     ...(input.kind !== undefined ? { kind: input.kind } : {}),
+    ...(input.multimodal ? { multimodal: true } : {}),
   };
   const id = randomUUID();
   const platform = input.platform?.trim() !== "" && input.platform !== undefined ? input.platform.trim() : platformFromBaseURL(input.baseURL);
   db.prepare(
-    "INSERT INTO model_providers (id, uid, platform, base_url, model, context_window, key_enc, created_ts, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-  ).run(id, uid, platform, config.baseURL, config.model, config.contextWindow ?? null, config.keyEnc ?? null, Date.now(), config.kind ?? "chat");
+    "INSERT INTO model_providers (id, uid, platform, base_url, model, context_window, key_enc, created_ts, kind, multimodal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    id,
+    uid,
+    platform,
+    config.baseURL,
+    config.model,
+    config.contextWindow ?? null,
+    config.keyEnc ?? null,
+    Date.now(),
+    config.kind ?? "chat",
+    config.multimodal ? 1 : 0,
+  );
   activateIfFirst(db, uid, id);
   return { ...config, id, platform };
 }
@@ -151,7 +168,7 @@ export function updateModelProvider(
   db: DatabaseSync,
   uid: string,
   id: string,
-  patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: ModelProviderKind },
+  patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: ModelProviderKind; multimodal?: boolean },
 ): void {
   const row = getRow(db, uid, id);
   if (!row) throw new Error(`model provider "${id}" 不存在`);
@@ -161,11 +178,12 @@ export function updateModelProvider(
     contextWindow: patch.contextWindow !== undefined ? patch.contextWindow : row.context_window,
     keyEnc: patch.keyEnc !== undefined ? patch.keyEnc : row.key_enc,
     kind: patch.kind ?? (row.kind === "embedding" ? "embedding" : "chat"),
+    multimodal: patch.multimodal !== undefined ? (patch.multimodal ? 1 : 0) : row.multimodal,
   };
   const platform = patch.baseURL !== undefined ? platformFromBaseURL(next.baseURL) : row.platform;
   db.prepare(
-    "UPDATE model_providers SET base_url = ?, model = ?, context_window = ?, key_enc = ?, platform = ?, kind = ? WHERE id = ? AND uid = ?",
-  ).run(next.baseURL, next.model, next.contextWindow, next.keyEnc, platform, next.kind, id, uid);
+    "UPDATE model_providers SET base_url = ?, model = ?, context_window = ?, key_enc = ?, platform = ?, kind = ?, multimodal = ? WHERE id = ? AND uid = ?",
+  ).run(next.baseURL, next.model, next.contextWindow, next.keyEnc, platform, next.kind, next.multimodal, id, uid);
 }
 
 export function removeModelProvider(db: DatabaseSync, uid: string, id: string): void {
@@ -200,6 +218,7 @@ export function listModelProviders(db: DatabaseSync, uid: string): ModelProvider
     contextWindow: row.context_window,
     hasKey: row.key_enc !== null,
     kind: row.kind === "embedding" ? "embedding" : "chat",
+    multimodal: row.multimodal === 1,
   }));
 }
 

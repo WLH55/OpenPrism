@@ -1,6 +1,6 @@
 # OpenPrism 架构图
 
-> 基于分支 feat/design-standalone 当前代码（提交 22048af）。三层结构：web/ 前端、src/app/ 应用层、src/harness/ 核心库，靠两条缝连接——harness 经 PlatformEnv / FileIO / SessionLog 接口获得平台能力，前端经 HTTP + SSE 与应用层通信。
+> 基于分支 feat/design-standalone 当前代码。三层结构：web/ 前端、src/app/ 应用层、src/harness/ 核心库，靠两条缝连接——harness 经 PlatformEnv / FileIO / SessionLog 接口获得平台能力，前端经 HTTP + SSE 与应用层通信。
 
 ## 总体架构
 
@@ -8,22 +8,26 @@
 flowchart TB
     %% ===== 前端 =====
     subgraph WEB["web/ 前端（React 18 + Vite + Tailwind）"]
-        SHELL["App.tsx 应用壳<br/>登录门 + 侧栏导航 + 视图切换"]
-        PAGES["Chat 聊天 · Today 今天 · Panels 盘面 · Progress 成长<br/>Agents 伙伴 · Tasks 提醒 · Skills 技能 · Memory 记忆<br/>Settings 模型接入 · NotifyChannels 通知通道 · Login"]
+        SHELL["App.tsx 应用壳（100dvh）<br/>登录门 + 视图切换<br/>桌面侧栏 / 窄屏抽屉 + 底部标签栏"]
+        PAGES["Chat 聊天 · Today 今天 · Panels 盘面 · Progress 成长<br/>Agents 伙伴 · Tasks 提醒 · Skills 技能 · Memory 记忆<br/>Settings 模型接入 · NotifyChannels 通知通道 · Profile 个人资料 · Login"]
         WIZ["AgentWizard 伙伴五步向导<br/>FaceEditor 形象编辑 · soulTemplates 形象模板"]
-        APIC["api.ts API 客户端<br/>fetch 封装 + EventSource 实时流"]
-        SHELL --> PAGES & WIZ
-        PAGES --> APIC
+        ATTACH["Attachments 附件托盘<br/>图片缩放转 WebP · 文本文件读成正文<br/>窄屏另有拍照直入入口"]
+        MNAV["MobileNav 窄屏导航<br/>底部五项标签栏 + 左滑抽屉（安卓返回键收起）"]
+        APIC["api.ts API 客户端<br/>fetch 封装 + EventSource 实时流<br/>事件分段：limit 最近 N 条 · before 向上翻页"]
+        SHELL --> PAGES & WIZ & MNAV
+        PAGES --> APIC & ATTACH
         WIZ --> APIC
     end
 
     %% ===== 应用层 =====
     subgraph APP["src/app/ 应用层（Node ≥ 22.13，唯一可碰平台 API 的层）"]
         MAIN["main.ts 进程入口：装配全部服务"]
-        SRV["server.ts HTTP 路由<br/>auth · models · conversations · agents · skills · mcps<br/>memory · tasks · notifications · flows · checkin · panels · progress<br/>静态托管 web/dist"]
+        SRV["server.ts HTTP 路由<br/>auth · models · conversations · agents · skills · mcps<br/>memory · tasks · notifications · flows · checkin · panels · progress<br/>静态托管 web/dist（gzip 协商 + 哈希资源长缓存）<br/>events 按归属校验（非本人 404）"]
         AUTH["auth.ts 注册登录<br/>scrypt 慢哈希 + SessionStore 会话令牌"]
-        SB["secretbox.ts BYOK 密封<br/>AES-256-GCM · 多供应商配置（model_providers）"]
-        CONV["conversations.ts 会话池<br/>一个会话 = 一个 harness Agent<br/>adapter 每次调用现读配置，改设置即时生效"]
+        SB["secretbox.ts BYOK 密封<br/>AES-256-GCM · 多供应商配置（model_providers）<br/>kind：chat / embedding · multimodal 图片识别开关"]
+        CONV["conversations.ts 会话池<br/>一个会话 = 一个 harness Agent<br/>adapter 每次调用现读配置，改设置即时生效<br/>图片输入的多模态闸门（发送 / 切换 / 装配三处）"]
+        ATTS["attachments.ts 附件校验<br/>图片签名与上限 · 文本附件 · 内容块构造"]
+        AVA["avatar.ts 形象字段校验<br/>头像 data URL / emoji / 色盘，用户与伙伴共用"]
         SLOG["session-log.ts SqliteSessionLog<br/>SessionLog 缝的 SQLite 实现<br/>九事件落 conversation_events"]
         LEDT["tools.ts 账本录入工具<br/>record_flow / create_plan / checkin_plan<br/>query_ledger / void_flow / cancel_plan"]
         PER["persona.ts system prompt 合成<br/>人设卡 + 日期 + 记忆块 + 行为纪律"]
@@ -75,9 +79,10 @@ flowchart TB
     %% ===== 应用层内部 =====
     MAIN --> DB
     MAIN --> SRV & CONV & TSK & MEXT & AUTH & SB
-    SRV --> AUTH & CONV & LG & FOLD & AGT & SKL & MCPC & MEM & TSK & NTF & SB
+    SRV --> AUTH & CONV & LG & FOLD & AGT & SKL & MCPC & MEM & TSK & NTF & SB & ATTS & AVA
     CONV -- "装配：工具集快照 + systemPrompt 每步重取 + adapter 现读配置" --> AGENT
-    CONV --> SLOG & LEDT & PER & SKL & MCPC & MEM
+    CONV --> SLOG & LEDT & PER & SKL & MCPC & MEM & ATTS
+    AGT & AUTH --> AVA
     LEDT --> LG
     PER -. "读取" .-> MEM & AGT & SKL
     MEXT --> MEM & MTOP & MVEC
@@ -127,9 +132,14 @@ sequenceDiagram
     participant M as 外部 LLM (BYOK)
     participant T as 工具管线 → 账本
 
-    U->>S: POST /api/conversations/:cid/messages
-    S->>C: send(uid, cid, text)
-    C->>A: agent.followup(text)（Inbox followup 通道）
+    U->>S: GET /api/conversations/:cid/events?limit=50（首屏最近一段）
+    S->>S: 会话归属校验（非本人 404）→ 返回事件片段（seq 升序）
+    U->>S: 触顶续取 ?before=<片段最小 seq>&limit=50（合并后按高度差回补滚动位置）
+    U->>S: POST /api/conversations/:cid/messages（text + attachments）
+    S->>S: parseAttachments 校验附件 → 内容块
+    S->>C: send(uid, cid, text, 附件块)
+    C->>C: 含图片且当前有效模型未开多模态 → 409（不消耗回合）
+    C->>A: agent.followup(内容块)（Inbox followup 通道）
     S-->>U: 202（异步，不等回复）
     U->>S: GET /api/conversations/:cid/stream（SSE）
     S->>A: agent.subscribe → 事件实时推送
@@ -149,6 +159,39 @@ sequenceDiagram
     end
     A->>D: turn/end（completed / aborted / budget-exhausted …）
 ```
+
+## 图片与附件
+
+```mermaid
+flowchart LR
+    PICK["Chat 页选文件<br/>（图片 / 文本）"] --> CONV1["Attachments.tsx<br/>图片等比缩到长边 1280 → WebP<br/>文本按 UTF-8 解码，二进制格式拒绝"]
+    CONV1 -- "多模态开关未勾选 → 就地拦下并提示" --> GATE{"当前有效模型<br/>multimodal？"}
+    GATE -- 是 --> POST["POST …/messages<br/>attachments: image / file"]
+    GATE -- 否 --> STOP["提示：该模型不支持图片识别<br/>文字文件仍可上传"]
+    POST --> PARSE["attachments.ts 服务端复校<br/>类型 / 字节签名 / 大小 / 张数上限"]
+    PARSE --> BLOCKS["内容块：text + image + file<br/>随 user/message 事件入 conversation_events"]
+    BLOCKS --> WIRE["openai-compat adapter<br/>image → image_url（data URL）<br/>file → 文本段（带文件名抬头）"]
+    WIRE --> MODEL["外部视觉模型"]
+    BLOCKS -. "历史里有图片时" .-> SWITCH["切换模型 / 伙伴 → 409<br/>装配期请求拦截（兜底）"]
+```
+
+图片以 base64 随消息进会话日志（可重放、可跨进程重建请求），文本附件正文内联为文本块。发送、切换模型/伙伴、装配请求三处都做多模态校验：发送被拦是 409，切换被拦是 409，兜底拦截让该回合在发请求前失败并说明原因。
+
+## 手机浏览器与静态资源
+
+```mermaid
+flowchart LR
+    subgraph NARROW["窄屏（< 768px）"]
+        TOPBAR["顶栏：菜单按钮 + 页名"]
+        TABS["底部五项标签栏<br/>对话 · 今天 · 盘面 · 成长 · 更多"]
+        DRAWER["左滑抽屉（SidebarContent 复用）<br/>最近对话 + 伙伴 + 提醒 + 设置<br/>安卓返回键收起（popstate）"]
+    end
+    SHELL2["App.tsx 应用壳（h-dvh）"] --> TOPBAR & TABS & DRAWER
+    CHAT2["Chat 页窄屏收纳<br/>模型 / 思维链 / 切换伙伴进会话设置面板<br/>上传双入口：图片文件 + 拍照（capture）"]
+    STATIC["server.ts 静态托管<br/>文本资源 gzip（Accept-Encoding 协商 + Vary）<br/>assets/* 一年 immutable · html 与 manifest 不缓存<br/>manifest.webmanifest + Prism 图标 → 添加到主屏幕"]
+```
+
+窄屏断点取 `md`（768px）：以上结构只在窄屏渲染，桌面端排版保持原样。可安装形态受传输协议限制：明文 HTTP 下浏览器只提供「添加到主屏幕」快捷方式，完整安装（独立窗口、离线缓存）需要 HTTPS（见 docs/deployment.md）。
 
 ## 记忆管线
 

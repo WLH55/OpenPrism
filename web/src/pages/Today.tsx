@@ -131,8 +131,8 @@ export function Today() {
         </div>
       )}
 
-      {/* 三统计卡 */}
-      <div className="mb-5 grid grid-cols-3 gap-3">
+      {/* 三统计卡（窄屏两列，第三张跨满行） */}
+      <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3">
         <div className="rounded-xl border border-line bg-surface px-4 py-3">
           <div className="text-xs text-ink2">今日笔数</div>
           <div className="num mt-1 text-xl font-semibold text-ink">{view.flows.length}</div>
@@ -144,7 +144,7 @@ export function Today() {
             <span className="text-sm font-normal text-ink3">/{view.plans.length}</span>
           </div>
         </div>
-        <div className="rounded-xl border border-line bg-surface px-4 py-3">
+        <div className="col-span-2 rounded-xl border border-line bg-surface px-4 py-3 md:col-span-1">
           <div className="text-xs text-ink2">连续打卡</div>
           <div className="num mt-1 text-xl font-semibold text-warm">{view.streakDays} 天</div>
         </div>
