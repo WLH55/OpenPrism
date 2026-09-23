@@ -1,0 +1,74 @@
+/* 深林墨绿·成长 / 森林夜色 —— token 与原型 prototype/index.html 同源 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg: #f6f4ee;
+  --surface: #ffffff;
+  --surface-2: #eceae2;
+  --line: #e4e1d7;
+  --ink: #2b2a26;
+  --ink-2: #6f6b60;
+  --ink-3: #a49e90;
+  --accent: #2f6b4f;
+  --accent-2: #24523c;
+  --accent-3: #e4efe9;
+  --warm: #b98a3e;
+  --warm-2: #f3ead8;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e1410;
+  --surface: #171e18;
+  --surface-2: #1e2620;
+  --line: #2a332c;
+  --ink: #e7ebe5;
+  --ink-2: #a4ada2;
+  --ink-3: #6d7569;
+  --accent: #7fb08f;
+  --accent-2: #3d6b52;
+  --accent-3: #1c2a20;
+  --warm: #c99a5b;
+  --warm-2: #2b231a;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+
+@layer base {
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+body { font-variant-numeric: tabular-nums; }
+.num { font-variant-numeric: tabular-nums; }
+.page { display: none; }
+.page.active { display: block; }
+.prism { display: inline-block; vertical-align: -0.1em; }
+
+/* 热力图强度分级（0=无记录 → 4=最热，颜色深浅 = 当日记录数） */
+.heat-0 { background: var(--surface-2); }
+.heat-1 { background: color-mix(in srgb, var(--cat, var(--accent)) 30%, var(--surface-2)); }
+.heat-2 { background: color-mix(in srgb, var(--cat, var(--accent)) 60%, var(--surface-2)); }
+.heat-3 { background: var(--cat, var(--accent)); }
+.heat-4 { background: var(--warm); }
+#heatmap {
+  display: grid;
+  grid-auto-flow: column;          /* 每列 = 一周，自上而下填 7 天 */
+  grid-template-rows: repeat(7, 12px);  /* 定死 7 行 */
+  grid-auto-columns: 12px;         /* 定死列宽，格子是固定小方块，不随容器撑开 */
+  gap: 4px;
+}
+
+/* 主题切换图标显隐 */
+[data-theme="dark"] .icon-sun { display: block; }
+[data-theme="dark"] .icon-moon { display: none; }
+.icon-sun { display: none; }
+.icon-moon { display: block; }
