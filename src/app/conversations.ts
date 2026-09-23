@@ -12,7 +12,7 @@ import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
-import { createTaskTools } from "./tasks";
+import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
 
@@ -83,8 +83,6 @@ export interface ConversationEntry {
 
 const DEFAULT_TITLE = "新对话";
 const TITLE_MAX_RUNES = 24;
-/** 任务提醒固定会话的 cid 前缀：每个伙伴一个（默认助手 = feed:default），存在即复用 */
-const TASK_FEED_PREFIX = "feed:";
 
 const TITLE_PROMPT = `根据用户的提问生成一个简短的会话标题。
 要求：
@@ -152,7 +150,7 @@ export class ConversationStore {
    * 不存在即创建（置顶 + 绑定该伙伴），存在即复用；绑定该伙伴的所有定时任务提醒都进这一个会话。
    */
   async ensureTaskFeed(uid: string, agentId: string | undefined): Promise<ConversationEntry> {
-    const cid = `${TASK_FEED_PREFIX}${agentId ?? "default"}`;
+    const cid = `${TASK_FEED_CID_PREFIX}${agentId ?? "default"}`;
     const found = this.db
       .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
@@ -434,6 +432,7 @@ export class ConversationStore {
       persona: current.persona,
       ...(current.identity ? { identity: { name: current.name, description: current.identity.description, language: current.identity.language } } : {}),
       ...(merged !== "" ? { memoryBlock: merged } : {}),
+      taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
       now: this.deps.now,
       tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? -new Date().getTimezoneOffset(),
     });

@@ -43,6 +43,14 @@ describe("composeAssistantPrompt", () => {
     expect(prompt).toContain("不要猜");
   });
 
+  it("提醒会话：taskFeed 时附加自动触发规则，普通会话不带", () => {
+    const feed = composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480, taskFeed: true });
+    expect(feed).toContain("定时提醒会话");
+    expect(feed).toContain("不是用户此刻打的字");
+    expect(feed).toContain("不要拿这些反问用户");
+    expect(composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480 })).not.toContain("定时提醒会话");
+  });
+
   it("身份块：伙伴名字+描述进 prompt；灵魂优先级声明；无身份退默认助手", () => {
     const withIdentity = composeAssistantPrompt({
       persona: "## 语气\n像老朋友。",
