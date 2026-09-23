@@ -35,6 +35,14 @@ export interface TaskRun {
   detail?: string;
 }
 
+/** 本次运行的来路：调度器按计划到点（带计划时刻 due）或用户在界面手动触发 */
+export type TaskRunTrigger = { kind: "scheduled"; due: number } | { kind: "manual" };
+
+/** 定时提醒会话的 cid 前缀（每伙伴一个，见 conversations.ensureTaskFeed） */
+export const TASK_FEED_CID_PREFIX = "feed:";
+/** 任务专属会话的 cid 前缀（会话日志键 = `task:<taskId>`） */
+export const TASK_SESSION_CID_PREFIX = "task:";
+
 // ── cron 匹配器（5 段：分 时 日 月 周；支持 * n a-b a,b */n；周日用 0|7） ──
 
 function parseField(field: string, min: number, max: number): (value: number) => boolean {
@@ -197,6 +205,75 @@ export function nextDue(trigger: TaskTrigger, fromTs: number, tz: number): numbe
   }
 }
 
+// ── 触发描述与到点注入（提醒会话的上下文，2026-09-23） ──
+// 调度器到点时只投一句任务指令的话，模型会当成普通对话反问时间与频率；
+// 这里把「这是自动触发 + 任务内容 + 重复规则 + 计划时刻与实际触发时刻」一次写全。
+
+const WEEKDAY_NAMES = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"]; // 1=周一 … 7=周日
+
+/** 按任务时区显示时刻（用户看到的是自己钟面上的日期与钟点） */
+export function formatLocal(ts: number, tzOffsetMinutes: number): string {
+  const shifted = new Date(ts + tzOffsetMinutes * 60000);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+}
+
+/** 触发规则的人话描述（到点注入与记忆提取共用同一份口径） */
+export function describeTrigger(trigger: TaskTrigger, tzOffsetMinutes = 0): string {
+  switch (trigger.kind) {
+    case "once":
+      return `单次 ${formatLocal(trigger.at, tzOffsetMinutes)}`;
+    case "daily":
+      return `每天 ${trigger.time}`;
+    case "weekly": {
+      const days = trigger.days.map((day) => WEEKDAY_NAMES[day] ?? `周${day}`).join("、");
+      return days === "" ? `每周 ${trigger.time}` : `每${days} ${trigger.time}`;
+    }
+    case "monthly":
+      return `每月 ${trigger.day} 日 ${trigger.time}`;
+    case "yearly":
+      return `每年 ${trigger.month} 月 ${trigger.day} 日 ${trigger.time}`;
+    case "interval": {
+      const unit = { minute: "分钟", hour: "小时", day: "天", week: "周", month: "个月", year: "年" }[trigger.unit];
+      const freq = trigger.every === 1 ? `每${unit}` : `每 ${trigger.every} ${unit}`;
+      return trigger.time ? `${freq} ${trigger.time}` : freq;
+    }
+    case "cron":
+      return `cron 表达式 ${trigger.expr}`;
+  }
+}
+
+/** 延迟时长的人话描述（补跑标注用） */
+function describeDuration(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  if (hours < 24) return restMinutes === 0 ? `${hours} 小时` : `${hours} 小时 ${restMinutes} 分钟`;
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours === 0 ? `${days} 天` : `${days} 天 ${restHours} 小时`;
+}
+
+/** 到点投给模型的任务上下文（提醒会话的指令正文，落 user/message 事件可见） */
+export function taskTriggerMessage(task: TaskDef, run: TaskRunTrigger, now: number): string {
+  const lines = [
+    `【定时任务触发】${task.title}`,
+    `任务内容：${task.instruction}`,
+    `重复规则：${describeTrigger(task.trigger, task.tzOffsetMinutes)}`,
+  ];
+  if (run.kind === "scheduled") {
+    const delay = now - run.due;
+    lines.push(`计划时刻：${formatLocal(run.due, task.tzOffsetMinutes)}`);
+    lines.push(`触发时刻：${formatLocal(now, task.tzOffsetMinutes)}${delay >= 60000 ? `（补跑，比计划晚 ${describeDuration(delay)}）` : "（准点）"}`);
+  } else {
+    lines.push("触发方式：用户在提醒页手动点了「立即跑」");
+    lines.push(`触发时刻：${formatLocal(now, task.tzOffsetMinutes)}`);
+  }
+  lines.push("这次触发由系统按计划自动发起，用户此刻没有打字。请直接完成上面这个任务，把要给用户看的内容作为回复正文；重复规则与时刻已经配置好，不要就这些反问用户。");
+  return lines.join("\n");
+}
+
 function validateTrigger(trigger: TaskTrigger): void {
   switch (trigger.kind) {
     case "once":
@@ -348,7 +425,7 @@ export class TaskStore {
 export interface SchedulerDeps {
   uids(): string[];
   tasks: TaskStore;
-  runTask(uid: string, task: TaskDef): Promise<void>;
+  runTask(uid: string, task: TaskDef, run: TaskRunTrigger): Promise<void>;
   now(): number;
   intervalMs?: number;
   logger?(line: string): void;
@@ -398,7 +475,7 @@ export class Scheduler {
           continue;
         }
         try {
-          await this.deps.runTask(uid, task);
+          await this.deps.runTask(uid, task, { kind: "scheduled", due });
           task.lastRunTs = now;
           await this.deps.tasks.updateLastRun(uid, task.id, now);
           await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "ran" });

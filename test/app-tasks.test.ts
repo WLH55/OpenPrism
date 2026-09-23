@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
-import { createTaskTools, cronMatches, nextDue, Scheduler, TaskStore, type TaskTrigger } from "../src/app/tasks";
+import { createTaskTools, cronMatches, describeTrigger, nextDue, Scheduler, taskTriggerMessage, TaskStore, type TaskDef, type TaskRunTrigger, type TaskTrigger } from "../src/app/tasks";
 import { testDb } from "./helpers-db";
 
 const TZ = 480; // UTC+8
@@ -131,12 +131,12 @@ describe("TaskStore", () => {
 describe("Scheduler", () => {
   function makeWorld(db: ReturnType<typeof testDb>, uid: string, nowTs: number) {
     const store = new TaskStore({ db, now: () => nowTs, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
-    const ran: { uid: string; id: string }[] = [];
+    const ran: { uid: string; id: string; run: TaskRunTrigger }[] = [];
     const scheduler = new Scheduler({
       uids: () => [uid],
       tasks: store,
-      runTask: async (uidRun, task) => {
-        ran.push({ uid: uidRun, id: task.id });
+      runTask: async (uidRun, task, run) => {
+        ran.push({ uid: uidRun, id: task.id, run });
       },
       now: () => nowTs,
     });
@@ -150,6 +150,8 @@ describe("Scheduler", () => {
     const run = makeWorld(db, "u-due", T("2026-09-03T15:01:00Z")); // 当地 23:01，到期 1 分钟
     expect(await run.scheduler.tick()).toBe(1);
     expect(run.ran).toHaveLength(1);
+    // 到点触发带上计划时刻（注入上下文的"计划时刻"就取它）
+    expect(run.ran[0]!.run).toEqual({ kind: "scheduled", due: T("2026-09-03T15:00:00Z") });
     expect(await run.scheduler.tick()).toBe(0);
   });
 
@@ -188,6 +190,55 @@ describe("Scheduler", () => {
     const second = makeWorld(db, "u-once", T("2026-09-03T12:00:00Z"));
     expect(await second.scheduler.tick()).toBe(0);
     expect(second.ran).toHaveLength(0);
+  });
+});
+
+describe("触发描述与到点注入（提醒会话上下文）", () => {
+  const base: TaskDef = {
+    id: "t1",
+    uid: "u1",
+    title: "工作提醒",
+    instruction: "提醒我工作辛苦了，记得照顾好自己",
+    trigger: { kind: "daily", time: "17:00" },
+    enabled: true,
+    tzOffsetMinutes: TZ,
+    createdTs: 0,
+  };
+
+  it("describeTrigger：各触发器的中文描述（周几用汉字，interval 单复数一致）", () => {
+    expect(describeTrigger({ kind: "daily", time: "17:00" })).toBe("每天 17:00");
+    expect(describeTrigger({ kind: "weekly", days: [1, 3], time: "08:00" })).toBe("每周一、周三 08:00");
+    expect(describeTrigger({ kind: "monthly", day: 5, time: "09:30" })).toBe("每月 5 日 09:30");
+    expect(describeTrigger({ kind: "yearly", month: 9, day: 3, time: "09:00" })).toBe("每年 9 月 3 日 09:00");
+    expect(describeTrigger({ kind: "interval", every: 2, unit: "hour", startTs: 0 })).toBe("每 2 小时");
+    expect(describeTrigger({ kind: "interval", every: 1, unit: "day", time: "09:00", startTs: 0 })).toBe("每天 09:00");
+    expect(describeTrigger({ kind: "cron", expr: "0 9 * * *" })).toBe("cron 表达式 0 9 * * *");
+    // once 按任务时区显示（UTC+8：UTC 00:00 = 当地 08:00）
+    expect(describeTrigger({ kind: "once", at: T("2026-09-03T00:00:00Z") }, TZ)).toBe("单次 2026-09-03 08:00");
+  });
+
+  it("taskTriggerMessage：自动触发写全任务内容、重复规则、计划时刻与触发时刻", () => {
+    const due = T("2026-09-23T09:00:00Z"); // 当地 17:00
+    const text = taskTriggerMessage(base, { kind: "scheduled", due }, due);
+    expect(text).toContain("【定时任务触发】工作提醒");
+    expect(text).toContain("任务内容：提醒我工作辛苦了，记得照顾好自己");
+    expect(text).toContain("重复规则：每天 17:00");
+    expect(text).toContain("计划时刻：2026-09-23 17:00");
+    expect(text).toContain("触发时刻：2026-09-23 17:00（准点）");
+    expect(text).toContain("由系统按计划自动发起");
+    expect(text).toContain("不要就这些反问用户");
+  });
+
+  it("taskTriggerMessage：补跑标注延迟；手动触发说明来路且不写计划时刻", () => {
+    const due = T("2026-09-23T09:00:00Z");
+    const late = taskTriggerMessage(base, { kind: "scheduled", due }, due + 80 * 60000);
+    expect(late).toContain("触发时刻：2026-09-23 18:20");
+    expect(late).toContain("（补跑，比计划晚 1 小时 20 分钟）");
+    const manual = taskTriggerMessage(base, { kind: "manual" }, due);
+    expect(manual).toContain("触发方式：用户在提醒页手动点了「立即跑」");
+    expect(manual).toContain("触发时刻：2026-09-23 17:00");
+    expect(manual).not.toContain("计划时刻");
+    expect(manual).not.toContain("准点");
   });
 });
 

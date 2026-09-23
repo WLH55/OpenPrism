@@ -21,6 +21,7 @@ import {
   type MemoryKind,
 } from "./memory";
 import { createLlmTopicAdjudicator, listTopTopics, observeTopics } from "./memory-topics";
+import { describeTrigger, TASK_FEED_CID_PREFIX, TASK_SESSION_CID_PREFIX, type TaskTrigger } from "./tasks";
 
 // ── 常量（Spec §6.3） ──────────
 
@@ -157,31 +158,7 @@ interface TaskRow {
   trigger_json: string;
   enabled: number;
   last_run_ts: number | null;
-}
-
-/** 任务触发描述（从旧 describeTrigger 移植） */
-export function describeTrigger(trigger: { kind: string; at?: number; time?: string; days?: number[]; day?: number; month?: number; every?: number; unit?: string; expr?: string }): string {
-  switch (trigger.kind) {
-    case "once":
-      return `单次 ${trigger.at !== undefined ? new Date(trigger.at).toLocaleString() : ""}`;
-    case "daily":
-      return `每天 ${trigger.time ?? ""}`;
-    case "weekly":
-      return (trigger.days ?? []).length > 0 ? `每周${(trigger.days ?? []).join("、")} ${trigger.time ?? ""}` : `每周 ${trigger.time ?? ""}`;
-    case "monthly":
-      return `每月 ${trigger.day} 日 ${trigger.time ?? ""}`;
-    case "yearly":
-      return `每年 ${trigger.month}-${trigger.day} ${trigger.time ?? ""}`;
-    case "interval": {
-      const unit = { minute: "分钟", hour: "小时", day: "天", week: "周", month: "个月", year: "年" }[trigger.unit ?? "day"] ?? "天";
-      const freq = trigger.every === 1 ? `每${unit}` : `每 ${trigger.every} ${unit}`;
-      return trigger.time ? `${freq} ${trigger.time}` : freq;
-    }
-    case "cron":
-      return `cron ${trigger.expr ?? ""}`;
-    default:
-      return trigger.kind;
-  }
+  tz_offset_minutes: number;
 }
 
 // ── 决策（WeKnora 决策制） ──────────
@@ -385,9 +362,10 @@ export class MemoryExtractor {
         `SELECT ce.id AS eid, ce.cid, ce.ts, ce.role, ce.event_json FROM conversation_events ce
          JOIN conversations c ON c.cid = ce.cid
          WHERE c.uid = ? AND ce.id > ? AND ce.type IN ('user/message','assistant/message')
+           AND c.cid NOT LIKE ? AND c.cid NOT LIKE ?
          ORDER BY ce.id LIMIT 400`,
       )
-      .all(uid, cursor ?? 0) as unknown as { eid: number; cid: string; ts: number; role: string | null; event_json: string }[];
+      .all(uid, cursor ?? 0, `${TASK_FEED_CID_PREFIX}%`, `${TASK_SESSION_CID_PREFIX}%`) as unknown as { eid: number; cid: string; ts: number; role: string | null; event_json: string }[];
 
     type Msg = { eid: number; cid: string; ts: number; role: string; text: string };
     const msgs: Msg[] = [];
@@ -482,7 +460,7 @@ export class MemoryExtractor {
 
   private tasksSegment(uid: string): { segment: ExtractSegment | null; fingerprint: string } {
     const rows = this.deps.db
-      .prepare("SELECT id, title, instruction, trigger_json, enabled, last_run_ts FROM tasks WHERE uid = ? ORDER BY created_ts, id")
+      .prepare("SELECT id, title, instruction, trigger_json, enabled, last_run_ts, tz_offset_minutes FROM tasks WHERE uid = ? ORDER BY created_ts, id")
       .all(uid) as unknown as TaskRow[];
     const canonical = rows.map((r) => `${r.id}|${r.title}|${r.instruction}|${r.trigger_json}|${r.enabled}|${r.last_run_ts ?? 0}`).join("\n");
     const fingerprint = createHash("sha1").update(canonical).digest("hex");
@@ -491,7 +469,7 @@ export class MemoryExtractor {
     const lines: ExtractLine[] = rows.slice(0, EXTRACT_MAX_ROWS_NON_CHAT).map((r) => {
       let trigger = "";
       try {
-        trigger = describeTrigger(JSON.parse(r.trigger_json) as Parameters<typeof describeTrigger>[0]);
+        trigger = describeTrigger(JSON.parse(r.trigger_json) as TaskTrigger, r.tz_offset_minutes);
       } catch {
         trigger = r.trigger_json;
       }

@@ -20,7 +20,7 @@ import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
 import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extract";
 import { createMemoryVector } from "./memory-vector";
-import { Scheduler, TaskStore, type TaskDef } from "./tasks";
+import { Scheduler, TaskStore, taskTriggerMessage, type TaskDef, type TaskRunTrigger } from "./tasks";
 import { NotificationStore } from "./notify";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
@@ -118,11 +118,13 @@ async function main(): Promise<void> {
   );
 
   // 任务执行体（调度/手动共用）：跑进该伙伴的固定提醒会话（不存在即创建、置顶显示），
-  // 助手回复直接落在会话里；同时落一条站内通知兜底（提醒页徽标）
-  const taskRunner = async (uidRun: string, task: TaskDef): Promise<void> => {
+  // 助手回复直接落在会话里；同时落一条站内通知兜底（提醒页徽标）。
+  // 投给模型的是触发上下文（自动触发说明 + 任务内容 + 重复规则 + 计划/触发时刻），不是光秃秃一句指令——
+  // 否则模型把到点指令当成用户刚说的话，回头反问"每天还是今天一次、几点提醒"。
+  const taskRunner = async (uidRun: string, task: TaskDef, run: TaskRunTrigger): Promise<void> => {
     const feed = await conversations.ensureTaskFeed(uidRun, task.agentId);
     const agent = await conversations.agent(uidRun, feed.id);
-    agent.followup(task.instruction);
+    agent.followup(taskTriggerMessage(task, run, Date.now()));
     await agent.whenIdle();
     const events = agent.sessionLog.readAll();
     const last = [...events].reverse().find((e) => e.type === "assistant/message");

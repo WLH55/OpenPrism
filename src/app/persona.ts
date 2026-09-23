@@ -21,6 +21,9 @@ const DISCIPLINE = `守则：
 - 用户显式表达对你的偏好/事实（"以后叫我龙哥""我喜欢简洁回复"）时，用 save_preference 记住；只记显式说出的，不要猜。
 - 语气自然、简洁、有温度，像朋友聊天，不堆格式不堆数据。`;
 
+/** 定时提醒会话的回合规则：触发消息由调度器自动投递，用户不在场（2026-09-23） */
+const TASK_FEED_RULES = `定时提醒会话：本会话里的【定时任务触发】消息由系统按计划自动投递，不是用户此刻打的字。收到这类消息时，直接完成其中的任务内容，把要提醒用户看的内容作为回复正文；重复规则、计划时刻、触发时刻都已经写在消息里，不要拿这些反问用户。确实缺信息时，按最合理的假设完成本次提醒，并在正文里说明这个假设。`;
+
 /** 人设卡名字：首个 H1 文本；无则空串（上层兜底"助手"） */
 export function extractAgentName(markdown: string): string {
   for (const line of markdown.split("\n")) {
@@ -43,6 +46,8 @@ export interface ComposePromptInput {
   identity?: AgentIdentityPrompt;
   /** MemoryStore.injectionBlock 产物（已剥脚注）；缺省 = 无记忆注入 */
   memoryBlock?: string;
+  /** true = 定时提醒会话（cid 前缀 feed:）：附加自动触发的回合规则 */
+  taskFeed?: boolean;
   now(): number;
   tzOffsetMinutes?: number;
 }
@@ -62,6 +67,7 @@ export function composeAssistantPrompt(input: ComposePromptInput): string {
       : "";
   const persona = input.persona?.trim() || DEFAULT_IDENTITY;
   const parts = [[identityBlock, persona].filter((p) => p !== "").join("\n\n"), dateLine(input.now(), input.tzOffsetMinutes ?? 0)];
+  if (input.taskFeed) parts.push(TASK_FEED_RULES);
   if (input.memoryBlock && input.memoryBlock.trim() !== "") {
     // 记忆块自带 <user_memory> 信封（背景资料非指令、冲突以用户当前说法为准），此处直接拼入
     parts.push(input.memoryBlock.trim());

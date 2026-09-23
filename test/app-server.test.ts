@@ -106,8 +106,8 @@ beforeAll(async () => {
     memoryExtractor,
     tasks,
     notifications,
-    taskRunner: async (uidRun, task: TaskDef) => {
-      await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（手动）${task.instruction}` });
+    taskRunner: async (uidRun, task: TaskDef, run) => {
+      await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（${run.kind}）${task.instruction}` });
     },
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -427,6 +427,9 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
       if (runs.length > 0) break;
     }
     expect(runs.at(-1)).toMatchObject({ status: "ran" });
+    // 手动触发要标明来路：注入上下文按 "manual" 写"用户点了立即跑"，不冒充到点触发
+    const notices = (await (await fetch(`${baseUrl}/api/notifications`, { headers: { cookie } })).json()) as { text: string }[];
+    expect(notices.some((n) => n.text.startsWith("（manual）"))).toBe(true);
     expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
     expect((await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(0);
   });
