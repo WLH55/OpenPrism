@@ -61,7 +61,7 @@ export interface ServerDeps {
   tasks: import("./tasks").TaskStore;
   notifications: import("./notify").NotificationStore;
   /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
-  taskRunner(uid: string, task: import("./tasks").TaskDef): Promise<void>;
+  taskRunner(uid: string, task: import("./tasks").TaskDef, run: import("./tasks").TaskRunTrigger): Promise<void>;
   staticDir?: string;
 }
 
@@ -263,12 +263,15 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
-  /** 上下文窗口入参归一：undefined=不改/缺省、null=回默认、正整数=自定义 */
-  const parseContextWindow = (input: unknown): number | null | undefined => {
+  /** 上下文窗口入参归一：undefined=不改/缺省、null=回默认、正整数=自定义。
+   *  下限按用途分：chat 窗口参与压缩判压，需 ≥1000；embedding 窗口只作记录，任何正整数都收。 */
+  const parseContextWindow = (input: unknown, kind: "chat" | "embedding"): number | null | undefined => {
     if (input === undefined) return undefined;
     if (input === null) return null;
     const n = Number(input);
-    if (!Number.isInteger(n) || n < 1000) throw new Error("contextWindow 需为 ≥1000 的整数（tokens）");
+    if (!Number.isInteger(n) || n < (kind === "embedding" ? 1 : 1000)) {
+      throw new Error(kind === "embedding" ? "contextWindow 需为正整数（tokens）" : "contextWindow 需为 ≥1000 的整数（tokens）");
+    }
     return n;
   };
   /** 提供方用途归一：undefined=不改/缺省（chat） */
@@ -293,8 +296,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     try {
       validateBaseURL(baseURL);
       if (model === "") throw new Error("model 必填");
-      const contextWindow = parseContextWindow(body.contextWindow);
       const kind = parseProviderKind(body.kind);
+      const contextWindow = parseContextWindow(body.contextWindow, kind ?? "chat");
       const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
       const created = addModelProvider(deps.db, uid, {
         baseURL,
@@ -327,10 +330,16 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
           if (model === "") throw new Error("model 必填");
           patch.model = model;
         }
-        const contextWindow = parseContextWindow(body.contextWindow);
-        if (contextWindow !== undefined) patch.contextWindow = contextWindow;
         const kind = parseProviderKind(body.kind);
+        const existing = listModelProviders(deps.db, uid).find((p) => p.id === providerId);
+        const effectiveKind = kind ?? existing?.kind ?? "chat";
+        const contextWindow = parseContextWindow(body.contextWindow, effectiveKind);
+        // 用途切到 chat 时，留在行里的 embedding 小窗口不满足对话压缩下限，须显式改填
+        if (effectiveKind === "chat" && contextWindow === undefined && existing?.contextWindow != null && existing.contextWindow < 1000) {
+          throw new Error("切换为对话用途时，上下文窗口需 ≥1000（tokens）");
+        }
         if (kind !== undefined) patch.kind = kind;
+        if (contextWindow !== undefined) patch.contextWindow = contextWindow;
         const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
         if (apiKey !== "") patch.keyEnc = seal(deps.masterKey, apiKey);
         updateModelProvider(deps.db, uid, providerId, patch);
@@ -871,7 +880,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       if (sub === "/run" && method === "POST") {
         const task = await deps.tasks.get(uid, tid);
         if (!task) return sendError(res, 404, "task 不存在");
-        void deps.taskRunner(uid, task).then(
+        void deps.taskRunner(uid, task, { kind: "manual" }).then(
           async () => deps.tasks.recordRun(uid, tid, { ts: deps.env.now(), status: "ran" }),
           async (error) =>
             deps.tasks.recordRun(uid, tid, { ts: deps.env.now(), status: "failed", detail: String((error as Error).message).slice(0, 200) }),
