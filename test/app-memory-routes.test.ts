@@ -129,6 +129,32 @@ describe("主题计数与向量配置路由", () => {
     expect(bad.status).toBe(400);
   });
 
+  it("窗口下限按用途分：embedding 收 1024 与 512，chat 仍要求 ≥1000；小窗口行切回 chat 须显式改填", async () => {
+    const small = await req("/api/models", {
+      method: "POST",
+      body: { baseURL: "https://api.jina.ai/v1", model: "jina-embeddings-v5-text-small", apiKey: "sk-test", kind: "embedding", contextWindow: 1024 },
+    });
+    expect(small.status).toBe(200);
+    const list = await req("/api/models");
+    expect(list.body.providers.find((p: { id: string }) => p.id === small.body.id)).toMatchObject({ kind: "embedding", contextWindow: 1024 });
+
+    const tiny = await req("/api/models", { method: "POST", body: { baseURL: "https://api.jina.ai/v1", model: "m", kind: "embedding", contextWindow: 512 } });
+    expect(tiny.status).toBe(200);
+    const zero = await req("/api/models", { method: "POST", body: { baseURL: "https://api.jina.ai/v1", model: "m", kind: "embedding", contextWindow: 0 } });
+    expect(zero.status).toBe(400);
+    expect(zero.body.error).toContain("正整数");
+    const chatSmall = await req("/api/models", { method: "POST", body: { baseURL: "https://api.jina.ai/v1", model: "m", contextWindow: 512 } });
+    expect(chatSmall.status).toBe(400);
+    expect(chatSmall.body.error).toContain("≥1000");
+
+    const switchBack = await req(`/api/models/${tiny.body.id}`, { method: "PUT", body: { kind: "chat" } });
+    expect(switchBack.status).toBe(404);
+    expect(switchBack.body.error).toContain("≥1000");
+    const withWindow = await req(`/api/models/${tiny.body.id}`, { method: "PUT", body: { kind: "chat", contextWindow: 32768 } });
+    expect(withWindow.status).toBe(200);
+    const relisted = await req("/api/models");
+    expect(relisted.body.providers.find((p: { id: string }) => p.id === tiny.body.id)).toMatchObject({ kind: "chat", contextWindow: 32768 });
+  });
   it("embedding 提供方连接测试走 embeddingTester", async () => {
     const ok = await req(`/api/models/${embedProviderId}/test`, { method: "POST" });
     expect(ok.status).toBe(200);

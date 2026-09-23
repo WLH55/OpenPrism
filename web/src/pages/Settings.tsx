@@ -36,6 +36,9 @@ function formatWindow(n: number | null): string {
   return n % 1000 === 0 ? `${Math.round(n / 1000)}K` : `${n}`;
 }
 
+/** 对话用途的窗口档位（embedding 用途直接填数字，不走档位） */
+const CHAT_WINDOW_CHOICES = ["32768", "65536", "131072", "200000"];
+
 /** 平台预置（数据移植自 Tencent WeKnora 的厂商清单，按聊天场景补上下文窗口；baseURL/模型名为公开事实信息） */
 interface ModelPreset {
   id: string;
@@ -101,7 +104,10 @@ export function Settings() {
   const editing = form.editingId !== null ? providers.find((p) => p.id === form.editingId) : undefined;
 
   const openCreate = () => setForm({ ...EMPTY_FORM, open: true });
-  const openEdit = (provider: ModelProvider) =>
+  const openEdit = (provider: ModelProvider) => {
+    const kind = provider.kind === "embedding" ? "embedding" : "chat";
+    const window = provider.contextWindow === null ? "" : String(provider.contextWindow);
+    const fromChoice = kind === "chat" && CHAT_WINDOW_CHOICES.includes(window);
     setForm({
       open: true,
       editingId: provider.id,
@@ -109,15 +115,11 @@ export function Settings() {
       baseURL: provider.baseURL,
       model: provider.model,
       apiKey: "",
-      kind: provider.kind === "embedding" ? "embedding" : "chat",
-      windowChoice:
-        provider.contextWindow === null
-          ? "default"
-          : ["32768", "65536", "131072", "200000"].includes(String(provider.contextWindow))
-            ? String(provider.contextWindow)
-            : "custom",
-      customWindow: provider.contextWindow !== null && !["32768", "65536", "131072", "200000"].includes(String(provider.contextWindow)) ? String(provider.contextWindow) : "",
+      kind,
+      windowChoice: window === "" ? "default" : fromChoice ? window : "custom",
+      customWindow: window === "" || fromChoice ? "" : window,
     });
+  };
   const closeForm = () => setForm(EMPTY_FORM);
 
   const applyPreset = (preset: ModelPreset) =>
@@ -127,14 +129,24 @@ export function Settings() {
       presetId: preset.id,
       baseURL: preset.baseURL,
       model: preset.model,
-      windowChoice: preset.contextWindow === null ? "default" : String(preset.contextWindow),
-      customWindow: "",
+      ...(form.kind === "chat"
+        ? { windowChoice: preset.contextWindow === null ? "default" : String(preset.contextWindow), customWindow: "" }
+        : {}),
     });
 
   const save = async () => {
     setBusy(true);
     setMessage(null);
-    const contextWindow = form.windowChoice === "default" ? null : form.windowChoice === "custom" ? Number(form.customWindow) : Number(form.windowChoice);
+    const contextWindow =
+      form.kind === "embedding"
+        ? form.customWindow.trim() === ""
+          ? null
+          : Number(form.customWindow)
+        : form.windowChoice === "default"
+          ? null
+          : form.windowChoice === "custom"
+            ? Number(form.customWindow)
+            : Number(form.windowChoice);
     try {
       if (form.editingId !== null) {
         await api.updateModel(form.editingId, {
@@ -234,7 +246,12 @@ export function Settings() {
                 {p.kind === "embedding" && <span className="ml-2 rounded-full bg-accent3 px-1.5 py-0.5 text-[11px] font-normal text-accent">向量</span>}
               </div>
               <div className="mt-0.5 truncate font-mono text-xs text-ink3">
-                {p.baseURL} · 窗口 {formatWindow(p.contextWindow)}
+                {p.baseURL} ·{" "}
+                {p.kind === "embedding"
+                  ? p.contextWindow === null
+                    ? "输入上限未填"
+                    : `输入上限 ${p.contextWindow}`
+                  : `窗口 ${formatWindow(p.contextWindow)}`}
                 {p.hasKey ? " · Key 已配置" : " · 未配 Key"}
               </div>
             </div>
@@ -357,41 +374,62 @@ export function Settings() {
               id="provider-kind"
               className={`${inputCls} font-sans`}
               value={form.kind}
-              onChange={(e) => setForm({ ...form, kind: e.target.value })}
+              onChange={(e) => setForm({ ...form, kind: e.target.value, windowChoice: "default", customWindow: "" })}
             >
               <option value="chat">对话与提取（chat）</option>
               <option value="embedding">记忆向量（embedding）</option>
             </select>
-            <p className="mt-1.5 text-xs text-ink3">embedding 用途用于记忆的语义召回；上下文窗口对它无效。</p>
+            <p className="mt-1.5 text-xs text-ink3">embedding 用途用于记忆的语义召回，不参与对话上下文压缩。</p>
           </div>
           <div>
-            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="context-window">上下文窗口（tokens）</label>
-            <select
-              id="context-window"
-              className={`${inputCls} font-sans`}
-              value={form.windowChoice}
-              onChange={(e) => setForm({ ...form, windowChoice: e.target.value })}
-            >
-              <option value="default">默认（64K）</option>
-              <option value="32768">32K</option>
-              <option value="65536">64K</option>
-              <option value="131072">128K</option>
-              <option value="200000">200K</option>
-              <option value="custom">自定义…</option>
-            </select>
-            {form.windowChoice === "custom" && (
-              <input
-                aria-label="自定义上下文窗口"
-                className={`${inputCls} mt-2`}
-                type="number"
-                min={1000}
-                step={1000}
-                placeholder="如 96000"
-                value={form.customWindow}
-                onChange={(e) => setForm({ ...form, customWindow: e.target.value })}
-              />
+            <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="context-window">
+              {form.kind === "embedding" ? "单次输入上限（tokens）" : "上下文窗口（tokens）"}
+            </label>
+            {form.kind === "embedding" ? (
+              <>
+                <input
+                  id="context-window"
+                  aria-label="embedding 单次输入上限"
+                  className={inputCls}
+                  type="number"
+                  min={1}
+                  step={1}
+                  placeholder="如 1024"
+                  value={form.customWindow}
+                  onChange={(e) => setForm({ ...form, customWindow: e.target.value })}
+                />
+                <p className="mt-1.5 text-xs text-ink3">embedding 模型的输入长度上限，按模型规格填；只作记录，记忆召回不做上下文压缩。</p>
+              </>
+            ) : (
+              <>
+                <select
+                  id="context-window"
+                  className={`${inputCls} font-sans`}
+                  value={form.windowChoice}
+                  onChange={(e) => setForm({ ...form, windowChoice: e.target.value })}
+                >
+                  <option value="default">默认（64K）</option>
+                  <option value="32768">32K</option>
+                  <option value="65536">64K</option>
+                  <option value="131072">128K</option>
+                  <option value="200000">200K</option>
+                  <option value="custom">自定义…</option>
+                </select>
+                {form.windowChoice === "custom" && (
+                  <input
+                    aria-label="自定义上下文窗口"
+                    className={`${inputCls} mt-2`}
+                    type="number"
+                    min={1000}
+                    step={1}
+                    placeholder="如 16384"
+                    value={form.customWindow}
+                    onChange={(e) => setForm({ ...form, customWindow: e.target.value })}
+                  />
+                )}
+                <p className="mt-1.5 text-xs text-ink3">对话接近该窗口的 80% 时自动压缩历史；按你模型的真实窗口填。</p>
+              </>
             )}
-            <p className="mt-1.5 text-xs text-ink3">对话接近该窗口的 80% 时自动压缩历史；按你模型的真实窗口填。</p>
           </div>
 
           <div className="flex gap-2">
