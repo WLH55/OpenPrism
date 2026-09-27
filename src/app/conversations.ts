@@ -535,10 +535,12 @@ export class ConversationStore {
 
   /**
    * 发送一条用户消息（文本 + 附件块）：附件里的图片要求当前有效模型是多模态，否则就地拒绝（不消耗回合）。
+   * 归属校验（2026-09-27 越权补齐）：会话不属于该用户时按不存在拒绝，一个字节都不写。
    * 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
    * query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
    */
   async send(uid: string, cid: string, text: string, attachments: ContentBlock[] = []): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     if (attachments.some((block) => block.type === "image")) {
       const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
       if (!config) throw new ModelNotConfiguredError();
@@ -557,6 +559,17 @@ export class ConversationStore {
     agent.followup(content);
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
+  }
+
+  /**
+   * 手动中止当前回合（2026-09-27 打断）：harness abort 语义——停止模型调用与工具执行，
+   * 已收到的部分输出以 interrupted 消息落日志，回合以 aborted 收尾；Inbox 一并清空
+   * （前端等待队列在客户端，服务端 Inbox 不承载用户排队语义）。
+   */
+  async stop(uid: string, cid: string): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    const agent = await this.agent(uid, cid);
+    agent.cancel();
   }
 
   /** 凝练原料：该用户全部会话的 user/assistant 文本（SQL 取代逐文件全扫） */

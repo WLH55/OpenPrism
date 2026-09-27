@@ -176,6 +176,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify(attachments.length > 0 ? { text, attachments } : { text }),
     }),
+  /** 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息 */
+  stopConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}/stop`, { method: "POST" }),
 
   today: () => request<TodayView>(`/api/today?tz=${-new Date().getTimezoneOffset()}`),
   quickFlow: (input: { category: string; note?: string; value?: number; unit?: string }) =>

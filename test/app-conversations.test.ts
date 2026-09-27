@@ -12,9 +12,10 @@ import { TaskStore } from "../src/app/tasks";
 import { MemoryStore } from "../src/app/memory";
 import { SqliteSessionLog } from "../src/app/session-log";
 import { addModelProvider, readModelConfig, readModelProviderConfig } from "../src/app/secretbox";
-import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
+import { createMockLlmAdapter, llmFailure, type LlmAdapter } from "../src/harness/index";
 import type { ModelConfig } from "../src/app/secretbox";
 import { testDb } from "./helpers-db";
+import { deferred } from "./helpers";
 
 const UID = "u-1";
 const MODEL: ModelConfig = { baseURL: "https://api.mock.local", model: "mock-1" };
@@ -520,5 +521,102 @@ describe("ConversationStore（事件分段读取与归属，2026-09-23）", () =
     expect(store.readEvents(entry.id, { limit: 5, before: 0 })).toEqual([]);
     // 只传 before 不传 limit → 按缺省 50 条上限取
     expect(seqs(store.readEvents(entry.id, { before: 6 }))).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+});
+
+describe("ConversationStore（打断与归属加固，2026-09-27）", () => {
+  it("send：非本人会话按不存在拒绝（越权补齐），一个字节都不落日志", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await expect(store.send("别人", entry.id, "偷写")).rejects.toThrow("不存在");
+    expect(store.readEvents(entry.id)).toHaveLength(0);
+  });
+
+  it("stop：非本人/不存在会话拒绝；空闲时 stop 无害", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await expect(store.stop("别人", entry.id)).rejects.toThrow("不存在");
+    await expect(store.stop(UID, "no-such-cid")).rejects.toThrow("不存在");
+    await expect(store.stop(UID, entry.id)).resolves.toBeUndefined();
+  });
+
+  it("stop：中止当前回合——部分输出保留为 interrupted 消息，turn/end{aborted}，后续脚本不再消耗", async () => {
+    const db = testDb();
+    const started = deferred<void>(); // fn 步骤已进入（模型调用挂起中）
+    let aborted = false; // cancel 是否真正打断了请求 signal
+    const mock = createMockLlmAdapter([
+      {
+        kind: "fn",
+        fn: (_req, options) =>
+          new Promise((_resolve, reject) => {
+            options?.onTextDelta?.("已经流出的");
+            started.resolve();
+            options?.signal?.addEventListener("abort", () => {
+              aborted = true;
+              reject(llmFailure("ABORTED", "aborted by test"));
+            });
+          }),
+      },
+      { kind: "text", text: "中止后不应跑到这里" },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.send(UID, entry.id, "说个长的");
+    await started.promise; // 确定性等模型调用进行中（不靠轮询/真实计时）
+    await store.stop(UID, entry.id);
+    const agent = await store.agent(UID, entry.id);
+    await agent.whenIdle();
+
+    expect(aborted).toBe(true);
+    expect(mock.requests).toHaveLength(1); // 中止后没有第二次模型请求
+    const events = agent.sessionLog.readAll();
+    const partial = events.find((e) => e.type === "assistant/message");
+    expect(partial).toMatchObject({
+      type: "assistant/message",
+      message: { interrupted: true, content: [{ type: "text", text: "已经流出的" }] },
+    });
+    expect(events.at(-1)).toMatchObject({ type: "turn/end", reason: "aborted" });
+  });
+
+  it("stop 后 followup：中止回合收口后，新消息作为新回合开场（打断→改问的链路）", async () => {
+    const db = testDb();
+    const started = deferred<void>();
+    const mock = createMockLlmAdapter([
+      {
+        kind: "fn",
+        fn: (_req, options) =>
+          new Promise((_resolve, reject) => {
+            started.resolve();
+            options?.signal?.addEventListener("abort", () => reject(llmFailure("ABORTED", "aborted")));
+          }),
+      },
+      { kind: "text", text: "新回合的回答" },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    const agent = await store.agent(UID, entry.id);
+
+    await store.send(UID, entry.id, "原问题");
+    await started.promise;
+    await store.stop(UID, entry.id);
+    await store.send(UID, entry.id, "改问这个"); // 前端「立即发送」的时序：先 stop 再 send
+    await agent.whenIdle();
+
+    const events = agent.sessionLog.readAll();
+    const ends = events.filter((e) => e.type === "turn/end");
+    expect(ends.map((e) => (e as { reason: string }).reason)).toEqual(["aborted", "completed"]);
+    const texts = events
+      .filter((e) => e.type === "user/message")
+      .map((e) => (e as { message: { content: { type: string; text?: string }[] } }).message.content.map((b) => b.text ?? "").join(""));
+    expect(texts).toEqual(["原问题", "改问这个"]);
+    const final = events.filter((e) => e.type === "assistant/message").at(-1) as { message: { interrupted?: boolean } };
+    expect(final.message.interrupted).toBeUndefined();
   });
 });

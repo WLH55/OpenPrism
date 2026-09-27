@@ -213,6 +213,33 @@ describe("HTTP API", () => {
     controller.abort();
   });
 
+  it("会话归属（2026-09-27 越权补齐 + 打断端点）：他人 cid 的 messages/stop/stream 一律 404；本人空闲 stop 无害 200", async () => {
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "intruder", password: "hunter2" }));
+    expect(reg.status).toBe(200);
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+
+    const created = await fetch(`${baseUrl}/api/conversations`, {
+      ...json({}),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    const conv = (await created.json()) as { id: string };
+
+    const tamper = await fetch(`${baseUrl}/api/conversations/${conv.id}/messages`, {
+      ...json({ text: "偷写" }),
+      headers: { "Content-Type": "application/json", cookie: otherCookie },
+    });
+    expect(tamper.status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/conversations/${conv.id}/stop`, { method: "POST", headers: { cookie: otherCookie } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/conversations/${conv.id}/stream`, { headers: { cookie: otherCookie } })).status).toBe(404);
+    // 越权写入一个字节都不落：日志里没有「偷写」
+    const events = (await (
+      await fetch(`${baseUrl}/api/conversations/${conv.id}/events`, { headers: { cookie } })
+    ).json()) as { type: string; message?: { content?: { text?: string }[] } }[];
+    expect(events.some((e) => e.message?.content?.some((b) => (b.text ?? "").includes("偷写")))).toBe(false);
+    // 本人：空闲时 stop = 无回合可中止，无害返回 200（不消耗 mock 脚本）
+    expect((await fetch(`${baseUrl}/api/conversations/${conv.id}/stop`, { method: "POST", headers: { cookie } })).status).toBe(200);
+  });
+
   it("快速记录（ui 来源）→今天页可见；作废后消失", async () => {
     const posted = await fetch(`${baseUrl}/api/flows`, {
       ...json({ category: "运动", value: 30, unit: "分钟", note: "晨跑" }),

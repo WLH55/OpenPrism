@@ -523,11 +523,15 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       } catch (error) {
         if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
         if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
+        // 归属不符（2026-09-27 越权补齐）按不存在处理，不泄露他人会话存在性
+        if (String((error as Error).message).includes("不存在")) return sendError(res, 404, "会话不存在");
         throw error;
       }
     }
 
     if (sub === "/stream" && method === "GET") {
+      // 归属校验（2026-09-27 越权补齐）：非本人会话不开直播流
+      if (deps.conversations.ownerOf(cid) !== uid) return sendError(res, 404, "会话不存在");
       let agent;
       try {
         agent = await deps.conversations.agent(uid, cid);
@@ -556,6 +560,17 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         clearInterval(heartbeat);
       });
       return;
+    }
+
+    // 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息
+    if (sub === "/stop" && method === "POST") {
+      try {
+        await deps.conversations.stop(uid, cid);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
+        return sendError(res, 404, String((error as Error).message));
+      }
     }
 
     // 会话伙伴绑定/切换（D4.2）
