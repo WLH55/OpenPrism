@@ -135,6 +135,11 @@ export const MenuIcon = (p: P) => (
     <path d="M4 6h16M4 12h16M4 18h16" />
   </svg>
 );
+export const StopIcon = ({ className = "h-4 w-4" }: P) => (
+  <svg className={className} viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+    <rect x="5" y="5" width="10" height="10" rx="1.5" />
+  </svg>
+);
 export const CloseIcon = (p: P) => (
   <svg {...base(p.className)}>
     <path d="M18 6 6 18M6 6l12 12" />

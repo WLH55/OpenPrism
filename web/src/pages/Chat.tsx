@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, api2, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
-import { CheckSolidIcon, ChevronDownIcon, SlidersIcon, SwitchPartnerIcon } from "../icons";
+import { CheckSolidIcon, ChevronDownIcon, CloseIcon, SlidersIcon, StopIcon, SwitchPartnerIcon } from "../icons";
 import { FaceAvatar } from "../components/FaceEditor";
 import { AttachmentTray, toAttachmentInputs, type PendingAttachment } from "../components/Attachments";
 import { Markdown } from "../markdown";
@@ -12,9 +12,12 @@ const EVENTS_PAGE_SIZE = 50;
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
   | { kind: "user"; key: string; text: string; images: BlockLoose[]; files: string[] }
-  | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string }
+  | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean }
   | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
   | { kind: "switch"; key: string; label: string };
+
+/** 等待队列条目（2026-09-27）：AI 输出期间发送的消息（文本 + 附件），排队在输入框上方 */
+type QueuedMessage = { key: string; text: string; attachments: PendingAttachment[] };
 
 function foldEvents(
   events: SessionEventLoose[],
@@ -50,6 +53,7 @@ function foldEvents(
         text: text || "…",
         reasoning: event.message?.reasoning ?? "",
         agentId: agentIdAt(event.ts),
+        interrupted: event.message?.interrupted === true,
       });
     } else if (event.type === "tool/call") {
       items.push({ kind: "receipt", key: `t${event.id}`, name: event.name ?? "?", ok: true, text: "执行中…" });
@@ -92,6 +96,10 @@ export function Chat({
   const [composerError, setComposerError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // AI 正在输出（2026-09-27 打断与排队）：SSE status/turn-end 事件驱动，发送按钮据此变形
+  const [generating, setGenerating] = useState(false);
+  // 等待队列：AI 输出期间发送的消息暂存于此，回复完成后按入队顺序自动发出
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
   const openImage = useLightbox();
   const [showReasoning, setShowReasoning] = useState(true);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -101,6 +109,10 @@ export function Chat({
   const headerRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeConvId;
+  // SSE 回调要读最新值的镜像（activeIdRef 同款模式）：队列、自动出队的在途标记、发送管线
+  const queueRef = useRef<QueuedMessage[]>([]);
+  const flushInFlightRef = useRef(false);
+  const deliverRef = useRef<(text: string, attachments: PendingAttachment[]) => Promise<boolean>>(async () => false);
 
   const agentName = useCallback(
     (id: string): string => agents.find((a) => a.id === id)?.name ?? "新伙伴",
@@ -206,13 +218,122 @@ export function Chat({
       .catch(() => undefined);
   }, []);
 
+  /** 实际发送一条消息（2026-09-27 从 send 抽出，队列出队复用）：乐观插本地气泡；失败撤泡 + 提示，内容回退由调用方决定 */
+  const deliver = async (text: string, outgoing: PendingAttachment[]): Promise<boolean> => {
+    if (!activeConvId) return false;
+    const localKey = `local-${Date.now()}`;
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user",
+        key: localKey,
+        text,
+        images: outgoing.filter((item) => item.kind === "image").map((item) => ({ type: "image", mediaType: item.mediaType, data: item.dataBase64 })),
+        files: outgoing.filter((item) => item.kind === "file").map((item) => item.name),
+      },
+    ]);
+    try {
+      await api.sendMessage(activeConvId, text, toAttachmentInputs(outgoing));
+      return true;
+    } catch (e) {
+      const error = e as Error & { status?: number; code?: string };
+      setItems((prev) => prev.filter((item) => item.key !== localKey));
+      if (error.code === "model_not_configured") setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
+      else if (error.code === "model_not_multimodal") setComposerError(error.message);
+      else setBanner(`发送失败：${error.message}`);
+      return false;
+    }
+  };
+  deliverRef.current = deliver;
+
+  /**
+   * 回合收尾（turn-end / status idle / error / budget-exhausted）：置闲 + 幂等出队队首。
+   * 在途标记保证同一收尾事件只发一条（turn-end 与 status idle 常背靠背到达）；
+   * 发送失败退回队首——此时无回合在跑，不会再触发自动发送，等用户处理。
+   */
+  const settleAndFlush = () => {
+    setGenerating(false);
+    if (flushInFlightRef.current) return;
+    const next = queueRef.current[0];
+    if (!next) return;
+    flushInFlightRef.current = true;
+    queueRef.current = queueRef.current.slice(1);
+    setQueue(queueRef.current);
+    void deliverRef.current(next.text, next.attachments).then((ok) => {
+      flushInFlightRef.current = false;
+      if (!ok) {
+        queueRef.current = [next, ...queueRef.current];
+        setQueue(queueRef.current);
+      }
+    });
+  };
+
+  /** 点击发送：空闲直接发；AI 输出中入等待队列（回复完成后自动发出，可立即发送/删除） */
+  const send = () => {
+    const text = input.trim();
+    if ((text === "" && attachments.length === 0) || !activeConvId) return;
+    setInput("");
+    setAttachments([]);
+    setComposerError(null);
+    if (generating) {
+      queueRef.current = [...queueRef.current, { key: `q-${Date.now()}`, text, attachments }];
+      setQueue(queueRef.current);
+      return;
+    }
+    void deliver(text, attachments).then((ok) => {
+      // 发送失败：把内容还给输入区，用户改完模型就能直接重发
+      if (!ok) {
+        setInput(text);
+        setAttachments(attachments);
+      }
+    });
+  };
+
+  /** 停止 AI 输出：中止当前回合（已生成的部分保留并标「已中止」） */
+  const stopGenerating = async () => {
+    if (!activeConvId) return;
+    try {
+      await api.stopConversation(activeConvId);
+    } catch {
+      /* 停止失败静默：以 SSE 事件为准，回合结束会自行收尾 */
+    }
+  };
+
+  /** 队列条目「立即发送」：先中止当前输出，随后立即发出；失败退回队列 */
+  const sendQueuedNow = async (item: QueuedMessage) => {
+    queueRef.current = queueRef.current.filter((q) => q.key !== item.key);
+    setQueue(queueRef.current);
+    if (generating) await stopGenerating();
+    const ok = await deliver(item.text, item.attachments);
+    if (!ok) {
+      queueRef.current = [item, ...queueRef.current.filter((q) => q.key !== item.key)];
+      setQueue(queueRef.current);
+    }
+  };
+
+  /** 队列条目「删除」：取消这段待发内容 */
+  const removeQueued = (key: string) => {
+    queueRef.current = queueRef.current.filter((q) => q.key !== key);
+    setQueue(queueRef.current);
+  };
+
   // 会话的确保与选中在壳子完成；此处只订阅当前会话
   useEffect(() => {
+    // 换会话/删光会话（activeConvId 变 null 而 Chat 仍挂载）：清流式残留与等待队列——
+    // 队列是原会话的待发内容，不能带去新会话，也不能挂在无会话的空界面上
+    setStream(null);
+    setGenerating(false);
+    queueRef.current = [];
+    setQueue([]);
     if (!activeConvId) return;
     void loadEvents(activeConvId).catch(() => undefined);
     const close = openConversationStream(activeConvId, (event: LiveEventLoose) => {
       if (activeIdRef.current !== activeConvId) return;
-      if (event.type === "reasoning-delta") {
+      if (event.type === "status") {
+        // 连接时服务端先推当前状态；断线重连也会重推（此处出队幂等，不会重发）
+        if (event.status === "running") setGenerating(true);
+        else settleAndFlush();
+      } else if (event.type === "reasoning-delta") {
         setStream((s) => ({ reasoning: (s?.reasoning ?? "") + (event.text ?? ""), text: s?.text ?? "" }));
       } else if (event.type === "text-delta") {
         setStream((s) => ({ reasoning: (s?.reasoning ?? ""), text: (s?.text ?? "") + (event.text ?? "") }));
@@ -232,6 +353,7 @@ export function Chat({
             .then(() => reloadConversations())
             .catch(() => undefined);
         }
+        settleAndFlush();
       } else if (event.type === "tool-call") {
         setItems((prev) => [
           ...prev,
@@ -278,38 +400,6 @@ export function Chat({
     document.addEventListener("click", onDoc);
     return () => document.removeEventListener("click", onDoc);
   }, []);
-
-  const send = async () => {
-    const text = input.trim();
-    if ((text === "" && attachments.length === 0) || !activeConvId) return;
-    const outgoing = attachments;
-    const localKey = `local-${Date.now()}`;
-    setInput("");
-    setAttachments([]);
-    setComposerError(null);
-    setItems((prev) => [
-      ...prev,
-      {
-        kind: "user",
-        key: localKey,
-        text,
-        images: outgoing.filter((item) => item.kind === "image").map((item) => ({ type: "image", mediaType: item.mediaType, data: item.dataBase64 })),
-        files: outgoing.filter((item) => item.kind === "file").map((item) => item.name),
-      },
-    ]);
-    try {
-      await api.sendMessage(activeConvId, text, toAttachmentInputs(outgoing));
-    } catch (e) {
-      // 发送失败：撤掉本地气泡、把内容还给输入区，用户改完模型就能直接重发
-      const error = e as Error & { status?: number; code?: string };
-      setItems((prev) => prev.filter((item) => item.key !== localKey));
-      setInput(text);
-      setAttachments(outgoing);
-      if (error.code === "model_not_configured") setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
-      else if (error.code === "model_not_multimodal") setComposerError(error.message);
-      else setBanner(`发送失败：${error.message}`);
-    }
-  };
 
   const pickPartner = async (id: string) => {
     setPickerOpen(false);
@@ -597,6 +687,9 @@ export function Chat({
                   <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
                     <Markdown text={item.text} />
                   </div>
+                  {item.interrupted && (
+                    <span className="w-fit rounded-md bg-warm2 px-2 py-0.5 text-[11px] text-warm">已中止</span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -643,6 +736,30 @@ export function Chat({
           {composerError && (
             <p className="mb-2 rounded-lg border border-warm/40 bg-warm2/50 px-3 py-2 text-xs leading-relaxed text-warm">{composerError}</p>
           )}
+          {/* 等待队列（2026-09-27）：AI 输出期间发送的消息排队于此，回复完成后自动发出；可立即发送或删除 */}
+          {queue.map((item) => (
+            <div key={item.key} className="mb-1.5 flex items-center gap-2 rounded-xl border border-line bg-surface2 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm text-ink">{item.text !== "" ? item.text : `（${item.attachments.length} 个附件）`}</p>
+                <p className="text-xs text-ink3">
+                  AI 回复完成后自动发送{item.attachments.length > 0 ? ` · ${item.attachments.length} 个附件` : ""}
+                </p>
+              </div>
+              <button
+                className="shrink-0 rounded-lg bg-accent2 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => void sendQueuedNow(item)}
+              >
+                立即发送
+              </button>
+              <button
+                className="shrink-0 rounded-lg border border-line bg-surface p-1.5 text-ink3 transition hover:bg-surface2 hover:text-ink"
+                onClick={() => removeQueued(item.key)}
+                title="删除这段待发内容"
+              >
+                <CloseIcon className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
           <div className="flex items-end gap-2">
             <textarea
               rows={1}
@@ -651,18 +768,31 @@ export function Chat({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                // isComposing：中文输入法组词时的 Enter 是确认候选词，不是发送
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  void send();
+                  send();
                 }
               }}
             />
-            <button
-              className="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
-              onClick={() => void send()}
-            >
-              发送
-            </button>
+            {/* AI 输出中：输入区为空 → 停止键（中止当前回合）；有内容 → 发送（入等待队列） */}
+            {generating && input.trim() === "" && attachments.length === 0 ? (
+              <button
+                className="flex items-center gap-1.5 rounded-xl bg-warm2 px-4 py-2.5 text-sm font-semibold text-warm transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => void stopGenerating()}
+                title="停止 AI 输出（保留已生成的部分）"
+              >
+                <StopIcon className="h-4 w-4" />
+                停止
+              </button>
+            ) : (
+              <button
+                className="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => send()}
+              >
+                发送
+              </button>
+            )}
           </div>
         </footer>
       </main>
