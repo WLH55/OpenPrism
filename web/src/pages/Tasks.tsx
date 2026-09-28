@@ -17,7 +17,7 @@ type CustomUnit = (typeof CUSTOM_UNITS)[number];
 /** 分钟/小时按固定间隔从创建时刻跑（无时刻）；天及以上锚当日 HH:mm */
 const isTimedUnit = (u: CustomUnit): boolean => u === "day" || u === "week" || u === "month" || u === "year";
 
-type SchedKind = "hourly" | "daily" | "workday" | "weekly" | "monthly" | "custom";
+type SchedKind = "once" | "hourly" | "daily" | "workday" | "weekly" | "monthly" | "custom";
 
 const SCHEDULE_TYPES: { value: SchedKind; label: string }[] = [
   { value: "hourly", label: "每小时" },
@@ -25,6 +25,7 @@ const SCHEDULE_TYPES: { value: SchedKind; label: string }[] = [
   { value: "workday", label: "每工作日" },
   { value: "weekly", label: "每周" },
   { value: "monthly", label: "每月" },
+  { value: "once", label: "单次" },
   { value: "custom", label: "自定义" },
 ];
 
@@ -36,6 +37,9 @@ const asUnit = (unit: TaskTriggerLoose["unit"]): CustomUnit => (unit !== undefin
 const pad = (n: number): string => String(n).padStart(2, "0");
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+const SECONDS = MINUTES; // 秒与分同为 0..59
+/** 本地日期串 YYYY-MM-DD（input[type=date] 的值格式） */
+const localDateStr = (d: Date): string => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const DAYS_31 = Array.from({ length: 31 }, (_, i) => i + 1);
 const TZ_OFFSET_MINUTES = -new Date().getTimezoneOffset(); // 本地时区（如 UTC+8 → 480）
 
@@ -92,6 +96,11 @@ function triggerShort(trigger: TaskTriggerLoose): string {
       if (hourly) return "每小时";
       return "cron";
     }
+    case "once": {
+      if (!trigger.at) return "单次";
+      const d = new Date(trigger.at);
+      return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}${d.getSeconds() !== 0 ? `:${pad(d.getSeconds())}` : ""}`;
+    }
     default:
       return "—";
   }
@@ -114,6 +123,11 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [minuteOfHour, setMinuteOfHour] = useState(0);
   const [weekdays, setWeekdays] = useState<number[]>(WORKDAYS);
   const [monthDay, setMonthDay] = useState(1);
+  // 单次（once 触发器）：年月日 + 时分秒，默认明天 09:00:00
+  const [onceDate, setOnceDate] = useState(() => localDateStr(new Date(Date.now() + 86400000)));
+  const [onceHour, setOnceHour] = useState(9);
+  const [onceMinute, setOnceMinute] = useState(0);
+  const [onceSecond, setOnceSecond] = useState(0);
   // 自定义重复（interval 触发器）：每 N 天/周/月/年 + 结束条件
   const [customEvery, setCustomEvery] = useState(1);
   const [customUnit, setCustomUnit] = useState<CustomUnit>("day");
@@ -165,6 +179,19 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
       case "monthly":
         trigger = { kind: "monthly", day: monthDay, time: createTime };
         break;
+      case "once": {
+        const at = new Date(`${onceDate}T${pad(onceHour)}:${pad(onceMinute)}:${pad(onceSecond)}`).getTime();
+        if (onceDate === "" || !Number.isFinite(at)) {
+          setMessage("单次：先选一个日期");
+          return;
+        }
+        if (at <= Date.now()) {
+          setMessage("单次时刻需要晚于现在");
+          return;
+        }
+        trigger = { kind: "once", at };
+        break;
+      }
       case "custom": {
         if (customEnd === "date" && customEndDate === "") {
           setMessage("自定义重复：选了「指定日期」就要挑一个结束日期");
@@ -217,7 +244,8 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
 
   const enabled = tasks.filter((t) => t.enabled);
   const daily = enabled.filter((t) => t.trigger.kind === "daily");
-  const recurring = enabled.filter((t) => !["daily"].includes(t.trigger.kind));
+  const once = enabled.filter((t) => t.trigger.kind === "once");
+  const recurring = enabled.filter((t) => t.trigger.kind !== "daily" && t.trigger.kind !== "once");
   const disabled = tasks.filter((t) => !t.enabled);
 
   const taskRow = (task: TaskLoose) => (
@@ -296,6 +324,8 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         return `每周${(weekdays.length > 0 ? weekdays : [1]).map((d) => WEEKDAY[d]).join("、")} ${createTime}`;
       case "monthly":
         return `每月 ${monthDay} 号 ${createTime}`;
+      case "once":
+        return `单次 ${onceDate} ${pad(onceHour)}:${pad(onceMinute)}:${pad(onceSecond)}`;
       default: {
         const every = Math.max(1, Math.floor(customEvery) || 1);
         const end = customEnd === "date" && customEndDate !== "" ? ` · 至 ${customEndDate}` : " · 永不结束";
@@ -395,6 +425,32 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
                     </option>
                   ))}
                 </select>
+              )}
+              {schedKind === "once" && (
+                <>
+                  <input type="date" className={selectCls} value={onceDate} onChange={(e) => setOnceDate(e.target.value)} aria-label="日期" />
+                  <select className={selectCls} value={onceHour} onChange={(e) => setOnceHour(Number(e.target.value))} aria-label="小时">
+                    {HOURS.map((h) => (
+                      <option key={h} value={h}>
+                        {pad(h)}
+                      </option>
+                    ))}
+                  </select>
+                  <select className={selectCls} value={onceMinute} onChange={(e) => setOnceMinute(Number(e.target.value))} aria-label="分钟">
+                    {MINUTES.map((m) => (
+                      <option key={m} value={m}>
+                        {pad(m)}
+                      </option>
+                    ))}
+                  </select>
+                  <select className={selectCls} value={onceSecond} onChange={(e) => setOnceSecond(Number(e.target.value))} aria-label="秒">
+                    {SECONDS.map((s) => (
+                      <option key={s} value={s}>
+                        {pad(s)}
+                      </option>
+                    ))}
+                  </select>
+                </>
               )}
               {(schedKind === "daily" || schedKind === "workday" || schedKind === "weekly" || schedKind === "monthly" || (schedKind === "custom" && isTimedUnit(customUnit))) && (
                 <>
@@ -516,6 +572,17 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         <div className="space-y-1.5">
           {daily.length === 0 && <p className="text-sm text-ink3">（无）</p>}
           {daily.map((task) => (
+            <div key={task.id}>{taskRow(task)}</div>
+          ))}
+        </div>
+      </section>
+
+      {/* 单次任务（once 触发器：到点跑一次即止，错过 <24h 补跑） */}
+      <section className="mb-6">
+        <h2 className="mb-2 text-sm font-semibold text-ink">单次任务</h2>
+        <div className="space-y-1.5">
+          {once.length === 0 && <p className="text-sm text-ink3">（无）</p>}
+          {once.map((task) => (
             <div key={task.id}>{taskRow(task)}</div>
           ))}
         </div>

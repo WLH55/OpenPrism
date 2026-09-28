@@ -213,11 +213,12 @@ export function nextDue(trigger: TaskTrigger, fromTs: number, tz: number): numbe
 
 const WEEKDAY_NAMES = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"]; // 1=周一 … 7=周日
 
-/** 按任务时区显示时刻（用户看到的是自己钟面上的日期与钟点） */
+/** 按任务时区显示时刻（用户看到的是自己钟面上的日期与钟点）；秒非零时补 :ss（单次任务可指定到秒），整分保持 HH:mm */
 export function formatLocal(ts: number, tzOffsetMinutes: number): string {
   const shifted = new Date(ts + tzOffsetMinutes * 60000);
   const pad = (n: number): string => String(n).padStart(2, "0");
-  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  const base = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  return ts % 60000 === 0 ? base : `${base}:${pad(shifted.getUTCSeconds())}`;
 }
 
 /** 触发规则的人话描述（到点注入与记忆提取共用同一份口径） */

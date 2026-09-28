@@ -213,8 +213,9 @@ describe("触发描述与到点注入（提醒会话上下文）", () => {
     expect(describeTrigger({ kind: "interval", every: 2, unit: "hour", startTs: 0 })).toBe("每 2 小时");
     expect(describeTrigger({ kind: "interval", every: 1, unit: "day", time: "09:00", startTs: 0 })).toBe("每天 09:00");
     expect(describeTrigger({ kind: "cron", expr: "0 9 * * *" })).toBe("cron 表达式 0 9 * * *");
-    // once 按任务时区显示（UTC+8：UTC 00:00 = 当地 08:00）
+    // once 按任务时区显示（UTC+8：UTC 00:00 = 当地 08:00）；秒非零补 :ss，整分保持 HH:mm
     expect(describeTrigger({ kind: "once", at: T("2026-09-03T00:00:00Z") }, TZ)).toBe("单次 2026-09-03 08:00");
+    expect(describeTrigger({ kind: "once", at: T("2026-09-03T00:00:30Z") }, TZ)).toBe("单次 2026-09-03 08:00:30");
   });
 
   it("taskTriggerMessage：自动触发写全任务内容、重复规则、计划时刻与触发时刻", () => {
