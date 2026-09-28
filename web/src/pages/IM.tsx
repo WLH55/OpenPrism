@@ -2,6 +2,7 @@
 // 绑定后：微信里直接对话（进「微信对话」会话，web 同步可见）；定时任务通知渠道可选「微信机器人」。
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { apiIm, type WechatBindState } from "../api";
 import { CloseIcon } from "../icons";
 
@@ -11,7 +12,7 @@ export function IM() {
   const [state, setState] = useState<WechatBindState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [qr, setQr] = useState<{ qrcode: string; imgUrl: string } | null>(null);
+  const [qr, setQr] = useState<{ qrcode: string; content: string } | null>(null);
   const [phase, setPhase] = useState<ScanPhase>("idle");
   // 扫码状态轮询代数：关闭弹层/过期后旧循环自动退场
   const pollGenRef = useRef(0);
@@ -194,11 +195,14 @@ export function IM() {
                 <CloseIcon className="h-4 w-4" />
               </button>
             </div>
-            {qr.imgUrl !== "" ? (
-              <img src={qr.imgUrl} alt="微信登录二维码" className="mx-auto h-56 w-56 rounded-lg border border-line object-contain" />
+            {qr.content !== "" ? (
+              // qrcode_img_content 是 liteapp 落地页 URL 而非图片（真机实证）——前端编码成二维码图形，微信扫它
+              <div className="mx-auto flex h-56 w-56 items-center justify-center rounded-lg border border-line bg-white p-2">
+                <QRCodeSVG value={qr.content} size={208} level="M" />
+              </div>
             ) : (
               <div className="mx-auto flex h-56 w-56 items-center justify-center rounded-lg border border-line text-xs text-ink3">
-                二维码图片地址为空
+                二维码内容为空
               </div>
             )}
             <p className="mt-3 text-center text-xs text-ink3">

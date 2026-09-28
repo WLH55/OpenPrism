@@ -849,7 +849,7 @@ describe("微信桥路由（2026-09-27 iLink 绑定）", () => {
 
     const qr = await fetch(`${baseUrl}/api/wechat/bind/qrcode`, { method: "POST", headers: { cookie } });
     expect(qr.status).toBe(200);
-    expect(await qr.json()).toEqual({ qrcode: "qr-1", imgUrl: "https://img.local/qr-1.png" });
+    expect(await qr.json()).toEqual({ qrcode: "qr-1", content: "https://img.local/qr-1.png" });
 
     expect((await fetch(`${baseUrl}/api/wechat/bind/status`, { headers: { cookie } })).status).toBe(400); // 缺 qrcode
 

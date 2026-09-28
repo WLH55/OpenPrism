@@ -76,10 +76,10 @@ export class WechatBridge {
     this.runners.set(uid, { stopped: false, cursor: "" });
     if (opts?.start !== false) this.startLoop(uid);
     // 欢迎语后台推：不 await（iLink 慢/挂不拖绑定闭环的路由响应，轮询也已先启）；
-    // 无 context_token 的主动推送是否被接受属 Q5 实测项，失败不拦绑定
+    // 无 context_token 的主动推送是否被接受属 Q5 实测项，失败不拦绑定但必须留日志（排障）
     void this.client
       .sendMessage(creds.botToken, creds.ilinkUserId, "", "绑定成功！以后直接在这里跟我说话就行；定时任务也可以选「微信机器人」通知到这里。")
-      .catch(() => undefined);
+      .catch((error) => console.error("[wechat] 欢迎语推送失败（不拦绑定，Q5 实测项）:", error instanceof Error ? error.message : error));
   }
 
   async unbind(uid: string): Promise<void> {
@@ -107,8 +107,8 @@ export class WechatBridge {
 
   // ── 扫码登录（服务端路由代理用；申请与轮询绑定归属） ────
 
-  /** 申请登录二维码并记录归属（status 轮询时校验，防他账号持 qrcode 劫绑） */
-  async newQRCode(uid: string): Promise<{ qrcode: string; imgUrl: string }> {
+  /** 申请登录二维码并记录归属（status 轮询时校验，防他账号持 qrcode 劫绑）；content = 前端要编码成二维码图形的 URL */
+  async newQRCode(uid: string): Promise<{ qrcode: string; content: string }> {
     const qr = await this.client.getBotQRCode();
     this.pendingQRCodes.set(qr.qrcode, uid);
     return qr;
@@ -162,6 +162,7 @@ export class WechatBridge {
         attempts = 0;
       } catch (error) {
         if (this.runners.get(uid) !== mine || mine.stopped) return; // 解绑/过期/被取代收口
+        console.error("[wechat] 轮询出错，退避重试:", error instanceof Error ? error.message : error);
         attempts += 1;
         await sleep(Math.min(1000 * 2 ** (attempts - 1), 30_000));
       }
@@ -190,8 +191,12 @@ export class WechatBridge {
     if (reply === "") return;
     try {
       await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
-    } catch {
-      // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）
+    } catch (error) {
+      // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）——但必须留日志（排障）
+      console.error(
+        `[wechat] 回复推送失败（uid=${uid} cid=${cid} 回复 ${Math.min(reply.length, REPLY_MAX_CHARS)} 字）:`,
+        error instanceof Error ? error.message : error,
+      );
     }
   }
 
@@ -229,7 +234,8 @@ export class WechatBridge {
     try {
       await this.client.sendMessage(bind.botToken, bind.ilink_user_id, "", text.slice(0, 500));
       return true;
-    } catch {
+    } catch (error) {
+      console.error("[wechat] 任务通知推送失败（静默退站内）:", error instanceof Error ? error.message : error);
       return false;
     }
   }
