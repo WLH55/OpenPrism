@@ -92,7 +92,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
           description:
             "day | week | month | year | ndays | deadline。周期习惯用 day/week/month/year/ndays（每个周期重新打卡，如\"每天背单词\"=day、\"每周跑两次\"=week）；一次性的事用 deadline 并填 due（打过一次就算完成，如\"周五前交报告\"）。用户话里没有\"每天/每周\"也没有截止日就先问一句要哪种，不要猜。",
         },
-        due: { type: "string", description: "截止日 YYYY-MM-DD（scope=deadline 必填）" },
+        due: {
+          type: "string",
+          description:
+            "截止日 YYYY-MM-DD（scope=deadline 必填）。相对期限换算成该周期最后一天：本周内=本周日（周一起算）、本月内=月末、今年内=12-31，以系统注入的今天为准；用户说了具体日期就直接用，不要替他改。",
+        },
         ndays: { type: "integer", description: "最近 N 天（scope=ndays 必填）" },
         goalId: { type: "string", description: "挂到的目标 goalId（里程碑用 deadline scope 挂阶段下）" },
       },
@@ -308,7 +312,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         why: { type: "string", description: "direction：为什么重要" },
         outcome: { type: "string", description: "可验收的预期结果" },
         metric: { type: "string", description: "direction：衡量指标" },
-        due: { type: "string", description: "YYYY-MM-DD（阶段截止日常用）" },
+        due: { type: "string", description: "YYYY-MM-DD（阶段截止日常用）。相对期限（本周内/本月内…）取该周期最后一天，与 create_plan 同规" },
         nextStep: { type: "string", description: "（已弃用）下一步统一用 create_plan 建打卡点表达——阶段下第一条未完成的打卡点就是下一步" },
       },
     },
