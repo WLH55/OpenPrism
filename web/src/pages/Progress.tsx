@@ -2,26 +2,6 @@ import { useEffect, useState } from "react";
 import { api, api4, type GoalNodeLoose, type ProgressLoose } from "../api";
 import { catColor } from "../catcolor";
 
-/** 一行迷你条（sparkline）：小图只配一行，不配大版面（B4 图表判据：回答问题才有图） */
-function Sparkline({ data, highlightLast = true }: { data: { date: string; count: number }[]; highlightLast?: boolean }) {
-  const max = Math.max(1, ...data.map((t) => t.count));
-  return (
-    <div className="flex items-end gap-1" style={{ height: 28 }}>
-      {data.map((t, i) => (
-        <div
-          key={t.date}
-          title={`${t.date}：${t.count} 笔`}
-          className="flex-1 rounded-sm"
-          style={{
-            height: `${Math.max(6, (t.count / max) * 100)}%`,
-            background: t.count === 0 ? "var(--surface-2)" : highlightLast && i === data.length - 1 ? "var(--warm)" : "var(--accent)",
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
 /** 目标进度区（B4）：方向 + 里程碑完成度，点击进计划页 */
 function GoalProgress({ onOpenPlans }: { onOpenPlans: () => void }) {
   const [goals, setGoals] = useState<GoalNodeLoose[] | null>(null);
@@ -123,31 +103,6 @@ export function Progress({ onOpenPlans }: { onOpenPlans: () => void }) {
       {/* 目标进度（B4） */}
       <GoalProgress onOpenPlans={onOpenPlans} />
 
-      {/* 连续（streak）+ 历史最长锚点 */}
-      <section className="mb-5 rounded-xl border border-line bg-surface p-4">
-        <div className="flex items-start justify-between">
-          <div>
-            <h2 className="text-sm font-semibold text-ink">连续打卡</h2>
-            <p className="mt-0.5 text-xs text-ink3">
-              {view.bestStreak > view.streakDays
-                ? `历史最长 ${view.bestStreak} 天——还差 ${view.bestStreak - view.streakDays} 天追平`
-                : "断过就是从零再来，但历史最长就是你"}
-            </p>
-          </div>
-          <div className="text-right">
-            <div className="num text-3xl font-semibold text-warm">{view.streakDays}</div>
-            <div className="text-xs text-ink3">天</div>
-          </div>
-        </div>
-        <div className="mt-3">
-          <Sparkline data={(view.trend14 ?? []).slice(-7)} />
-        </div>
-        <div className="mt-1 flex justify-between text-[10px] text-ink3">
-          <span>7 天前</span>
-          <span>今天</span>
-        </div>
-      </section>
-
       {/* 完成率（本期计划）+ 周均基准 */}
       <section className="mb-5 rounded-xl border border-line bg-surface p-4">
         <h2 className="text-sm font-semibold text-ink">本周计划完成率</h2>
@@ -207,19 +162,6 @@ export function Progress({ onOpenPlans }: { onOpenPlans: () => void }) {
               </div>
             );
           })}
-        </div>
-      </section>
-
-      {/* 近 14 天趋势：sparkline 一行（大图降级） */}
-      <section className="rounded-xl border border-line bg-surface p-4">
-        <div className="mb-2 flex items-baseline justify-between">
-          <h2 className="text-sm font-semibold text-ink">近 14 天记录趋势</h2>
-          <span className="num text-xs text-ink3">单位：笔</span>
-        </div>
-        <Sparkline data={view.trend14 ?? []} highlightLast={false} />
-        <div className="mt-1 flex justify-between text-[10px] text-ink3">
-          <span>14 天前</span>
-          <span>今天</span>
         </div>
       </section>
     </div>
