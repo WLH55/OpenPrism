@@ -1,21 +1,14 @@
 // 批次2·agents：三段配置「身份 + 灵魂(persona_md) + 能力绑定」；2026-09-07 五步向导改版——
-// 身份字段（描述/emoji/色盘/头像/语言/默认模型）入库，名字显式优先（H1 推导仅创建兜底，persona 编辑不再改名）。
+// 身份字段（描述/emoji/色盘/头像/语言/默认模型）入库；2026-09-28 起名字只来自表单显式输入（不从 persona H1 推导，persona 编辑也不改名）。
 
 import { describe, expect, it } from "vitest";
 import { AgentStore, validateIdentityPatch } from "../src/app/agents";
-import { composeAssistantPrompt, extractAgentName } from "../src/app/persona";
+import { composeAssistantPrompt } from "../src/app/persona";
 import { testDb } from "./helpers-db";
 
+let aidSeq = 0; // 同一 db 内多次 create 需唯一主键
 const store = () =>
-  new AgentStore({ db: testDb(), now: () => 1000, randomUUID: () => "aid-1" });
-
-describe("extractAgentName", () => {
-  it("取首个 H1 文本；无 H1 返回空串", () => {
-    expect(extractAgentName("# 庄丽洪 · 学姐\n你是我认识的人…")).toBe("庄丽洪 · 学姐");
-    expect(extractAgentName("## 二级标题不算\n正文")).toBe("");
-    expect(extractAgentName("没有标题的正文")).toBe("");
-  });
-});
+  new AgentStore({ db: testDb(), now: () => 1000, randomUUID: () => `aid-${++aidSeq}` });
 
 describe("composeAssistantPrompt", () => {
   const NOW = () => Date.UTC(2026, 8, 3, 12, 0, 0);
@@ -72,22 +65,24 @@ describe("composeAssistantPrompt", () => {
 });
 
 describe("AgentStore", () => {
-  it("create：名字从 H1 推导；list 默认绑定空；persona 可读回", async () => {
+  it("create：名字只来自表单（H1 不再推导，缺省「助手」）；list 默认绑定空；persona 可读回", async () => {
     const s = store();
-    const entry = await s.create("u1", { persona: "# 教练\n盯训练。" });
+    const entry = await s.create("u1", { name: "教练", persona: "# 无关标题\n盯训练。" });
     expect(entry.name).toBe("教练");
+    const noName = await s.create("u1", { persona: "# 灵魂标题\n正文" });
+    expect(noName.name).toBe("助手"); // persona 的 H1 不再参与命名；改名走 updateIdentity
     const list = await s.list("u1");
-    expect(list).toHaveLength(1);
+    expect(list).toHaveLength(2);
     expect(list[0]!.binding).toEqual({ skills: [], mcps: [] });
-    expect(await s.persona("u1", entry.id)).toBe("# 教练\n盯训练。");
+    expect(await s.persona("u1", entry.id)).toBe("# 无关标题\n盯训练。");
   });
 
-  it("无 H1 的名字兜底「助手」；persona 编辑不再改名（名字是显式资产）；binding 持久化；remove 生效", async () => {
+  it("无名字兜底「助手」；persona 编辑不改名（名字是表单显式资产）；binding 持久化；remove 生效", async () => {
     const s = store();
     const entry = await s.create("u2", { persona: "随性写的正文，没有标题" });
     expect(entry.name).toBe("助手");
     const renamed = await s.updatePersona("u2", entry.id, "# 庄丽洪 · 学姐\n新文案");
-    expect(renamed.name).toBe("助手"); // 名字不随 H1 变；改名走 updateIdentity
+    expect(renamed.name).toBe("助手"); // 名字与 persona 内容无关；改名走 updateIdentity
     await s.updateIdentity("u2", entry.id, { name: "学姐" });
     expect((await s.list("u2"))[0]!.name).toBe("学姐");
     await s.updateBinding("u2", entry.id, { tools: ["record_flow", "query_ledger"], skills: ["sk-1"], mcps: [] });
@@ -99,8 +94,8 @@ describe("AgentStore", () => {
 
   it("snapshotSync：同步取人设/名字/绑定（systemPrompt 每步热读的底座）；不存在返回 null", async () => {
     const s = store();
-    await s.create("u3", { persona: "# 学姐\n温柔。", binding: { tools: ["query_ledger"], skills: ["sk-1"], mcps: [] } });
-    const snapshot = s.snapshotSync("u3", "aid-1");
+    const entry = await s.create("u3", { name: "学姐", persona: "# 随手标题\n温柔。", binding: { tools: ["query_ledger"], skills: ["sk-1"], mcps: [] } });
+    const snapshot = s.snapshotSync("u3", entry.id);
     expect(snapshot).not.toBeNull();
     expect(snapshot!.name).toBe("学姐");
     expect(snapshot!.persona).toContain("温柔");
@@ -112,7 +107,7 @@ describe("AgentStore", () => {
 describe("AgentStore 身份（五步向导，2026-09-07）", () => {
   const idStore = () => new AgentStore({ db: testDb(), now: () => 1000, randomUUID: () => `aid-${Math.random().toString(36).slice(2, 8)}` });
 
-  it("create 全身份往返：名字显式优先、H1 兜底；list/snapshotSync 带身份", async () => {
+  it("create 全身份往返：名字只认表单字段；list/snapshotSync 带身份", async () => {
     const s = idStore();
     const entry = await s.create("u1", {
       name: "小伴",
@@ -137,9 +132,9 @@ describe("AgentStore 身份（五步向导，2026-09-07）", () => {
       modelProviderId: "prov-1",
     });
     expect(s.snapshotSync("u1", entry.id)!.identity.language).toBe("zh");
-    // H1 兜底仍然生效
+    // H1 不再推导名字：无显式名字一律兜底「助手」
     const fallback = await s.create("u1", { persona: "# 教练\n盯训练。" });
-    expect(fallback.name).toBe("教练");
+    expect(fallback.name).toBe("助手");
   });
 
   it("updateIdentity：补丁式更新；modelProviderId 空串清空绑定", async () => {

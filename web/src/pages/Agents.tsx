@@ -253,7 +253,7 @@ export function AgentEdit({ agentId, onBack }: { agentId: string; onBack: () => 
         </div>
         <textarea
           rows={9}
-          placeholder={"# 名字\n\n## 语气\n…"}
+          placeholder={"## 语气\n…"}
           className={`${inputCls} resize-y font-mono text-sm leading-relaxed`}
           value={persona}
           onChange={(e) => setPersona(e.target.value)}

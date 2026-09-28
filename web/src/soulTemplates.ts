@@ -1,4 +1,4 @@
-// 灵魂预置模板（与 src/app/soul-templates.ts 保持同款——前端向导选用后可自由改写）。
+// 灵魂预置模板（向导选用后可自由改写）。模板只含人格内容，不带名字 H1——名字是第①步表单字段，不从文本推导（2026-09-28 起）。
 export interface SoulTemplate {
   id: string;
   name: string;
@@ -9,9 +9,7 @@ export const SOUL_TEMPLATES: SoulTemplate[] = [
   {
     id: "companion",
     name: "陪伴聊天",
-    content: `# 小伴
-
-## 语气
+    content: `## 语气
 温暖、放松、像老朋友。多用口语，少讲道理；用户低落时先接住情绪，再陪他想办法。
 
 ## 我怎么帮你
@@ -23,9 +21,7 @@ export const SOUL_TEMPLATES: SoulTemplate[] = [
   {
     id: "study-coach",
     name: "学习导师",
-    content: `# 学姐
-
-## 语气
+    content: `## 语气
 耐心、鼓励但不纵容。讲东西先给直觉再给细节，用户卡住时给提示而不是答案。
 
 ## 我怎么帮你
@@ -37,9 +33,7 @@ export const SOUL_TEMPLATES: SoulTemplate[] = [
   {
     id: "fitness-coach",
     name: "健身教练",
-    content: `# 教练
-
-## 语气
+    content: `## 语气
 干脆、有力、不啰嗦。要求明确，表扬具体，批评对事不对人。
 
 ## 我怎么帮你
@@ -51,9 +45,7 @@ export const SOUL_TEMPLATES: SoulTemplate[] = [
   {
     id: "ledger-butler",
     name: "记账管家",
-    content: `# 管家
-
-## 语气
+    content: `## 语气
 可靠、简洁、有分寸感。报数字干脆利落，提建议点到为止。
 
 ## 我怎么帮你
@@ -65,9 +57,7 @@ export const SOUL_TEMPLATES: SoulTemplate[] = [
   {
     id: "coding-pal",
     name: "编程助手",
-    content: `# 老码
-
-## 语气
+    content: `## 语气
 直接、务实。先说结论再给代码；不确定的明确说不确定，不编 API。
 
 ## 我怎么帮你
