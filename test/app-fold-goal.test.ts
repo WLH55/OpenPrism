@@ -248,8 +248,7 @@ describe("todayView 增补（B1）", () => {
     expect(view.goalCard.phases[0]).toMatchObject({ title: "8 周减脂", nextStep: "约教练做体测" });
   });
 
-  it("计划状态折叠（2026-09-28 用户验收）：已过期收编且排最前；未开始/进行中/待做/已完成各就各位；历史完成且已过期的沉出", () => {
-    const view = todayView(
+  it("计划状态折叠（2026-09-28 用户验收）：已过期收编且排最前；未开始/进行中/待做/已完成各就各位；历史完成且已过期的沉出", () => {    const view = todayView(
       records(
         { kind: "plan", ts: NOW - 90000, source: "ui", planId: "a", title: "逾期打卡点", scope: "deadline", due: "2026-09-26" },
         { kind: "plan", ts: NOW - 80000, source: "ui", planId: "b", title: "今日截止", scope: "deadline", due: TODAY },
@@ -272,6 +271,21 @@ describe("todayView 增补（B1）", () => {
     const g = view.plans.find((p) => p.planId === "g")!;
     expect(g.done).toBe(true);
     expect(g.doneSeqs).toHaveLength(1); // 撤销 = 作废该打卡（与计划页同规）
+  });
+
+  it("计划归属显示（2026-09-28）：挂树的计划带顶层方向 goalTitle，独立待办不带——两种待办的区分信号", () => {
+    const view = todayView(
+      records(
+        mkGoal("d1", 1, { level: "direction", title: "健康" }),
+        mkGoal("p1", 2, { level: "phase", parentId: "d1", title: "8 周减脂" }),
+        { kind: "plan", ts: NOW - 9000, source: "ui", planId: "m1", title: "约教练做体测", scope: "deadline", due: "2026-10-02", goalId: "p1" },
+        { kind: "plan", ts: NOW - 8000, source: "ui", planId: "t1", title: "买手机壳", scope: "deadline", due: "2026-09-29" },
+      ),
+      NOW,
+      TZ,
+    );
+    expect(view.plans.find((p) => p.planId === "m1")!.goalTitle).toBe("健康");
+    expect(view.plans.find((p) => p.planId === "t1")!.goalTitle).toBeUndefined();
   });
 });
 
