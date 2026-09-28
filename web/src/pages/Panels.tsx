@@ -286,7 +286,6 @@ export function Panels() {
                 />
               ))}
             </div>
-            <p className="mt-2 text-xs text-ink3">这个分类没有数值——记次数就够了，不值得放大图</p>
           </div>
         )}
       </section>
