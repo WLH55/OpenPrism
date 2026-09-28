@@ -441,4 +441,9 @@ export const apiIm = {
   bindStatus: (qrcode: string) => request<{ status: "wait" | "scaned" | "confirmed" | "expired" }>(`/api/wechat/bind/status?qrcode=${encodeURIComponent(qrcode)}`),
   bindState: () => request<WechatBindState>("/api/wechat/bind"),
   unbind: () => request<{ ok: boolean }>("/api/wechat/bind", { method: "DELETE" }),
+  /** 「微信对话」会话当前绑定的伙伴（2026-09-28 增补）：null = 默认助手 */
+  bindAgentState: () => request<{ agentId: string | null }>("/api/wechat/bind/agent"),
+  /** 切换伙伴（null = 默认助手）；web 与微信同一会话，同步生效 */
+  bindAgent: (agentId: string | null) =>
+    request<{ ok: boolean }>("/api/wechat/bind/agent", { method: "PUT", body: JSON.stringify({ agentId }) }),
 };

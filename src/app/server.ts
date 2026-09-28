@@ -581,9 +581,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return sendJson(res, 200, await deps.conversations.metaFor(uid, cid));
     }
     if (sub === "/agent" && method === "PUT") {
-      const body = (await readBody(req)) as { agentId?: string };
+      const body = (await readBody(req)) as { agentId?: string | null };
       try {
-        await deps.conversations.switchAgent(uid, cid, String(body.agentId ?? ""));
+        await deps.conversations.switchAgent(uid, cid, body.agentId ?? null);
         return sendJson(res, 200, { ok: true });
       } catch (error) {
         if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
@@ -639,6 +639,22 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
     await deps.wechat.unbind(uid);
     return sendJson(res, 200, { ok: true });
+  }
+  // 「微信对话」会话的伙伴绑定（2026-09-28 增补）：null = 默认助手；切换对 web/微信同步生效
+  if (path === "/api/wechat/bind/agent" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    return sendJson(res, 200, { agentId: await deps.wechat.currentAgent(uid) });
+  }
+  if (path === "/api/wechat/bind/agent" && method === "PUT") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    const body = (await readBody(req)) as { agentId?: string | null };
+    try {
+      await deps.wechat.switchAgent(uid, body.agentId ?? null);
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
+      return sendError(res, 404, String((error as Error).message));
+    }
   }
 
   // ── 智能体（三段配置） ─────────────────────────────────

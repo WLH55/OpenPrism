@@ -904,4 +904,28 @@ describe("微信桥路由（2026-09-27 iLink 绑定）", () => {
     expect(mine.status).toBe(200);
     expect(await mine.json()).toEqual({ status: "wait" });
   });
+
+  it("微信对话伙伴（2026-09-28 增补）：401 门；默认 null → 切到具体 → 切回 null；非法 id 404", async () => {
+    expect((await fetch(`${baseUrl}/api/wechat/bind/agent`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/wechat/bind/agent`, { ...json({ agentId: null }), headers: { "Content-Type": "application/json" } })).status).toBe(401);
+
+    const initial = (await (await fetch(`${baseUrl}/api/wechat/bind/agent`, { headers: { cookie } })).json()) as { agentId: string | null };
+    expect(initial.agentId).toBeNull(); // 会话未建/未绑定 = 默认助手
+
+    const created = (await (await fetch(`${baseUrl}/api/agents`, {
+      ...json({ name: "教练", persona: "# 教练\n盯训练。" }),
+      headers: { "Content-Type": "application/json", cookie },
+    })).json()) as { id: string };
+
+    const put = (agentId: string | null) =>
+      fetch(`${baseUrl}/api/wechat/bind/agent`, { ...json({ agentId }), method: "PUT", headers: { "Content-Type": "application/json", cookie } });
+
+    expect((await put(created.id)).status).toBe(200);
+    expect(((await (await fetch(`${baseUrl}/api/wechat/bind/agent`, { headers: { cookie } })).json()) as { agentId: string | null }).agentId).toBe(created.id);
+
+    expect((await put(null)).status).toBe(200);
+    expect(((await (await fetch(`${baseUrl}/api/wechat/bind/agent`, { headers: { cookie } })).json()) as { agentId: string | null }).agentId).toBeNull();
+
+    expect((await put("aid-nope")).status).toBe(404);
+  });
 });
