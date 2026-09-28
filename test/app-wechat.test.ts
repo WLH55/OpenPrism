@@ -178,6 +178,16 @@ describe("iLink 客户端（协议面）", () => {
       },
     });
   });
+
+  it("sendMessage：HTTP 200 但业务码非 0 → 抛错带详情（假成功防线）；-14 → TokenExpired", async () => {
+    const biz = fakeILink();
+    biz.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ ret: 0, errcode: 5, errmsg: "rejected by ilink" }));
+    await expect(createILinkClient({ fetch: biz.fetch }).sendMessage("t", "u", "ctx", "hi")).rejects.toThrow("errcode=5");
+
+    const exp = fakeILink();
+    exp.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ errcode: -14 }));
+    await expect(createILinkClient({ fetch: exp.fetch }).sendMessage("t", "u", "", "hi")).rejects.toBeInstanceOf(ILinkTokenExpiredError);
+  });
 });
 
 describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", () => {
@@ -346,7 +356,7 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     fixture.iLink.on((url) => url.includes("get_bot_qrcode"), () => ({ qrcode: "qr-x", qrcode_img_content: "https://img.local/x.png" }));
     fixture.iLink.on((url) => url.includes("qrcode=qr-x"), () => ({ status: "confirmed", bot_token: "bt2", ilink_bot_id: "ib2", ilink_user_id: "iu2" }));
     const qr = await fixture.bridge.newQRCode(UID);
-    expect(qr).toEqual({ qrcode: "qr-x", imgUrl: "https://img.local/x.png" });
+    expect(qr).toEqual({ qrcode: "qr-x", content: "https://img.local/x.png" });
     expect(await fixture.bridge.pollQRStatus("别人", "qr-x")).toBeNull(); // 归属不符：劫绑拦截
     expect(await fixture.bridge.pollQRStatus(UID, "qr-nope")).toBeNull(); // 未知码
     const ok = await fixture.bridge.pollQRStatus(UID, "qr-x");

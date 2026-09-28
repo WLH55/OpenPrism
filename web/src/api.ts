@@ -435,8 +435,8 @@ export interface WechatBindState {
 }
 
 export const apiIm = {
-  /** 申请登录二维码（imgUrl 供 <img> 直展示） */
-  bindQRCode: () => request<{ qrcode: string; imgUrl: string }>("/api/wechat/bind/qrcode", { method: "POST" }),
+  /** 申请登录二维码（content = 要编码成二维码图形的 URL——真机实证它本身不是图片，前端用 QR 组件渲染） */
+  bindQRCode: () => request<{ qrcode: string; content: string }>("/api/wechat/bind/qrcode", { method: "POST" }),
   /** 扫码状态长轮询（~35s 一轮；confirmed 即完成绑定） */
   bindStatus: (qrcode: string) => request<{ status: "wait" | "scaned" | "confirmed" | "expired" }>(`/api/wechat/bind/status?qrcode=${encodeURIComponent(qrcode)}`),
   bindState: () => request<WechatBindState>("/api/wechat/bind"),

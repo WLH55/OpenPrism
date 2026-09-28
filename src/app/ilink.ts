@@ -39,8 +39,12 @@ export interface ILinkInboundMessage {
 }
 
 export interface ILinkClient {
-  /** 申请登录二维码：qrcode = 轮询凭据，imgUrl = 二维码图片 URL（前端 <img> 直展示） */
-  getBotQRCode(): Promise<{ qrcode: string; imgUrl: string }>;
+  /**
+   * 申请登录二维码：qrcode = 轮询凭据，content = 要编码进二维码图形的 URL。
+   * 注意（2026-09-28 真机实证）：qrcode_img_content 是 liteapp.weixin.qq.com 的 SPA 落地页，
+   * 不是图片地址——前端须自行把它渲染成二维码（WeKnora 注释 "URL to render as a QR code" 同义）。
+   */
+  getBotQRCode(): Promise<{ qrcode: string; content: string }>;
   /** 扫码状态长轮询（~35s 一轮）；confirmed 时带凭据 */
   pollQRCodeStatus(qrcode: string): Promise<{ status: "wait" | "scaned" | "confirmed" | "expired"; creds?: ILinkCredentials }>;
   /** 拉一轮消息（35s 长轮询由服务端保持；返回用户文本消息与下一轮游标） */
@@ -84,7 +88,7 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
         qrcode_img_content?: string;
       };
       if (!raw.qrcode) throw new Error(`ilink get_bot_qrcode 返回空 qrcode：${JSON.stringify(raw).slice(0, 200)}`);
-      return { qrcode: raw.qrcode, imgUrl: raw.qrcode_img_content ?? "" };
+      return { qrcode: raw.qrcode, content: raw.qrcode_img_content ?? "" };
     },
 
     async pollQRCodeStatus(qrcode) {
@@ -166,7 +170,16 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
         },
         base_info: { channel_version: CHANNEL_VERSION },
       });
-      await request("/ilink/bot/sendmessage", { method: "POST", body, headers: authHeaders(botToken, body) });
+      const raw = (await request("/ilink/bot/sendmessage", { method: "POST", body, headers: authHeaders(botToken, body) })) as {
+        ret?: number;
+        errcode?: number;
+        errmsg?: string;
+      };
+      // 2026-09-28 真机排障：HTTP 200 不等于送达——业务码必须检查，否则静默丢单（WeKnora 原版也不查，属共同盲区）
+      if (raw.errcode === -14) throw new ILinkTokenExpiredError();
+      if ((raw.ret ?? 0) !== 0 || (raw.errcode ?? 0) !== 0) {
+        throw new Error(`ilink sendmessage ret=${raw.ret} errcode=${raw.errcode}: ${String(raw.errmsg ?? "").slice(0, 200)}`);
+      }
     },
   };
 }
