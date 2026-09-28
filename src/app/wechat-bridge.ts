@@ -188,7 +188,15 @@ export class WechatBridge {
       )
       .filter((text) => text !== "")
       .join("\n\n");
-    if (reply === "") return;
+    if (reply === "") {
+      // 排障（2026-09-28 真机）：事件明明有 assistant 文本却提取为空——把中间态全部现形
+      console.error(
+        `[wechat] 回复提取为空，未推送（uid=${uid} cid=${cid} before=${before} 事件数=${events.length} 类型=[${events
+          .map((event) => event.type)
+          .join(",")}]）`,
+      );
+      return;
+    }
     try {
       await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
     } catch (error) {
