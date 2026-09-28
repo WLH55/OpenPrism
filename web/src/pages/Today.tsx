@@ -327,7 +327,10 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
                 ) : (
                   <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
                 )}
-                <span className={`flex-1 truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
+                <span className="min-w-0 flex-1">
+                  <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
+                  {plan.goalTitle !== undefined && <span className="block truncate text-xs text-ink3">属于：{plan.goalTitle}</span>}
+                </span>
                 {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
                 <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
               </button>

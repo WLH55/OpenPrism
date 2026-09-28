@@ -40,6 +40,8 @@ export interface TodayPlanView {
   state: PlanState;
   /** deadline 型且已完成时的存活 done 打卡 seq（今天页撤销 = 逐条作废，与计划页同规） */
   doneSeqs?: number[];
+  /** 挂目标树的计划带顶层方向标题（「属于：xx」）——与独立待办的区分信号（2026-09-28） */
+  goalTitle?: string;
 }
 
 export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
@@ -128,6 +130,7 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     doneSeqsByPlan.set(r.planId, list);
   }
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
+  const latestGoals = latestGoalSnapshots(records);
   // 周期计划"本周期内"是否已有打卡（不含今天）——区分 待做 / 进行中
   const periodHasCheckin = (plan: PlanRecord): boolean =>
     live.some((r) => r.kind === "checkin" && r.done && r.planId === plan.planId && planScopeCoversToday(plan, r.at, tzOffsetMinutes) && !isToday(r.at));
@@ -152,6 +155,7 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
       const doneToday = plan.scope === "deadline" ? doneEver.has(plan.planId) : checkinsToday.some((c) => c.planId === plan.planId);
       const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
       const state = stateOf(plan, doneToday);
+      const goalTitle = plan.goalId !== undefined ? goalTopTitle(latestGoals, plan.goalId) : undefined;
       return {
         planId: plan.planId,
         title: plan.title,
@@ -161,6 +165,7 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         ...(last !== undefined ? { checkinTs: last.at } : {}),
         state,
         ...(plan.scope === "deadline" && state === "done" ? { doneSeqs: doneSeqsByPlan.get(plan.planId) ?? [] } : {}),
+        ...(goalTitle !== undefined ? { goalTitle } : {}),
       };
     })
     .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.planId.localeCompare(b.planId));
@@ -286,6 +291,19 @@ function firstUncheckedMilestoneByGoal(live: LedgerRecord[], doneEver: Set<strin
     if (cur === undefined || (r.due ?? "9999") < (cur.due ?? "9999")) map.set(r.goalId, r);
   }
   return map;
+}
+
+/** 归属链顶层方向标题（seen 防环）：Top3「属于：xx」与今天页计划列表的归属显示同源 */
+function goalTopTitle(latest: ReturnType<typeof latestGoalSnapshots>, goalId: string): string | undefined {
+  const seen = new Set<string>();
+  let cur = latest.get(goalId);
+  while (cur !== undefined && !seen.has(cur.goalId)) {
+    seen.add(cur.goalId);
+    const up = cur.parentId !== undefined ? latest.get(cur.parentId) : undefined;
+    if (up === undefined) return cur.title;
+    cur = up;
+  }
+  return undefined;
 }
 
 export function goalView(records: LedgerRecord[], now: number, tzOffsetMinutes: number): GoalView {
@@ -418,17 +436,7 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
 
   // 归属链顶层标题（seen 防环）
   const latest = latestGoalSnapshots(records);
-  const topTitleOf = (goalId: string): string | undefined => {
-    const seen = new Set<string>();
-    let cur = latest.get(goalId);
-    while (cur !== undefined && !seen.has(cur.goalId)) {
-      seen.add(cur.goalId);
-      const up = cur.parentId !== undefined ? latest.get(cur.parentId) : undefined;
-      if (up === undefined) return cur.title;
-      cur = up;
-    }
-    return undefined;
-  };
+  const topTitleOf = (goalId: string): string | undefined => goalTopTitle(latest, goalId);
   const itemFor = (plan: PlanRecord, kind: TopItem["kind"]): TopItem => {
     const goalTitle = plan.goalId !== undefined ? topTitleOf(plan.goalId) : undefined;
     return {

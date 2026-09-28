@@ -47,6 +47,8 @@ export interface TodayPlanView {
   state?: "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
   /** deadline 型已完成时的存活打卡 seq；撤销 = 逐条作废（与计划页同规） */
   doneSeqs?: number[];
+  /** 挂目标树的计划带顶层方向标题——独立待办没有此字段 */
+  goalTitle?: string;
 }
 
 export interface TodayFlowView {
