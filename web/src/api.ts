@@ -60,6 +60,73 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
+  /** B1（2026-09-28）：今日必做 + 计划卡 */
+  top3: TopItemLoose[];
+  goalCard: {
+    directions: { goalId: string; title: string; progress: { done: number; total: number; rate: number }; updatedAt: number }[];
+    phases: { goalId: string; title: string; due?: string; nextStep?: string }[];
+    warning?: string;
+  };
+}
+
+/** 今日必做条目（确定性折叠：逾期 > 今日截止 > 覆盖今天 > 阶段下一步补位） */
+export interface TopItemLoose {
+  kind: "overdue" | "dueToday" | "today" | "nextStep";
+  title: string;
+  planId?: string;
+  due?: string;
+  goalTitle?: string;
+}
+
+export type GoalLevel = "direction" | "phase" | "project";
+
+/** 目标节点（服务端 goalView 的层级树成员） */
+export interface GoalNodeLoose {
+  goalId: string;
+  level: GoalLevel;
+  title: string;
+  status: "active" | "paused" | "done" | "archived";
+  parentId?: string;
+  why?: string;
+  outcome?: string;
+  metric?: string;
+  due?: string;
+  nextStep?: string;
+  updatedAt: number;
+  children: GoalNodeLoose[];
+  /** 子树里程碑进度（deadline 型 plan） */
+  progress: { done: number; total: number; rate: number };
+  /** 子树周期计划今日执行 */
+  recurring: { doneToday: number; total: number };
+}
+
+export interface GoalViewLoose {
+  directions: GoalNodeLoose[];
+  activeDirectionCount: number;
+  activePhaseCount: number;
+  warning?: string;
+}
+
+/** 里程碑明细（deadline 型 plan，挂目标树；计划页打卡按钮用） */
+export interface MilestoneLoose {
+  planId: string;
+  title: string;
+  due: string;
+  goalId: string;
+  done: boolean;
+}
+
+export type GoalsPageLoose = GoalViewLoose & { milestones: MilestoneLoose[] };
+
+export interface GoalInput {
+  level: GoalLevel;
+  title: string;
+  parentId?: string;
+  why?: string;
+  outcome?: string;
+  metric?: string;
+  due?: string;
+  nextStep?: string;
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
@@ -185,6 +252,16 @@ export const api = {
   voidRecord: (seq: number) => request<{ ok: boolean }>("/api/void", { method: "POST", body: JSON.stringify({ seq }) }),
   checkin: (planId: string, done = true) =>
     request<{ ok: boolean }>("/api/checkin", { method: "POST", body: JSON.stringify({ planId, done }) }),
+
+  // ── 目标层级（B3，2026-09-28）：方向/阶段/项目树 + UI 写入（修订=追加快照） ──
+  goals: () => request<GoalsPageLoose>(`/api/goals?tz=${-new Date().getTimezoneOffset()}`),
+  createGoal: (input: GoalInput) =>
+    request<{ goalId: string; ts: number }>("/api/goals", { method: "POST", body: JSON.stringify(input) }),
+  updateGoal: (goalId: string, patch: Omit<Partial<GoalInput>, "level"> & { status?: string }) =>
+    request<{ ok: boolean }>(`/api/goals/${encodeURIComponent(goalId)}`, { method: "PUT", body: JSON.stringify(patch) }),
+  /** UI 建计划/里程碑（挂目标树）；对话建计划走 agent 工具，同一账本 */
+  createPlan: (input: { title: string; scope: string; due?: string; goalId?: string }) =>
+    request<{ planId: string }>("/api/plans", { method: "POST", body: JSON.stringify(input) }),
 };
 
 export function openConversationStream(cid: string, onEvent: (event: LiveEventLoose) => void): () => void {
@@ -408,12 +485,21 @@ export interface CategoryPeriodLoose {
   total: number;
   daily: { date: string; count: number; total: number }[];
   flows: TodayFlowView[];
+  /** B4（2026-09-28）：上一同长周期对照（归因句数据源） */
+  lastPeriod: { count: number; total: number };
 }
 export interface ProgressLoose {
   streakDays: number;
   completion: { done: number; total: number; rate: number };
   weekOverWeek: { category: string; thisWeek: number; lastWeek: number; deltaPct: number | null }[];
   trend14: { date: string; count: number }[];
+  /** B4（2026-09-28）：基准锚点 + 行为模式 */
+  bestStreak: number;
+  weeklyDone8w: { weekStart: string; done: number }[];
+  hourBuckets: { morning: number; afternoon: number; evening: number; night: number };
+  topCategory: { category: string; count: number } | null;
+  voidedFlows: number;
+  insights: string[];
 }
 
 export const api4 = {

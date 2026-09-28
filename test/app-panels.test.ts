@@ -69,6 +69,21 @@ describe("categoryView", () => {
     const view = categoryView(rs, { category: "不存在", period: "week", now: NOW, tzOffsetMinutes: TZ });
     expect(view.count).toBe(0);
     expect(view.flows).toEqual([]);
+    expect(view.lastPeriod).toEqual({ count: 0, total: 0 });
+  });
+});
+
+describe("categoryView B4 上期对照（2026-09-28）", () => {
+  it("week 周期：lastPeriod = 上周的笔数与合计（归因句数据源）", () => {
+    const rs = records(
+      flow(NOW - 2 * DAY, "餐饮", 28),  // 本周（当地 9-01 周二? NOW=当地周四 20:00，本周一 8-31 → -2 天=周二）
+      flow(NOW - 9 * DAY, "餐饮", 46),  // 上周
+      flow(NOW - 9 * DAY + 1000, "餐饮", 4),
+    );
+    const view = categoryView(rs, { category: "餐饮", period: "week", now: NOW, tzOffsetMinutes: TZ });
+    expect(view.count).toBe(1);
+    expect(view.total).toBe(28);
+    expect(view.lastPeriod).toEqual({ count: 2, total: 50 });
   });
 });
 
@@ -95,5 +110,44 @@ describe("progressView", () => {
     expect(wow).toMatchObject({ thisWeek: 2, lastWeek: 1, deltaPct: 100 });
     expect(view.trend14).toHaveLength(14);
     expect(view.trend14.at(-1)).toMatchObject({ count: 1 }); // 今天：仅运动（餐饮在周一）
+  });
+});
+
+describe("progressView B4 基准与行为模式（2026-09-28）", () => {
+  it("bestStreak 扫全史：断档后重计，取最长；weeklyDone8w 八周 done 打卡数", () => {
+    const rs = records(
+      // 历史最长 4 连（10 天前起），当前 2 连（昨天+今天）
+      flow(NOW - 10 * DAY, "运动", 1),
+      flow(NOW - 9 * DAY, "运动", 1),
+      flow(NOW - 8 * DAY, "运动", 1),
+      flow(NOW - 7 * DAY, "运动", 1),
+      flow(NOW - DAY, "运动", 1),
+      flow(NOW, "运动", 1),
+      { kind: "checkin", ts: NOW - 6 * DAY, source: "ui", planId: "px", at: NOW - 6 * DAY, done: true },
+      { kind: "checkin", ts: NOW - 100, source: "ui", planId: "px", at: NOW - 100, done: true },
+    );
+    const view = progressView(rs, NOW, TZ);
+    expect(view.streakDays).toBe(2);
+    expect(view.bestStreak).toBe(4);
+    expect(view.weeklyDone8w).toHaveLength(8);
+    expect(view.weeklyDone8w.at(-1)!.done).toBe(1); // 本周：今天打卡 1 次
+  });
+
+  it("insights 有信号才出声：时段聚集（≥10 笔）/ 最活跃分类 / 周均对照", () => {
+    // 全部记录挤在傍晚 18:00（当地），共 12 笔「餐饮」；打卡全在两周前，上周 0 次 → 低于均值
+    const evening = Date.UTC(2026, 8, 3, 10, 0, 0); // 当地 18:00
+    const rs = records(
+      ...Array.from({ length: 12 }, (_, i) => flow(evening + i * 1000, "餐饮", 20)),
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "checkin" as const, ts: NOW - 15 * DAY + i, source: "ui" as const, planId: "px", at: NOW - 15 * DAY + i, done: true })),
+    );
+    const view = progressView(rs, NOW, TZ);
+    expect(view.hourBuckets.evening).toBe(12);
+    expect(view.topCategory).toEqual({ category: "餐饮", count: 12 });
+    expect(view.insights.some((s) => s.includes("傍晚") && s.includes("100%"))).toBe(true);
+    expect(view.insights.some((s) => s.includes("「餐饮」"))).toBe(true);
+    expect(view.insights.some((s) => s.includes("均值低 100%"))).toBe(true);
+    // 数据太少时不出声
+    const thin = progressView(records(flow(NOW, "心情")), NOW, TZ);
+    expect(thin.insights).toEqual([]);
   });
 });

@@ -1,9 +1,9 @@
 import type { ReactNode } from "react";
 import type { View } from "../App";
-import { CategoryIcon, ChatIcon, CloseIcon, MenuIcon, ProgressIcon, TodayIcon } from "../icons";
+import { ChatIcon, CloseIcon, MenuIcon, PlansIcon, ProgressIcon, TodayIcon } from "../icons";
 
-// 窄屏导航（2026-09-23 手机浏览器适配）：底部五项标签栏（对话 / 今天 / 盘面 / 成长 / 更多）+ 左滑抽屉容器。
-// 「更多」打开抽屉（最近对话、伙伴、提醒与设置都在里面）；桌面端（md+）整块不渲染。
+// 窄屏导航（2026-09-23 手机浏览器适配；2026-09-28 B3 重排）：底部五项标签栏（对话 / 今天 / 计划 / 成长 / 更多）
+// + 左滑抽屉容器。「更多」打开抽屉（最近对话、盘面、伙伴、提醒与设置都在里面）；桌面端（md+）整块不渲染。
 
 type IconType = (p: { className?: string }) => JSX.Element;
 
@@ -41,7 +41,7 @@ export function BottomTabs({
     <nav className="flex border-t border-line bg-surface2 pb-[env(safe-area-inset-bottom)] md:hidden" aria-label="主导航">
       {item("chat", "对话", ChatIcon, view === "chat", () => onPick("chat"))}
       {item("today", "今天", TodayIcon, view === "today", () => onPick("today"))}
-      {item("category", "盘面", CategoryIcon, view === "category", () => onPick("category"))}
+      {item("plans", "计划", PlansIcon, view === "plans", () => onPick("plans"))}
       {item("progress", "成长", ProgressIcon, view === "progress", () => onPick("progress"))}
       {item("more", "更多", MenuIcon, moreActive, onMore, unread)}
     </nav>

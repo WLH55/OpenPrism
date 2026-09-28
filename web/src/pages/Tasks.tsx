@@ -487,6 +487,41 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
             </p>
           </div>
+          {/* B4（2026-09-28）简报模板：D7"简报=定时任务用法"的落地入口——一键填好标题/调度/指令 */}
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-ink3">模板：</span>
+            <button
+              type="button"
+              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
+              onClick={() => {
+                setTitle("每日简报");
+                setSchedKind("daily");
+                setHour(8);
+                setMinuteOfHour(30);
+                setInstruction(
+                  "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段计划唯一下一步的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
+                );
+              }}
+            >
+              ☀️ 每日简报（每天 08:30）
+            </button>
+            <button
+              type="button"
+              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
+              onClick={() => {
+                setTitle("每周进化报告");
+                setSchedKind("weekly");
+                setWeekdays([1]);
+                setHour(20);
+                setMinuteOfHour(0);
+                setInstruction(
+                  "生成本周进化报告：先用 query_ledger 查 what=today 与 what=goals，总结：1) 本周完成打卡与上周对比（进步还是透支）；2) 各方向里程碑进度变化；3) 行为模式洞察——记录时段与分类的规律；4) 下周建议聚焦的一件事及原因。用具体数字说话。",
+                );
+              }}
+            >
+              📈 每周报告（周一 20:00）
+            </button>
+          </div>
           <textarea
             className={`${inputCls} mt-2 w-full`}
             rows={2}

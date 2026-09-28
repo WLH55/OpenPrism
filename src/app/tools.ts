@@ -1,11 +1,14 @@
 // 录入工具（D3.4 同源铁律：模型只能经工具写账本；UI 是另一写入方，source 语义不同）。
 // 六件：record_flow / create_plan / checkin_plan / query_ledger 只读 / void_flow+cancel_plan 走作废回路（2026-09-04 补）。
+// goal 三件（2026-09-28 B2，SDD 个人工作台业务借鉴）：create_goal / update_goal（修订=追加快照）/
+// query_ledger what=goals；create_plan 增 goalId 等价外键。
 // execute 返回 canonical JSON value；render 产出人话文本块（模型输入与 UI 回执共用）。
 
 import { randomUUID } from "node:crypto";
 import type { ContentBlock, ToolDefinition } from "../harness/index";
-import { todayView } from "./fold";
-import type { Ledger, LedgerActor, PlanRecord } from "./ledger";
+import { latestGoalSnapshots, validateGoalParenting } from "./goals";
+import { goalView, todayView } from "./fold";
+import type { GoalRecord, Ledger, LedgerActor, PlanRecord } from "./ledger";
 
 export interface LedgerToolsDeps {
   ledger: Ledger;
@@ -78,7 +81,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
 
   const createPlan: ToolDefinition = {
     name: "create_plan",
-    description: "建一个计划/待办：今天要做的事、本周目标、带截止日的任务等。",
+    description: "建一个计划/待办：今天要做的事、本周目标、带截止日的任务等；可挂到某个目标（方向/阶段/项目）下。",
     parameters: {
       type: "object",
       required: ["title", "scope"],
@@ -87,27 +90,36 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         scope: { type: "string", description: "day | week | month | year | ndays | deadline" },
         due: { type: "string", description: "截止日 YYYY-MM-DD（scope=deadline 必填）" },
         ndays: { type: "integer", description: "最近 N 天（scope=ndays 必填）" },
+        goalId: { type: "string", description: "挂到的目标 goalId（里程碑用 deadline scope 挂阶段下）" },
       },
     },
     output: {
       schema: {
         type: "object",
         required: ["planId", "title"],
-        properties: { planId: { type: "string" }, title: { type: "string" } },
+        properties: { planId: { type: "string" }, title: { type: "string" }, goalTitle: { type: "string" } },
       },
       render: (_args, value) => {
-        const v = value as { title: string };
-        return [{ type: "text", text: `已建计划「${v.title}」` }];
+        const v = value as { title: string; goalTitle?: string };
+        return [{ type: "text", text: v.goalTitle ? `已建计划「${v.title}」（${v.goalTitle}）` : `已建计划「${v.title}」` }];
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number };
+      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
       if (typeof input.title !== "string" || input.title.trim() === "") throw new Error("title 必填");
+      if (input.title.trim().length > 200) throw new Error("title 过长（≤200 字）");
       const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
       const scope = scopes.find((s) => s === input.scope);
       if (!scope) throw new Error(`scope 必须是 ${scopes.join(" | ")}`);
       if (scope === "deadline" && typeof input.due !== "string") throw new Error("scope=deadline 需要 due（YYYY-MM-DD）");
       if (scope === "ndays" && (typeof input.ndays !== "number" || input.ndays < 1)) throw new Error("scope=ndays 需要 ndays ≥ 1");
+      const latest = latestGoalSnapshots(ledger.readAll());
+      let goalTitle: string | undefined;
+      if (input.goalId !== undefined) {
+        const goal = latest.get(input.goalId);
+        if (!goal) throw new Error(`goalId "${input.goalId}" 不存在，先用 query_ledger what=goals 查`); // 等价外键
+        goalTitle = goal.title;
+      }
       const planId = `plan-${randomUUID().slice(0, 8)}`;
       await append({
         kind: "plan",
@@ -118,8 +130,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         scope,
         ...(input.due !== undefined ? { due: input.due } : {}),
         ...(input.ndays !== undefined ? { ndays: input.ndays } : {}),
+        ...(input.goalId !== undefined ? { goalId: input.goalId } : {}),
       });
-      return { planId, title: input.title.trim() };
+      return { planId, title: input.title.trim(), ...(goalTitle !== undefined ? { goalTitle } : {}) };
     },
     isConcurrencySafe: () => false,
   };
@@ -164,12 +177,12 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
 
   const queryLedger: ToolDefinition = {
     name: "query_ledger",
-    description: "查用户的账本：今天视图（流水+计划+打卡态）、活跃计划列表、按分类/日期过滤流水。只读。",
+    description: "查用户的账本：今天视图（流水+计划+打卡态+Top3）、目标层级树（方向/阶段/项目+进度）、活跃计划列表、按分类/日期过滤流水。只读。",
     parameters: {
       type: "object",
       required: ["what"],
       properties: {
-        what: { type: "string", description: "today | plans | flows" },
+        what: { type: "string", description: "today | goals | plans | flows" },
         category: { type: "string" },
         from: { type: "string", description: "YYYY-MM-DD" },
         to: { type: "string", description: "YYYY-MM-DD" },
@@ -182,10 +195,17 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       if (input.what === "today") {
         return todayView(ledger.readAll(), now()) as unknown;
       }
+      if (input.what === "goals") {
+        return goalView(ledger.readAll(), now(), 0); // 层级树 + 各级进度（建/改目标前先查 goalId）；工具层 UTC 口径同 today
+      }
       if (input.what === "plans") {
         const plans = active
           .filter((r): r is PlanRecord => r.kind === "plan")
-          .map(({ planId, title, scope, due }) => ({ planId, title, scope, ...(due !== undefined ? { due } : {}) }));
+          .map(({ planId, title, scope, due, goalId }) => ({
+            planId, title, scope,
+            ...(due !== undefined ? { due } : {}),
+            ...(goalId !== undefined ? { goalId } : {}), // 归属目标（打卡/调整时定位层级用）
+          }));
         return { plans };
       }
       if (input.what === "flows") {
@@ -200,7 +220,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
           .sort((a, b) => b.time - a.time);
         return { flows }; // seq 是作废（void_flow）的引用凭据
       }
-      throw new Error("what 必须是 today | plans | flows");
+      throw new Error("what 必须是 today | goals | plans | flows");
     },
     isConcurrencySafe: () => true,
   };
@@ -270,5 +290,137 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  return [recordFlow, createPlan, checkinPlan, queryLedger, voidFlow, cancelPlan];
+  const createGoal: ToolDefinition = {
+    name: "create_goal",
+    description:
+      "建一个目标：direction（长期方向，最多建议同时 3 个）/ phase（8-12 周阶段计划，挂在 direction 下）/ project（项目，挂在 phase 或 direction 下）。里程碑不在这里建——用 create_plan（scope=deadline）挂到阶段下。",
+    parameters: {
+      type: "object",
+      required: ["level", "title"],
+      properties: {
+        level: { type: "string", description: "direction | phase | project" },
+        title: { type: "string" },
+        parentId: { type: "string", description: "phase/project 必填：父目标 goalId（query_ledger what=goals 拿）" },
+        why: { type: "string", description: "direction：为什么重要" },
+        outcome: { type: "string", description: "可验收的预期结果" },
+        metric: { type: "string", description: "direction：衡量指标" },
+        due: { type: "string", description: "YYYY-MM-DD（阶段截止日常用）" },
+        nextStep: { type: "string", description: "phase：唯一下一步" },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        required: ["goalId", "title"],
+        properties: { goalId: { type: "string" }, title: { type: "string" }, hint: { type: "string" } },
+      },
+      render: (_args, value) => {
+        const v = value as { title: string; hint?: string };
+        return [{ type: "text", text: v.hint ? `已建目标「${v.title}」——${v.hint}` : `已建目标「${v.title}」` }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as Record<string, string>;
+      if (typeof input.title !== "string" || input.title.trim() === "") throw new Error("title 必填");
+      if (input.title.trim().length > 200) throw new Error("title 过长（≤200 字）");
+      const levels = ["direction", "phase", "project"] as const;
+      const level = levels.find((l) => l === input.level);
+      if (!level) throw new Error(`level 必须是 ${levels.join(" | ")}`);
+      const latest = latestGoalSnapshots(ledger.readAll());
+      validateGoalParenting(level, "", input.parentId, latest); // 新建无环可言，只校验层级与存在性
+      // 软约束（不 block）：同层 active ≥3 时在回执里提醒聚焦
+      let hint: string | undefined;
+      const activeOfLevel = [...latest.values()].filter((g) => g.level === level && g.status === "active").length;
+      if (activeOfLevel >= 3) hint = `该层级已有 ${activeOfLevel} 个进行中，同时推进太多容易分散注意力，建议先聚焦 3 个以内`;
+      const goalId = `goal-${randomUUID().slice(0, 8)}`;
+      await append({
+        kind: "goal",
+        source: "agent",
+        actor: actor(),
+        goalId,
+        level,
+        title: input.title.trim(),
+        status: "active",
+        ...(input.parentId !== undefined && input.parentId !== "" ? { parentId: input.parentId } : {}),
+        ...(input.why !== undefined && input.why !== "" ? { why: input.why } : {}),
+        ...(input.outcome !== undefined && input.outcome !== "" ? { outcome: input.outcome } : {}),
+        ...(input.metric !== undefined && input.metric !== "" ? { metric: input.metric } : {}),
+        ...(input.due !== undefined && input.due !== "" ? { due: input.due } : {}),
+        ...(input.nextStep !== undefined && input.nextStep !== "" ? { nextStep: input.nextStep } : {}),
+      });
+      return { goalId, title: input.title.trim(), ...(hint !== undefined ? { hint } : {}) };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  const updateGoal: ToolDefinition = {
+    name: "update_goal",
+    description:
+      "修改目标（标题/字段/状态/父级）：只传要改的字段，未提供的字段保持原值（部分更新）；追加新快照生效，历史保留。status：active | paused | done | archived；level 创建后不可改。goalId 从 query_ledger what=goals 拿。",
+    parameters: {
+      type: "object",
+      required: ["goalId"],
+      properties: {
+        goalId: { type: "string" },
+        title: { type: "string" },
+        status: { type: "string", description: "active | paused | done | archived" },
+        parentId: { type: "string" },
+        why: { type: "string" },
+        outcome: { type: "string" },
+        metric: { type: "string" },
+        due: { type: "string" },
+        nextStep: { type: "string" },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        required: ["goalId", "title", "status"],
+        properties: { goalId: { type: "string" }, title: { type: "string" }, status: { type: "string" } },
+      },
+      render: (_args, value) => {
+        const v = value as { title: string; status: string };
+        const statusLabel: Record<string, string> = { active: "进行中", paused: "已暂停", done: "已完成", archived: "已归档" };
+        return [{ type: "text", text: `已更新「${v.title}」（${statusLabel[v.status] ?? v.status}）` }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as Record<string, string>;
+      if (typeof input.goalId !== "string" || input.goalId === "") throw new Error("goalId 必填（query_ledger what=goals 拿）");
+      const latest = latestGoalSnapshots(ledger.readAll());
+      const cur = latest.get(input.goalId);
+      if (!cur) throw new Error(`goalId "${input.goalId}" 不存在，先用 query_ledger what=goals 查`);
+      const statuses = ["active", "paused", "done", "archived"] as const;
+      if (input.status !== undefined && !statuses.some((s) => s === input.status)) {
+        throw new Error(`status 必须是 ${statuses.join(" | ")}`);
+      }
+      // 合并新快照：未提供的字段沿用当前值
+      const optStr = (value: unknown, max = 2000): string | undefined => {
+        if (value === undefined) return undefined;
+        if (typeof value !== "string" || value.length > max) throw new Error(`字段需为不超过 ${max} 字的字符串`);
+        return value;
+      };
+      const newTitle = typeof input.title === "string" ? input.title.trim() : undefined;
+      if (newTitle !== undefined && newTitle.length > 200) throw new Error("title 过长（≤200 字）");
+      const parentIdRaw = optStr(input.parentId, 200);
+      const merged = {
+        ...cur,
+        ...(newTitle !== undefined && newTitle !== "" ? { title: newTitle } : {}), // 空白串视为未提供（与 create 同规）
+        ...(input.status !== undefined ? { status: input.status as GoalRecord["status"] } : {}),
+        ...(input.parentId !== undefined ? { ...(parentIdRaw === "" ? {} : { parentId: parentIdRaw }) } : {}), // 空串=解除父级（与 PUT 路由同语义）
+        ...(optStr(input.why) !== undefined ? { why: optStr(input.why) } : {}),
+        ...(optStr(input.outcome) !== undefined ? { outcome: optStr(input.outcome) } : {}),
+        ...(optStr(input.metric) !== undefined ? { metric: optStr(input.metric) } : {}),
+        ...(optStr(input.due, 200) !== undefined ? { due: optStr(input.due, 200) } : {}),
+        ...(optStr(input.nextStep) !== undefined ? { nextStep: optStr(input.nextStep) } : {}),
+      };
+      validateGoalParenting(merged.level, merged.goalId, merged.parentId, latest); // 换父级时校验层级 + 环
+      // 展开在前、显式覆盖在后：source/actor 以本次落账为准（seq/ts 由 append 重分配）
+      await append({ ...merged, kind: "goal", source: "agent", actor: actor() });
+      return { goalId: merged.goalId, title: merged.title, status: merged.status };
+    },
+    isConcurrencySafe: () => false,
+  };
+
+  return [recordFlow, createPlan, checkinPlan, queryLedger, voidFlow, cancelPlan, createGoal, updateGoal];
 }

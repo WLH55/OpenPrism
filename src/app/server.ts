@@ -2,6 +2,7 @@
 // 路由见 spec §4.2；未登录一律 401 JSON；Key 永不回传（BYOK 铁律）。
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -23,7 +24,9 @@ import {
   type ModelConfig,
 } from "./secretbox";
 import type { Ledger } from "./ledger";
-import { categoryView, listCategories, progressView, todayView } from "./fold";
+import { categoryView, goalView, listCategories, progressView, todayView } from "./fold";
+import { latestGoalSnapshots, validateGoalParenting } from "./goals";
+import type { GoalRecord } from "./ledger";
 import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
 import { parseAttachments } from "./attachments";
 import { faceOf, updateUserFace, type UserRecord } from "./auth";
@@ -1000,6 +1003,136 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       done: body.done ?? true,
     });
     return sendJson(res, 200, { ok: true, ts: record.ts });
+  }
+
+  // ── 目标层级（2026-09-28 B2，SDD 个人工作台业务借鉴）：UI 写入 = 追加快照，修订不消耗 void ──
+  if (method === "GET" && path === "/api/goals") {
+    const tz = Number(url.searchParams.get("tz") ?? "0") || 0;
+    const ledger = await deps.ledgerFor(uid);
+    const records = ledger.readAll();
+    const view = goalView(records, deps.env.now(), tz);
+    // 里程碑明细：deadline 型 plan（挂目标树）+ 曾有 done 打卡；树里只有聚合进度，打卡按钮需要逐条
+    const voidedSeqs = new Set(records.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
+    const doneEver = new Set<string>();
+    for (const r of records) {
+      if (r.kind === "checkin" && r.done && !voidedSeqs.has(r.seq)) doneEver.add((r as { planId: string }).planId);
+    }
+    const milestones = records
+      .filter((r) => r.kind === "plan" && !voidedSeqs.has(r.seq))
+      .map((r) => r as { planId: string; title: string; due?: string; goalId?: string; scope: string })
+      .filter((r) => r.scope === "deadline" && r.goalId !== undefined)
+      .map(({ planId, title, due, goalId }) => ({ planId, title, due: due ?? "", goalId: goalId!, done: doneEver.has(planId) }))
+      .sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
+    return sendJson(res, 200, { ...view, milestones });
+  }
+
+  if (method === "POST" && path === "/api/plans") {
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    const title = String(body.title ?? "").trim();
+    if (title === "") return sendError(res, 400, "title 必填");
+    const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
+    const scope = scopes.find((s) => s === body.scope);
+    if (!scope) return sendError(res, 400, `scope 必须是 ${scopes.join(" | ")}`);
+    if (scope === "deadline" && typeof body.due !== "string") return sendError(res, 400, "scope=deadline 需要 due（YYYY-MM-DD）");
+    if (scope === "ndays" && (typeof body.ndays !== "number" || body.ndays < 1)) return sendError(res, 400, "scope=ndays 需要 ndays ≥ 1");
+    const ledger = await deps.ledgerFor(uid);
+    if (body.goalId !== undefined && !latestGoalSnapshots(ledger.readAll()).has(body.goalId)) {
+      return sendError(res, 400, `goalId "${body.goalId}" 不存在`); // 等价外键（与 create_plan 工具同规）
+    }
+    const record = await ledger.append({
+      kind: "plan",
+      source: "ui",
+      planId: `plan-${randomUUID().slice(0, 8)}`,
+      title,
+      scope,
+      ...(body.due !== undefined && body.due !== "" ? { due: body.due } : {}),
+      ...(body.ndays !== undefined ? { ndays: body.ndays } : {}),
+      ...(body.goalId !== undefined && body.goalId !== "" ? { goalId: body.goalId } : {}),
+    });
+    return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
+  }
+
+  if (method === "POST" && path === "/api/goals") {
+    const body = (await readBody(req)) as Record<string, unknown>;
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    if (title === "") return sendError(res, 400, "title 必填");
+    if (title.length > 200) return sendError(res, 400, "title 过长（≤200 字）");
+    const levels = ["direction", "phase", "project"] as const;
+    const level = levels.find((l) => l === body.level);
+    if (!level) return sendError(res, 400, `level 必须是 ${levels.join(" | ")}`);
+    // 自由文本字段：字符串 + 长度上限（防认证后无界落库/全量回显放大）
+    const text = (value: unknown, max = 2000): string | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== "string" || value.length > max) throw new Error(`字段需为不超过 ${max} 字的字符串`);
+      return value;
+    };
+    const ledger = await deps.ledgerFor(uid);
+    const latest = latestGoalSnapshots(ledger.readAll());
+    try {
+      const fields = {
+        ...(text(body.parentId, 200) !== undefined ? { parentId: text(body.parentId, 200) } : {}),
+        ...(text(body.why) !== undefined ? { why: text(body.why) } : {}),
+        ...(text(body.outcome) !== undefined ? { outcome: text(body.outcome) } : {}),
+        ...(text(body.metric) !== undefined ? { metric: text(body.metric) } : {}),
+        ...(text(body.due, 200) !== undefined ? { due: text(body.due, 200) } : {}),
+        ...(text(body.nextStep) !== undefined ? { nextStep: text(body.nextStep) } : {}),
+      };
+      validateGoalParenting(level, "", fields.parentId, latest);
+      const record = await ledger.append({
+        kind: "goal",
+        source: "ui",
+        goalId: `goal-${randomUUID().slice(0, 8)}`,
+        level,
+        title,
+        status: "active",
+        ...fields,
+      });
+      return sendJson(res, 200, { goalId: (record as { goalId: string }).goalId, ts: record.ts });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+
+  const goalMatch = /^\/api\/goals\/([^/]+)$/.exec(path);
+  if (goalMatch && method === "PUT") {
+    const goalId = decodeURIComponent(goalMatch[1]!);
+    const body = (await readBody(req)) as Record<string, string>;
+    const ledger = await deps.ledgerFor(uid);
+    const latest = latestGoalSnapshots(ledger.readAll());
+    const cur = latest.get(goalId);
+    if (!cur) return sendError(res, 404, "goalId 不存在");
+    const statuses = ["active", "paused", "done", "archived"] as const;
+    if (body.status !== undefined && !statuses.some((s) => s === body.status)) {
+      return sendError(res, 400, `status 必须是 ${statuses.join(" | ")}`);
+    }
+    // 字段校验（类型 + 长度上限，与 POST 同规）；title 空白串视为未提供
+    const text = (value: unknown, max = 2000): string | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== "string" || value.length > max) throw new Error(`字段需为不超过 ${max} 字的字符串`);
+      return value;
+    };
+    try {
+      const newTitle = typeof body.title === "string" ? body.title.trim() : undefined;
+      const parentIdRaw = text(body.parentId, 200);
+      const merged = {
+        ...cur,
+        ...(newTitle !== undefined && newTitle !== "" ? { title: newTitle } : {}),
+        ...(body.status !== undefined ? { status: body.status as GoalRecord["status"] } : {}),
+        ...(body.parentId !== undefined ? { ...(parentIdRaw === "" ? {} : { parentId: parentIdRaw }) } : {}),
+        ...(text(body.why) !== undefined ? { why: text(body.why) } : {}),
+        ...(text(body.outcome) !== undefined ? { outcome: text(body.outcome) } : {}),
+        ...(text(body.metric) !== undefined ? { metric: text(body.metric) } : {}),
+        ...(text(body.due, 200) !== undefined ? { due: text(body.due, 200) } : {}),
+        ...(text(body.nextStep) !== undefined ? { nextStep: text(body.nextStep) } : {}),
+      };
+      // 修订快照剥离旧凭据：seq/ts 由 append 重分配，source/actor 以本次 UI 写入为准（审计归位）
+      const { seq: _seq, ts: _ts, source: _source, actor: _actor, ...snapshot } = merged;
+      validateGoalParenting(snapshot.level, snapshot.goalId, snapshot.parentId, latest);
+      await ledger.append({ ...snapshot, kind: "goal", source: "ui" });
+      return sendJson(res, 200, { ok: true, goalId: snapshot.goalId, title: snapshot.title, status: snapshot.status });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
   }
 
 
