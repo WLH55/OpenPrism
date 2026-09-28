@@ -247,6 +247,32 @@ describe("todayView 增补（B1）", () => {
     );
     expect(view.goalCard.phases[0]).toMatchObject({ title: "8 周减脂", nextStep: "约教练做体测" });
   });
+
+  it("计划状态折叠（2026-09-28 用户验收）：已过期收编且排最前；未开始/进行中/待做/已完成各就各位；历史完成且已过期的沉出", () => {
+    const view = todayView(
+      records(
+        { kind: "plan", ts: NOW - 90000, source: "ui", planId: "a", title: "逾期打卡点", scope: "deadline", due: "2026-09-26" },
+        { kind: "plan", ts: NOW - 80000, source: "ui", planId: "b", title: "今日截止", scope: "deadline", due: TODAY },
+        { kind: "plan", ts: NOW - 70000, source: "ui", planId: "c", title: "明天的打卡点", scope: "deadline", due: "2026-09-29" },
+        { kind: "plan", ts: Date.UTC(2026, 8, 10), source: "ui", planId: "d", title: "上月做完的旧打卡点", scope: "deadline", due: "2026-09-09" },
+        { kind: "checkin", ts: Date.UTC(2026, 8, 10, 2), source: "ui", planId: "d", at: Date.UTC(2026, 8, 10, 2), done: true },
+        { kind: "plan", ts: Date.UTC(2026, 8, 20), source: "ui", planId: "e", title: "月度习惯", scope: "month" },
+        { kind: "checkin", ts: Date.UTC(2026, 8, 25, 2), source: "ui", planId: "e", at: Date.UTC(2026, 8, 25, 2), done: true },
+        { kind: "plan", ts: NOW - 60000, source: "ui", planId: "f", title: "今日习惯", scope: "day" },
+        { kind: "plan", ts: NOW - 50000, source: "ui", planId: "g", title: "已完成的未来打卡点", scope: "deadline", due: "2026-10-02" },
+        { kind: "checkin", ts: NOW - 1000, source: "ui", planId: "g", at: NOW - 1000, done: true },
+      ),
+      NOW,
+      TZ,
+    );
+    // 顺序：逾期 > 今天截止 > 进行中（月内做过、今日未做）> 待做 > 未开始（明天）> 已完成
+    expect(view.plans.map((p) => p.state)).toEqual(["overdue", "dueToday", "doing", "todo", "upcoming", "done"]);
+    expect(view.plans.map((p) => p.planId)).toEqual(["a", "b", "e", "f", "c", "g"]);
+    expect(view.plans.some((p) => p.planId === "d")).toBe(false); // 历史完成且已过期 → 沉出今天列表
+    const g = view.plans.find((p) => p.planId === "g")!;
+    expect(g.done).toBe(true);
+    expect(g.doneSeqs).toHaveLength(1); // 撤销 = 作废该打卡（与计划页同规）
+  });
 });
 
 describe("goal 持久化与迁移（B1）", () => {
