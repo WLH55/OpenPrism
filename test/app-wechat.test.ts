@@ -133,6 +133,7 @@ describe("iLink 客户端（协议面）", () => {
     const call = iLink.calls.find((c) => c.url.endsWith("/ilink/bot/getupdates"))!;
     expect(call.init?.headers?.AuthorizationType).toBe("ilink_bot_token");
     expect(call.init?.headers?.Authorization).toBe("Bearer tok-1");
+    expect(call.init?.headers?.["Content-Length"]).toBeUndefined(); // 手动 CL 是字符数≠字节数，中文正文下挂死（2026-09-28 真机实证）
     expect(JSON.parse(call.init?.body ?? "{}")).toMatchObject({ get_updates_buf: "cursor-1" });
   });
 

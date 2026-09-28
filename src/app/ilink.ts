@@ -72,13 +72,16 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
     return JSON.parse(text) as Record<string, unknown>;
   };
 
-  /** 业务调用统一头（AuthorizationType 固定 ilink_bot_token；Bearer 为登录/轮询凭据） */
-  const authHeaders = (botToken: string, body?: string): Record<string, string> => ({
+  /** 业务调用统一头（AuthorizationType 固定 ilink_bot_token；Bearer 为登录/轮询凭据）。
+   * 不手动设 Content-Length：WeKnora（Go）的 len() 是字节数所以安全，但 JS 的 string.length 是字符数——
+   * 中文正文下声明 < 实际 UTF-8 字节数，undici 会原样发送该头，iLink 按短长度截断读 body、剩余字节污染连接，
+   * 表现为 fetch 挂死到超时（2026-09-28 真机实证：314 字符声明 vs 408 字节实际 → 挂死；不设 → 0.44s 成功）。
+   * Content-Length 交给 fetch 运行时按字节自动计算。 */
+  const authHeaders = (botToken: string): Record<string, string> => ({
     "Content-Type": "application/json",
     AuthorizationType: "ilink_bot_token",
     ...(botToken !== "" ? { Authorization: `Bearer ${botToken}` } : {}),
     "X-WECHAT-UIN": randomUin(),
-    ...(body !== undefined ? { "Content-Length": String(body.length) } : {}),
   });
 
   return {
@@ -122,7 +125,7 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
 
     async getUpdates(botToken, cursor) {
       const body = JSON.stringify({ get_updates_buf: cursor, base_info: { channel_version: CHANNEL_VERSION } });
-      const raw = (await request("/ilink/bot/getupdates", { method: "POST", body, headers: authHeaders(botToken, body) })) as {
+      const raw = (await request("/ilink/bot/getupdates", { method: "POST", body, headers: authHeaders(botToken) })) as {
         ret?: number;
         errcode?: number;
         errmsg?: string;
@@ -170,7 +173,7 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
         },
         base_info: { channel_version: CHANNEL_VERSION },
       });
-      const raw = (await request("/ilink/bot/sendmessage", { method: "POST", body, headers: authHeaders(botToken, body) })) as {
+      const raw = (await request("/ilink/bot/sendmessage", { method: "POST", body, headers: authHeaders(botToken) })) as {
         ret?: number;
         errcode?: number;
         errmsg?: string;
