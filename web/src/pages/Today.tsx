@@ -131,7 +131,7 @@ function GoalCard({
   );
 }
 
-/** 今天页：Top3 + 计划卡 + 快速记录 + 三统计卡 + 计划/流水（B3 增补，结构照 prototype 页 3） */
+/** 今天页：Top3 + 计划卡 + 快速记录 + 三统计卡 + 计划四段范围切换（今天/本周/全部/已完成，B4 2026-09-29） */
 export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
   const [view, setView] = useState<TodayView | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -140,6 +140,7 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
   const [value, setValue] = useState("");
   const [unit, setUnit] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [planTab, setPlanTab] = useState<"today" | "week" | "all" | "done">("today");
 
   const reload = useCallback(() => {
     api
@@ -179,7 +180,38 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
   }
 
   const weekday = ["日", "一", "二", "三", "四", "五", "六"][new Date().getDay()];
-  const doneCount = view.plans.filter((p) => p.done).length;
+
+  // 计划四段范围（2026-09-29 B4）：数据一次载荷（服务端全量收编），视图谓词前端算
+  const ymd = (ts: number): string => {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const dow = new Date(`${view.date}T00:00:00`).getDay();
+  const sunday = new Date(`${view.date}T00:00:00`);
+  sunday.setDate(sunday.getDate() + ((7 - dow) % 7)); // 周一起算的本周日（今天就是周日则为今天）
+  const sundayStr = ymd(sunday.getTime());
+  const doneToday = (p: TodayView["plans"][number]): boolean => p.doneAt !== undefined && ymd(p.doneAt) === view.date;
+  const inToday = (p: TodayView["plans"][number]): boolean => (p.state !== "upcoming" && p.state !== "done") || doneToday(p);
+  const tabPlans =
+    planTab === "done"
+      ? [...view.plans.filter((p) => p.state === "done" && p.doneAt !== undefined && p.doneAt >= Date.now() - 30 * 86400000)].sort(
+          (a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0),
+        )
+      : view.plans.filter((p) =>
+          planTab === "today"
+            ? inToday(p)
+            : planTab === "week"
+              ? inToday(p) || (p.state === "upcoming" && p.due !== undefined && p.due <= sundayStr)
+              : inToday(p) || p.state === "upcoming",
+        );
+  const todayPlans = view.plans.filter(inToday); // 统计卡口径 = 今天视图（全量收编后不宜直接用 view.plans）
+  const doneCount = todayPlans.filter((p) => p.done).length;
+  const PLAN_TABS: { key: typeof planTab; label: string; count: number }[] = [
+    { key: "today", label: "今天", count: todayPlans.length },
+    { key: "week", label: "本周", count: view.plans.filter((p) => inToday(p) || (p.state === "upcoming" && p.due !== undefined && p.due <= sundayStr)).length },
+    { key: "all", label: "全部", count: view.plans.filter((p) => inToday(p) || p.state === "upcoming").length },
+    { key: "done", label: "已完成", count: view.plans.filter((p) => p.state === "done" && p.doneAt !== undefined && p.doneAt >= Date.now() - 30 * 86400000).length },
+  ];
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -259,7 +291,7 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
           <div className="text-xs text-ink2">计划完成</div>
           <div className="num mt-1 text-xl font-semibold text-ink">
             {doneCount}
-            <span className="text-sm font-normal text-ink3">/{view.plans.length}</span>
+            <span className="text-sm font-normal text-ink3">/{todayPlans.length}</span>
           </div>
         </div>
         <div className="col-span-2 rounded-xl border border-line bg-surface px-4 py-3 md:col-span-1">
@@ -268,11 +300,25 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
         </div>
       </div>
 
-      {/* 计划（2026-09-28 状态折叠）：逾期 > 今天截止 > 进行中/待做 > 未开始（未来）> 已完成，全状态收编 */}
+      {/* 计划四段范围切换（2026-09-29 B4）：今天=今日应做（未来项移出）｜本周=+截止≤周日｜全部=+远期｜已完成=近 30 天存档 */}
       <section className="mb-6">
-        <h2 className="mb-2 text-sm font-semibold text-ink">计划</h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-ink">计划</h2>
+          <div className="flex gap-1">
+            {PLAN_TABS.map((t) => (
+              <button
+                key={t.key}
+                className={`rounded-full px-2.5 py-1 text-xs transition ${planTab === t.key ? "bg-accent2 font-medium text-white" : "text-ink3 transition hover:text-ink"}`}
+                onClick={() => setPlanTab(t.key)}
+              >
+                {t.label}
+                {t.count > 0 && <span className="num ml-0.5 opacity-70">{t.count}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="space-y-1.5">
-          {view.plans.length === 0 && (
+          {tabPlans.length === 0 && planTab === "today" && (
             <button
               className="w-full rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-left text-sm text-accent transition hover:border-accent"
               onClick={onOpenPlans}
@@ -280,8 +326,12 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
               今天还没有计划——去计划页给阶段加个里程碑，或直接跟助手说一句
             </button>
           )}
-          {view.plans.map((plan) => {
-            // 状态标签（旧服务端无 state 时用 done 兜底）；未来的 deadline 显示 明天/N 天后/日期
+          {tabPlans.length === 0 && planTab !== "today" && (
+            <div className="rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
+              {planTab === "done" ? "最近 30 天还没有完成的计划" : "这个范围没有计划"}
+            </div>
+          )}
+          {tabPlans.map((plan) => {
             const state = plan.state ?? (plan.done ? "done" : "todo");
             const daysTo = plan.due !== undefined ? Math.round((new Date(`${plan.due}T00:00:00`).getTime() - new Date(`${view.date}T00:00:00`).getTime()) / 86400000) : null;
             const stateLabel =
@@ -302,15 +352,22 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
                             ? `${daysTo} 天后`
                             : (plan.due ?? "未开始")
                         : "待做";
-            const stateCls =
-              state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : state === "done" ? "text-ink3" : "text-ink3";
+            const stateCls = state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : "text-ink3";
+            const skip = async () => {
+              if (plan.seq === undefined || !window.confirm(`跳过「${plan.title}」？= 作废这条计划（留痕可审计）。`)) return;
+              try {
+                await api.voidRecord(plan.seq);
+              } catch (e) {
+                window.alert(String((e as Error).message));
+              }
+              reload();
+            };
             return (
-              <button
+              <div
                 key={plan.planId}
-                className="flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition hover:bg-surface2/60"
+                className="flex w-full cursor-pointer items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition hover:bg-surface2/60"
                 onClick={async () => {
                   if (plan.done) {
-                    // deadline 型撤销 = 作废打卡（doneEver 语义下追加 done:false 无效），周期型仍是追加反向打卡
                     if ((plan.doneSeqs ?? []).length > 0) for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
                     else await api.checkin(plan.planId, false);
                   } else {
@@ -318,7 +375,7 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
                   }
                   reload();
                 }}
-                title={plan.done ? ((plan.doneSeqs ?? []).length > 0 ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "点击取消今日打卡") : "点击打卡"}
+                title={plan.done ? ((plan.doneSeqs ?? []).length > 0 ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "点击取消今日打卡") : "点击打卡（逾期项 = 现在补做）"}
               >
                 {plan.done ? (
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
@@ -333,7 +390,19 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
                 </span>
                 {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
                 <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
-              </button>
+                {state === "overdue" && (
+                  <button
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-warm/10 hover:text-warm"
+                    title="这事不做了：作废该计划（留痕可审计）"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void skip();
+                    }}
+                  >
+                    跳过
+                  </button>
+                )}
+              </div>
             );
           })}
         </div>

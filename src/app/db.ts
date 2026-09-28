@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_ts INTEGER NOT NULL,
   avatar     TEXT,
   emoji      TEXT NOT NULL DEFAULT '',
-  color      TEXT NOT NULL DEFAULT ''
+  color      TEXT NOT NULL DEFAULT '',
+  builtins_seeded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -143,7 +144,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   enabled           INTEGER NOT NULL DEFAULT 1,
   tz_offset_minutes INTEGER NOT NULL DEFAULT 0,
   created_ts        INTEGER NOT NULL,
-  last_run_ts       INTEGER
+  last_run_ts       INTEGER,
+  notify_channel    TEXT,
+  builtin           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_uid ON tasks(uid, enabled);
 
@@ -485,6 +488,8 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "conversations", "model_provider_id", "TEXT"); // 会话级模型绑定（2026-09-07）
   ensureColumn(db, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0"); // 置顶（定时提醒会话）
   ensureColumn(db, "tasks", "notify_channel", "TEXT"); // 任务级通知渠道（inapp 默认 | wechat，2026-09-27）
+  ensureColumn(db, "tasks", "builtin", "TEXT"); // 内置任务标记（daily-brief|daily-report|weekly-review，2026-09-29）
+  ensureColumn(db, "users", "builtins_seeded", "INTEGER NOT NULL DEFAULT 0"); // 内置三件套种子一次性标记（删了不复活，2026-09-29）
   // 伙伴创建向导（2026-09-07，对齐 DeepTutor）：身份字段 + 回复语言 + 默认模型；persona_md 语义升级为「灵魂」
   ensureColumn(db, "agents", "description", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "agents", "emoji", "TEXT NOT NULL DEFAULT ''");

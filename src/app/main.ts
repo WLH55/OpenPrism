@@ -246,6 +246,16 @@ async function main(): Promise<void> {
   // 启动补跑：距上次整理超 20h 且有条目 → 后台跑一次 consolidate（不限钟点，作白天补跑）
   void runConsolidateForAll("startup");
 
+  // 内置三件套补种（2026-09-29）：存量用户一次性种子（幂等；删除过内置任务的不复活——标记已置）
+  for (const user of users.values()) {
+    try {
+      const seeded = await tasks.ensureBuiltins(user.uid);
+      if (seeded > 0) process.stdout.write(`[openprism] builtin tasks seeded: ${user.username} +${seeded}\n`);
+    } catch (error) {
+      process.stdout.write(`[openprism] builtin tasks seed ${user.username} failed: ${String((error as Error).message)}\n`);
+    }
+  }
+
   async function runConsolidateForAll(reason: "startup" | "nightly"): Promise<void> {
     for (const user of users.values()) {
       const meta = memory.metaRow(user.uid);

@@ -49,6 +49,10 @@ export interface TodayPlanView {
   doneSeqs?: number[];
   /** 挂目标树的计划带顶层方向标题——独立待办没有此字段 */
   goalTitle?: string;
+  /** 账本 seq：逾期「跳过」= 作废该 plan 记录 */
+  seq?: number;
+  /** 完成时刻（最新存活 done 打卡）——已完成视图按它倒序/过滤近 30 天 */
+  doneAt?: number;
 }
 
 export interface TodayFlowView {
@@ -422,6 +426,8 @@ export interface TaskLoose {
   agentId?: string;
   /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送 */
   notifyChannel?: "inapp" | "wechat";
+  /** 内置任务标记（2026-09-29）：daily-brief | daily-report | weekly-review——UI 带「内置」徽标 */
+  builtin?: string;
   lastRunTs?: number;
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──

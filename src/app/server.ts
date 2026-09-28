@@ -265,6 +265,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     deps.users.set(username, user);
     deps.usersByUid?.set(uid, user);
     await deps.ledgerFor(uid); // 注册即开账本（空账本入缓存）
+    await deps.tasks.ensureBuiltins(uid); // 内置三件套随号种入（种子一次性，2026-09-29）
     const token = deps.sessions.issue(uid);
     return sendJson(res, 200, { uid, username }, sessionCookie(token));
   }

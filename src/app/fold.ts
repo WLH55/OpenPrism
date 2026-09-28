@@ -42,6 +42,10 @@ export interface TodayPlanView {
   doneSeqs?: number[];
   /** 挂目标树的计划带顶层方向标题（「属于：xx」）——与独立待办的区分信号（2026-09-28） */
   goalTitle?: string;
+  /** 账本 seq：逾期「跳过」= 作废该 plan 记录（2026-09-29） */
+  seq: number;
+  /** 完成时刻 = 最新存活 done 打卡的 at（2026-09-29）：已完成视图按它倒序/过滤近 30 天 */
+  doneAt?: number;
 }
 
 export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
@@ -119,15 +123,17 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     .map(({ seq, time, category, note, value, unit }) => ({ seq, time, category, ...(note !== undefined ? { note } : {}), ...(value !== undefined ? { value } : {}), ...(unit !== undefined ? { unit } : {}) }));
 
   const checkinsToday = live.filter((r): r is CheckinRecord => r.kind === "checkin" && r.done && isToday(r.at));
-  // doneEver（打过一次就算）+ 存活 done 打卡 seq：deadline 型的完成判定与撤销口径（与计划页同源）
+  // doneEver（打过一次就算）+ 存活 done 打卡 seq + 最新完成时刻：deadline 型的完成判定/撤销/完成视图排序三口径同源
   const doneEver = new Set<string>();
   const doneSeqsByPlan = new Map<string, number[]>();
+  const lastDoneAt = new Map<string, number>();
   for (const r of live) {
     if (r.kind !== "checkin" || !r.done) continue;
     doneEver.add(r.planId);
     const list = doneSeqsByPlan.get(r.planId) ?? [];
     list.push(r.seq);
     doneSeqsByPlan.set(r.planId, list);
+    lastDoneAt.set(r.planId, Math.max(lastDoneAt.get(r.planId) ?? 0, r.at));
   }
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
   const latestGoals = latestGoalSnapshots(records);
@@ -144,13 +150,10 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     if (doneToday) return "done";
     return periodHasCheckin(plan) ? "doing" : "todo";
   };
-  // 列表成员：覆盖今天的周期计划 + deadline 计划（未完成的全收——含已过期；完成且 due 已过的沉出，避免历史打卡点刷屏）
+  // 列表成员（2026-09-29 B4 全量收编）：覆盖今天的周期计划 + 全部 deadline（含已完成且 due 已过的——
+  // 「已完成」视图要看存档；默认视图的防刷屏改由前端按范围切换过滤，数据一次载荷）
   const plans = live
-    .filter((r): r is PlanRecord => {
-      if (r.kind !== "plan") return false;
-      if (r.scope === "deadline") return !doneEver.has(r.planId) || (r.due !== undefined && r.due >= todayStr);
-      return planScopeCoversToday(r, now, tzOffsetMinutes);
-    })
+    .filter((r): r is PlanRecord => r.kind === "plan" && (r.scope === "deadline" || planScopeCoversToday(r, now, tzOffsetMinutes)))
     .map((plan) => {
       const doneToday = plan.scope === "deadline" ? doneEver.has(plan.planId) : checkinsToday.some((c) => c.planId === plan.planId);
       const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
@@ -166,6 +169,8 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         state,
         ...(plan.scope === "deadline" && state === "done" ? { doneSeqs: doneSeqsByPlan.get(plan.planId) ?? [] } : {}),
         ...(goalTitle !== undefined ? { goalTitle } : {}),
+        seq: plan.seq,
+        ...(state === "done" ? { doneAt: lastDoneAt.get(plan.planId) } : {}),
       };
     })
     .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.planId.localeCompare(b.planId));
