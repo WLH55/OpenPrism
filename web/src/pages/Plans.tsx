@@ -114,17 +114,29 @@ function GoalForm({
   );
 }
 
-/** 里程碑行：勾选打卡（复用 /api/checkin） */
-function MilestoneRow({ planId, title, due, done, onChanged }: { planId: string; title: string; due: string; done: boolean; onChanged: () => void }) {
+/**
+ * 里程碑行：点圈打卡；撤销 = 作废那条打卡记录（#A，2026-09-28）。
+ * 里程碑完成判定是 doneEver（打过一次就算），追加 done:false 打卡不会撤销它——所以撤销走账本作废回路，历史留痕。
+ * 无存活打卡 seq（旧服务端）时退化为静态完成态，不给"可点"的假象。
+ */
+function MilestoneRow({ planId, title, due, done, doneSeqs, onChanged }: { planId: string; title: string; due: string; done: boolean; doneSeqs: number[]; onChanged: () => void }) {
   const left = daysLeft(due);
+  const undoable = done && doneSeqs.length > 0;
+  const toggle = async () => {
+    if (done) {
+      for (const seq of doneSeqs) await api.voidRecord(seq);
+    } else {
+      await api.checkin(planId, true);
+    }
+    onChanged();
+  };
+  const hint = done ? (undoable ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "已完成") : "点击打卡";
   return (
     <button
-      className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60"
-      onClick={async () => {
-        await api.checkin(planId, !done);
-        onChanged();
-      }}
-      title={done ? "点击取消打卡" : "点击打卡"}
+      className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60 disabled:cursor-default disabled:hover:bg-transparent"
+      disabled={done && !undoable}
+      onClick={() => void toggle()}
+      title={hint}
     >
       {done ? (
         <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
@@ -144,8 +156,8 @@ function MilestoneRow({ planId, title, due, done, onChanged }: { planId: string;
   );
 }
 
-/** 阶段卡：唯一下一步（可编辑）、里程碑打卡、暂停/完成 */
-function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; milestones: { planId: string; title: string; due: string; done: boolean }[]; onChanged: () => void }) {
+/** 阶段卡：唯一下一步（可编辑）、里程碑打卡、暂停/完成/删除 */
+function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; milestones: GoalsPageLoose["milestones"]; onChanged: () => void }) {
   const [open, setOpen] = useState(true);
   const [editing, setEditing] = useState(false);
   const [nextStep, setNextStep] = useState(node.nextStep ?? "");
@@ -227,15 +239,30 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
               {milestones.length > 0 && (
                 <div className="rounded-lg border border-line/60 bg-surface2/50 p-1">
                   {milestones.map((m) => (
-                    <MilestoneRow key={m.planId} planId={m.planId} title={m.title} due={m.due} done={m.done} onChanged={onChanged} />
+                    <MilestoneRow key={m.planId} planId={m.planId} title={m.title} due={m.due} done={m.done} doneSeqs={m.doneSeqs ?? []} onChanged={onChanged} />
                   ))}
                 </div>
               )}
               {projects.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
                   {projects.map((p) => (
-                    <span key={p.goalId} className={`rounded-full border px-2 py-0.5 text-xs ${p.status === "active" ? "border-line text-ink2" : "border-line text-ink3 line-through"}`}>
+                    <span key={p.goalId} className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${p.status === "active" ? "border-line text-ink2" : "border-line text-ink3 line-through"}`}>
                       📁 {p.title}
+                      <button
+                        className="text-ink3 transition hover:text-warm"
+                        title="删除该项目（作废快照留痕）"
+                        onClick={async () => {
+                          if (!window.confirm(`删除项目「${p.title}」？删除记录留痕可审计。`)) return;
+                          try {
+                            await api.deleteGoal(p.goalId);
+                          } catch (e) {
+                            window.alert(String((e as Error).message));
+                          }
+                          onChanged();
+                        }}
+                      >
+                        ✕
+                      </button>
                     </span>
                   ))}
                 </div>
@@ -266,6 +293,21 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
                     完成阶段
                   </button>
                 )}
+                <button
+                  className="text-xs text-ink3 transition hover:text-warm"
+                  title="作废该阶段全部快照（留痕）；其下里程碑计划保留、解除挂靠"
+                  onClick={async () => {
+                    if (!window.confirm(`删除${LEVEL_LABEL[node.level]}「${node.title}」？删除记录留痕可审计；其下里程碑计划会保留（解除挂靠）。`)) return;
+                    try {
+                      await api.deleteGoal(node.goalId);
+                    } catch (e) {
+                      window.alert(String((e as Error).message));
+                    }
+                    onChanged();
+                  }}
+                >
+                  删除
+                </button>
               </div>
               {addingMilestone && (
                 <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line/60 bg-surface p-2">
@@ -329,6 +371,21 @@ function DirectionCard({ node, milestones, onChanged }: { node: GoalNodeLoose; m
               完成
             </button>
           )}
+          <button
+            className="text-xs text-ink3 transition hover:text-warm"
+            title="作废该方向全部快照（留痕）；有阶段/项目挂着时需先清空"
+            onClick={async () => {
+              if (!window.confirm(`删除方向「${node.title}」？删除记录留痕可审计；其下需无阶段/项目。`)) return;
+              try {
+                await api.deleteGoal(node.goalId);
+              } catch (e) {
+                window.alert(String((e as Error).message));
+              }
+              onChanged();
+            }}
+          >
+            删除
+          </button>
         </div>
       </div>
 

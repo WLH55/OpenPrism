@@ -983,7 +983,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const seq = Number(body.seq);
     if (!Number.isInteger(seq)) return sendError(res, 400, "seq 必须是整数");
     const ledger = await deps.ledgerFor(uid);
-    if (!ledger.readAll().some((r) => r.seq === seq)) return sendError(res, 404, "seq 不存在");
+    const target = ledger.readAll().find((r) => r.seq === seq);
+    if (!target) return sendError(res, 404, "seq 不存在");
+    // goal 不走作废口（#B，2026-09-28）：修订=PUT 追加快照不消耗 void；真删整个目标=DELETE /api/goals/:goalId
+    if (target.kind === "goal") return sendError(res, 400, "goal 条目不走 /api/void：修订用 PUT，真删用 DELETE /api/goals/:goalId");
     await ledger.append({ kind: "void", source: "ui", targetSeq: seq });
     return sendJson(res, 200, { ok: true });
   }
@@ -1012,16 +1015,21 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const records = ledger.readAll();
     const view = goalView(records, deps.env.now(), tz);
     // 里程碑明细：deadline 型 plan（挂目标树）+ 曾有 done 打卡；树里只有聚合进度，打卡按钮需要逐条
+    // doneSeqs = 该 planId 名下所有存活 done 打卡的 seq（#A，2026-09-28）：里程碑撤销 = 作废这些记录，而非追加 done:false（doneEver 语义下无效）
     const voidedSeqs = new Set(records.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
-    const doneEver = new Set<string>();
+    const doneSeqs = new Map<string, number[]>();
     for (const r of records) {
-      if (r.kind === "checkin" && r.done && !voidedSeqs.has(r.seq)) doneEver.add((r as { planId: string }).planId);
+      if (r.kind !== "checkin" || !r.done || voidedSeqs.has(r.seq)) continue;
+      const planId = (r as { planId: string }).planId;
+      const list = doneSeqs.get(planId) ?? [];
+      list.push(r.seq);
+      doneSeqs.set(planId, list);
     }
     const milestones = records
       .filter((r) => r.kind === "plan" && !voidedSeqs.has(r.seq))
       .map((r) => r as { planId: string; title: string; due?: string; goalId?: string; scope: string })
       .filter((r) => r.scope === "deadline" && r.goalId !== undefined)
-      .map(({ planId, title, due, goalId }) => ({ planId, title, due: due ?? "", goalId: goalId!, done: doneEver.has(planId) }))
+      .map(({ planId, title, due, goalId }) => ({ planId, title, due: due ?? "", goalId: goalId!, done: doneSeqs.has(planId), doneSeqs: doneSeqs.get(planId) ?? [] }))
       .sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
     return sendJson(res, 200, { ...view, milestones });
   }
@@ -1133,6 +1141,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
     }
+  }
+
+  // #B（2026-09-28）：goal 真删唯一入口——作废该 goalId 全部存活快照（留痕，与 /api/void 限流配套）
+  if (goalMatch && method === "DELETE") {
+    const goalId = decodeURIComponent(goalMatch[1]!);
+    const ledger = await deps.ledgerFor(uid);
+    const records = ledger.readAll();
+    const latest = latestGoalSnapshots(records);
+    if (!latest.has(goalId)) return sendError(res, 404, "goalId 不存在");
+    // 有存活子目标不放行：静默提根会偷偷改树结构，先删子再删父
+    if ([...latest.values()].some((g) => g.parentId === goalId)) {
+      return sendError(res, 400, "其下还有阶段/项目——先删除它们，再删这个目标");
+    }
+    const voidedSeqs = new Set(records.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
+    const seqs = records
+      .filter((r) => r.kind === "goal" && (r as { goalId: string }).goalId === goalId && !voidedSeqs.has(r.seq))
+      .map((r) => r.seq);
+    for (const seq of seqs) await ledger.append({ kind: "void", source: "ui", targetSeq: seq });
+    return sendJson(res, 200, { ok: true, voided: seqs.length });
   }
 
 

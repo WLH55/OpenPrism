@@ -344,6 +344,49 @@ describe("HTTP API", () => {
     expect(direction.children[0]!.nextStep).toBe("约教练"); // 未提供字段沿用
   });
 
+  it("目标删除与作废边界（#A/#B，2026-09-28）：/api/void 拒收 goal；DELETE 真删留痕、有子不放行；里程碑撤销=作废打卡", async () => {
+    const uid = users.get("lathan")!.uid;
+    const ledger = await ledgers.get(uid)!;
+    const post = (path: string, body: unknown) =>
+      fetch(`${baseUrl}${path}`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
+    const get = (path: string) => fetch(`${baseUrl}${path}`, { headers: { cookie } });
+
+    // 方向 → 阶段 → 里程碑（deadline plan 挂阶段）
+    const dir = (await (await post("/api/goals", { level: "direction", title: "删除术" })).json()) as { goalId: string };
+    const phase = (await (await post("/api/goals", { level: "phase", title: "删除阶段", parentId: dir.goalId })).json()) as { goalId: string };
+    const plan = (await (await post("/api/plans", { title: "删前打卡点", scope: "deadline", due: "2026-10-01", goalId: phase.goalId })).json()) as { planId: string };
+    expect((await post("/api/checkin", { planId: plan.planId, done: true })).status).toBe(200);
+
+    // #A：里程碑 done=true 且带 doneSeqs（存活 done 打卡的 seq）
+    const mid = (await (await get("/api/goals?tz=480")).json()) as { milestones: { planId: string; done: boolean; doneSeqs: number[] }[] };
+    const milestone = mid.milestones.find((m) => m.planId === plan.planId)!;
+    expect(milestone.done).toBe(true);
+    expect(milestone.doneSeqs.length).toBe(1);
+    // 撤销打卡 = 作废那条打卡（checkin 可作废），doneEver 随之回落
+    expect((await post("/api/void", { seq: milestone.doneSeqs[0] })).status).toBe(200);
+    const undone = ((await (await get("/api/goals?tz=480")).json()) as typeof mid).milestones.find((m) => m.planId === plan.planId)!;
+    expect(undone.done).toBe(false);
+    expect(undone.doneSeqs).toEqual([]);
+
+    // #B：goal 快照不走 /api/void（修订=PUT 追加快照，真删=DELETE）
+    const goalSeq = ledger.readAll().find((r) => r.kind === "goal" && (r as { goalId: string }).goalId === dir.goalId)!.seq;
+    const rejected = await post("/api/void", { seq: goalSeq });
+    expect(rejected.status).toBe(400);
+
+    // DELETE：有存活子目标不放行 → 删子 → 删父留痕 → 树里消失 → 再删 404
+    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(400);
+    const deleted = (await (await fetch(`${baseUrl}/api/goals/${phase.goalId}`, { method: "DELETE", headers: { cookie } })).json()) as { voided: number };
+    expect(deleted.voided).toBeGreaterThanOrEqual(1);
+    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
+    const after = (await (await get("/api/goals?tz=480")).json()) as { directions: { title: string }[] };
+    expect(after.directions.some((d) => d.title === "删除术")).toBe(false);
+    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(404);
+    // 真删=作废快照留痕（审计可查），里程碑 plan 不被连坐
+    const records = ledger.readAll();
+    expect(records.some((r) => r.kind === "void" && (r as { targetSeq: number }).targetSeq === goalSeq)).toBe(true);
+    expect(records.some((r) => r.kind === "plan" && (r as { planId: string }).planId === plan.planId)).toBe(true);
+  });
+
 
 describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
   it("agents：创建（带身份）→列表→详情→改人设（名字保留）→改身份→坏 avatar 400→改绑定→删除", async () => {
