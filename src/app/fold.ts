@@ -50,9 +50,9 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
-  /** 今日必做（确定性折叠，无模型依赖）：逾期 > 今日截止 > 覆盖今天的未完成 > 阶段唯一下一步补位 */
+  /** 今日必做（确定性折叠，无模型依赖）：逾期 > 今日截止 > 覆盖今天的未完成 > 阶段第一条未完成打卡点补位（可打卡；存量 nextStep 文字兜底） */
   top3: TopItem[];
-  /** 计划卡：3 方向 + 3 阶段 + 软约束提示（B1） */
+  /** 计划卡：3 方向 + 3 阶段 + 软约束提示（B1）；阶段 nextStep = 其第一条未完成打卡点标题 */
   goalCard: {
     directions: { goalId: string; title: string; progress: GoalNode["progress"]; updatedAt: number }[];
     phases: { goalId: string; title: string; due?: string; nextStep?: string }[];
@@ -160,16 +160,16 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         }
       };
       collect(goals.directions);
+      // 下一步 = 该阶段第一条未完成打卡点（与 Top3 补位同源；旧 nextStep 文字不再是来源，转打卡点后自动衔接）
+      const firstUnchecked = firstUncheckedMilestoneByGoal(live, liveDoneEver(live));
       return all
         .filter((p) => p.status === "active")
         .sort((a, b) => (a.due ?? "9999").localeCompare(b.due ?? "9999") || (a.goalId < b.goalId ? -1 : 1))
         .slice(0, 3)
-        .map(({ goalId, title, due, nextStep }) => ({
-          goalId,
-          title,
-          ...(due !== undefined ? { due } : {}),
-          ...(nextStep !== undefined ? { nextStep } : {}),
-        }));
+        .map(({ goalId, title, due }) => {
+          const next = firstUnchecked.get(goalId);
+          return { goalId, title, ...(due !== undefined ? { due } : {}), ...(next !== undefined ? { nextStep: next.title } : {}) };
+        });
     })(),
     ...(goals.warning !== undefined ? { warning: goals.warning } : {}),
   };
@@ -221,6 +221,26 @@ export interface GoalView {
   activePhaseCount: number;
   /** 软约束提醒（active 方向或阶段 > 3 时给出，不 block） */
   warning?: string;
+}
+
+/** 存活 done 打卡的 planId 集合（doneEver 语义：打过一次就算）——top3/goalCard 共用 */
+function liveDoneEver(live: LedgerRecord[]): Set<string> {
+  const set = new Set<string>();
+  for (const r of live) {
+    if (r.kind === "checkin" && r.done) set.add(r.planId);
+  }
+  return set;
+}
+
+/** 各 goalId 名下第一条未完成打卡点（deadline 型 plan，按 due 升序）——「下一步」的统一来源（2026-09-28 统一执行项） */
+function firstUncheckedMilestoneByGoal(live: LedgerRecord[], doneEver: Set<string>): Map<string, PlanRecord> {
+  const map = new Map<string, PlanRecord>();
+  for (const r of live) {
+    if (r.kind !== "plan" || r.scope !== "deadline" || r.goalId === undefined || doneEver.has(r.planId)) continue;
+    const cur = map.get(r.goalId);
+    if (cur === undefined || (r.due ?? "9999") < (cur.due ?? "9999")) map.set(r.goalId, r);
+  }
+  return map;
 }
 
 export function goalView(records: LedgerRecord[], now: number, tzOffsetMinutes: number): GoalView {
@@ -339,16 +359,15 @@ export interface TopItem {
   goalTitle?: string;
 }
 
-/** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成；不足 3 用 active 阶段唯一下一步补位 */
+/** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成；不足 3 用 active 阶段第一条未完成打卡点补位 */
 export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: number): TopItem[] {
   const live = liveRecords(records);
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
   const todayK = dayKey(now, tzOffsetMinutes);
-  const doneEver = new Set<string>();
+  const doneEver = liveDoneEver(live);
   const doneToday = new Set<string>();
   for (const r of live) {
     if (r.kind !== "checkin" || !r.done) continue;
-    doneEver.add(r.planId);
     if (dayKey(r.at, tzOffsetMinutes) === todayK) doneToday.add(r.planId);
   }
 
@@ -392,18 +411,30 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
 
   const items = [...overdue, ...dueToday, ...todayItems].slice(0, 3);
   if (items.length < 3) {
+    // 下一步补位（2026-09-28 统一执行项）：active 阶段的第一条未完成打卡点（带 planId，今天页可直接打卡）；
+    // 存量阶段还挂着旧 nextStep 文字（未转打卡点）的兜底显示——不可打卡，计划页有"转为打卡点"入口
+    const taken = new Set(items.map((i) => i.planId));
+    const firstUnchecked = firstUncheckedMilestoneByGoal(live, doneEver);
     const phases = [...latest.values()]
-      .filter((g) => g.level === "phase" && g.status === "active" && g.nextStep !== undefined && g.nextStep !== "")
+      .filter((g) => g.level === "phase" && g.status === "active")
       .sort((a, b) => (a.due ?? "9999").localeCompare(b.due ?? "9999") || (a.goalId < b.goalId ? -1 : 1));
     for (const phase of phases) {
       if (items.length >= 3) break;
-      const goalTitle = phase.parentId !== undefined ? topTitleOf(phase.parentId) : undefined;
-      items.push({
-        kind: "nextStep",
-        title: `推进「${phase.title}」：${phase.nextStep}`,
-        ...(phase.due !== undefined ? { due: phase.due } : {}),
-        ...(goalTitle !== undefined ? { goalTitle } : {}),
-      });
+      const first = firstUnchecked.get(phase.goalId);
+      if (first !== undefined && !taken.has(first.planId)) {
+        items.push(itemFor(first, "nextStep"));
+        taken.add(first.planId);
+        continue;
+      }
+      if (phase.nextStep !== undefined && phase.nextStep !== "") {
+        const goalTitle = phase.parentId !== undefined ? topTitleOf(phase.parentId) : undefined;
+        items.push({
+          kind: "nextStep",
+          title: `推进「${phase.title}」：${phase.nextStep}`,
+          ...(phase.due !== undefined ? { due: phase.due } : {}),
+          ...(goalTitle !== undefined ? { goalTitle } : {}),
+        });
+      }
     }
   }
   return items;

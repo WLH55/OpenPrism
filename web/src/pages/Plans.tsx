@@ -57,7 +57,6 @@ function GoalForm({
   const [title, setTitle] = useState("");
   const [outcome, setOutcome] = useState("");
   const [due, setDue] = useState("");
-  const [nextStep, setNextStep] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -75,7 +74,6 @@ function GoalForm({
         ...(parentId !== undefined ? { parentId } : {}),
         ...(outcome.trim() !== "" ? { outcome: outcome.trim() } : {}),
         ...(due !== "" ? { due } : {}),
-        ...(level === "phase" && nextStep.trim() !== "" ? { nextStep: nextStep.trim() } : {}),
       });
       onDone();
     } catch (e) {
@@ -95,10 +93,7 @@ function GoalForm({
         <input className={field} placeholder={level === "direction" ? "方向标题（如：更健康的身体）" : "阶段标题（如：8 周减脂）"} value={title} onChange={(e) => setTitle(e.target.value)} />
         <input className={field} placeholder="预期结果（可验收，如：体重降到 70kg）" value={outcome} onChange={(e) => setOutcome(e.target.value)} />
         {level === "phase" && (
-          <>
-            <input className={field} type="date" value={due} onChange={(e) => setDue(e.target.value)} title="阶段截止日" />
-            <input className={field} placeholder="唯一下一步（如：约教练做体测）" value={nextStep} onChange={(e) => setNextStep(e.target.value)} />
-          </>
+          <input className={field} type="date" value={due} onChange={(e) => setDue(e.target.value)} title="阶段截止日" />
         )}
       </div>
       <div className="mt-3 flex items-center gap-3">
@@ -119,7 +114,7 @@ function GoalForm({
  * 里程碑完成判定是 doneEver（打过一次就算），追加 done:false 打卡不会撤销它——所以撤销走账本作废回路，历史留痕。
  * 无存活打卡 seq（旧服务端）时退化为静态完成态，不给"可点"的假象。
  */
-function MilestoneRow({ planId, title, due, done, doneSeqs, onChanged }: { planId: string; title: string; due: string; done: boolean; doneSeqs: number[]; onChanged: () => void }) {
+function MilestoneRow({ planId, title, due, done, doneSeqs, isNext = false, onChanged }: { planId: string; title: string; due: string; done: boolean; doneSeqs: number[]; isNext?: boolean; onChanged: () => void }) {
   const left = daysLeft(due);
   const undoable = done && doneSeqs.length > 0;
   const toggle = async () => {
@@ -145,7 +140,8 @@ function MilestoneRow({ planId, title, due, done, doneSeqs, onChanged }: { planI
       ) : (
         <span className="h-4 w-4 shrink-0 rounded-full border-2 border-line" />
       )}
-      <span className={`flex-1 text-sm ${done ? "text-ink3 line-through" : "text-ink"}`}>{title}</span>
+      {isNext && !done && <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">下一步</span>}
+      <span className={`flex-1 truncate text-sm ${done ? "text-ink3 line-through" : "text-ink"}`}>{title}</span>
       {due !== "" && (
         <span className={`num shrink-0 text-xs ${!done && left !== null && left < 0 ? "text-warm" : "text-ink3"}`}>
           {due}
@@ -156,22 +152,20 @@ function MilestoneRow({ planId, title, due, done, doneSeqs, onChanged }: { planI
   );
 }
 
-/** 阶段卡：唯一下一步（可编辑）、里程碑打卡、暂停/完成/删除 */
+/**
+ * 阶段卡（2026-09-28 统一执行项）：只留一种执行物——打卡点（挂树的 deadline 计划）。
+ * 「下一步」= 列表里第一条未完成的打卡点（带徽标，完成自动顶位）；不再有独立的下一步文字字段。
+ * 存量阶段还挂着旧 nextStep 文字的，给一行"转为打卡点"入口（转完字段清空，无缝衔接）。
+ */
 function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; milestones: GoalsPageLoose["milestones"]; onChanged: () => void }) {
   const [open, setOpen] = useState(true);
-  const [editing, setEditing] = useState(false);
-  const [nextStep, setNextStep] = useState(node.nextStep ?? "");
   const [milestoneTitle, setMilestoneTitle] = useState("");
   const [milestoneDue, setMilestoneDue] = useState("");
   const [addingMilestone, setAddingMilestone] = useState(false);
+  const [converting, setConverting] = useState(false);
   const left = node.due !== undefined ? daysLeft(node.due) : null;
   const projects = node.children;
-
-  const saveNextStep = async () => {
-    await api.updateGoal(node.goalId, { nextStep: nextStep.trim() });
-    setEditing(false);
-    onChanged();
-  };
+  const firstOpenIdx = milestones.findIndex((m) => !m.done);
 
   const addMilestone = async () => {
     if (milestoneTitle.trim() === "" || milestoneDue === "") return;
@@ -180,6 +174,19 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
     setMilestoneDue("");
     setAddingMilestone(false);
     onChanged();
+  };
+
+  /** 旧「唯一下一步」文字 → 今天的打卡点 + 清空字段（迁移一次性，转完这行就没了） */
+  const convertNextStep = async () => {
+    if (converting || !node.nextStep) return;
+    setConverting(true);
+    try {
+      await api.createPlan({ title: node.nextStep, scope: "deadline", due: new Date().toISOString().slice(0, 10), goalId: node.goalId });
+      await api.updateGoal(node.goalId, { nextStep: "" });
+      onChanged();
+    } finally {
+      setConverting(false);
+    }
   };
 
   return (
@@ -201,47 +208,29 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
           </div>
           {node.outcome !== undefined && <p className="mt-1 text-xs text-ink2">{node.outcome}</p>}
 
-          {/* 唯一下一步：阶段的执行锚点 */}
-          <div className="mt-2 flex items-center gap-2 text-sm">
-            <span className="shrink-0 text-xs text-ink3">下一步</span>
-            {editing ? (
-              <>
-                <input
-                  className="min-w-0 flex-1 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-accent"
-                  value={nextStep}
-                  onChange={(e) => setNextStep(e.target.value)}
-                  placeholder="写下唯一可启动的下一步"
-                />
-                <button className="shrink-0 text-xs text-accent transition hover:text-accent2" onClick={() => void saveNextStep()}>
-                  保存
-                </button>
-              </>
-            ) : (
-              <button
-                className={`min-w-0 flex-1 truncate text-left transition hover:text-accent ${node.nextStep ? "text-ink" : "text-ink3"}`}
-                onClick={() => {
-                  setNextStep(node.nextStep ?? "");
-                  setEditing(true);
-                }}
-                title="点击编辑唯一下一步"
-              >
-                {node.nextStep || "还没有下一步——点击补一个"}
-              </button>
-            )}
-          </div>
-
           {open && (
             <div className="mt-3 space-y-2">
               <ProgressBar progress={node.progress} />
               {node.recurring.total > 0 && (
                 <p className="num text-xs text-ink3">今日计划 {node.recurring.doneToday}/{node.recurring.total}</p>
               )}
+              {node.nextStep && (
+                <div className="flex items-center gap-2 rounded-lg border border-dashed border-accent/40 bg-surface px-2.5 py-1.5 text-sm">
+                  <span className="min-w-0 flex-1 truncate text-ink2">旧「下一步」：{node.nextStep}</span>
+                  <button className="shrink-0 text-xs text-accent transition hover:text-accent2 disabled:opacity-50" disabled={converting} onClick={() => void convertNextStep()}>
+                    转为打卡点
+                  </button>
+                </div>
+              )}
               {milestones.length > 0 && (
                 <div className="rounded-lg border border-line/60 bg-surface2/50 p-1">
-                  {milestones.map((m) => (
-                    <MilestoneRow key={m.planId} planId={m.planId} title={m.title} due={m.due} done={m.done} doneSeqs={m.doneSeqs ?? []} onChanged={onChanged} />
+                  {milestones.map((m, i) => (
+                    <MilestoneRow key={m.planId} planId={m.planId} title={m.title} due={m.due} done={m.done} doneSeqs={m.doneSeqs ?? []} isNext={i === firstOpenIdx} onChanged={onChanged} />
                   ))}
                 </div>
+              )}
+              {milestones.length === 0 && !node.nextStep && (
+                <p className="rounded-lg border border-dashed border-line px-3 py-2 text-xs text-ink3">还没有打卡点——把"约教练""首次 5km"这类要做的事加进来，第一条就是下一步</p>
               )}
               {projects.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
@@ -270,7 +259,7 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 {node.status === "active" && (
                   <button className="text-xs text-accent transition hover:text-accent2" onClick={() => setAddingMilestone(!addingMilestone)}>
-                    ＋里程碑
+                    ＋打卡点
                   </button>
                 )}
                 <button
@@ -313,7 +302,7 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
                 <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line/60 bg-surface p-2">
                   <input
                     className="min-w-0 flex-1 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-accent"
-                    placeholder="里程碑（如：完成首次 5km）"
+                    placeholder="打卡点（如：约教练做体测 / 完成首次 5km）"
                     value={milestoneTitle}
                     onChange={(e) => setMilestoneTitle(e.target.value)}
                   />

@@ -178,6 +178,40 @@ describe("top3", () => {
     expect(items[0]).toMatchObject({ kind: "today", title: "今日计划", goalTitle: "健康" });
     expect(items[1]).toMatchObject({ kind: "nextStep", title: "推进「8 周减脂」：约教练体测", goalTitle: "健康" });
   });
+
+  it("统一执行项（2026-09-28）：下一步补位 = 阶段第一条未完成打卡点（带 planId 可打卡），打卡后让位第二条", () => {
+    const base: Array<LedgerAppend & { ts: number }> = [
+      mkGoal("d1", 1, { level: "direction", title: "健康" }),
+      mkGoal("p1", 2, { level: "phase", parentId: "d1", title: "8 周减脂" }),
+      { kind: "plan", ts: NOW - 9000, source: "ui", planId: "m1", title: "约教练做体测", scope: "deadline", due: "2026-10-02", goalId: "p1" },
+      { kind: "plan", ts: NOW - 8000, source: "ui", planId: "m2", title: "完成首次 5km", scope: "deadline", due: "2026-10-20", goalId: "p1" },
+    ];
+    const before = top3(records(...base), NOW, TZ);
+    expect(before).toHaveLength(1);
+    expect(before[0]).toMatchObject({ kind: "nextStep", planId: "m1", title: "约教练做体测", goalTitle: "健康" }); // due 最近的第一条，可打卡（有 planId）
+
+    // m1 打卡（doneEver）后：第一条让位 m2
+    const after = top3(
+      records(...base, { kind: "checkin", ts: NOW - 7000, source: "ui", planId: "m1", at: NOW - 7000, done: true }),
+      NOW,
+      TZ,
+    );
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ kind: "nextStep", planId: "m2", title: "完成首次 5km" });
+  });
+
+  it("统一执行项：打卡点存在时旧 nextStep 文字不再补位（迁移后语义），打卡点全完成才兜底文字", () => {
+    const items = top3(
+      records(
+        mkGoal("d1", 1, { level: "direction", title: "健康" }),
+        mkGoal("p1", 2, { level: "phase", parentId: "d1", title: "8 周减脂", nextStep: "存量文字" }),
+        { kind: "plan", ts: NOW - 9000, source: "ui", planId: "m1", title: "未来的打卡点", scope: "deadline", due: "2026-10-02", goalId: "p1" },
+      ),
+      NOW,
+      TZ,
+    );
+    expect(items.map((i) => i.title)).toEqual(["未来的打卡点"]); // 不再出现"推进「…」：存量文字"
+  });
 });
 
 describe("todayView 增补（B1）", () => {
@@ -199,6 +233,19 @@ describe("todayView 增补（B1）", () => {
     expect(view.goalCard.warning).toContain("4 个方向");
     expect(view.top3).toHaveLength(2); // 两个 nextStep 补位
     expect(view.top3.every((i) => i.kind === "nextStep")).toBe(true);
+  });
+
+  it("统一执行项：goalCard 阶段 nextStep = 第一条未完成打卡点（与 Top3 补位同源）", () => {
+    const view = todayView(
+      records(
+        mkGoal("d1", 1, { level: "direction", title: "健康" }),
+        mkGoal("p1", 2, { level: "phase", parentId: "d1", title: "8 周减脂", nextStep: "存量文字" }),
+        { kind: "plan", ts: NOW - 9000, source: "ui", planId: "m1", title: "约教练做体测", scope: "deadline", due: "2026-10-02", goalId: "p1" },
+      ),
+      NOW,
+      TZ,
+    );
+    expect(view.goalCard.phases[0]).toMatchObject({ title: "8 周减脂", nextStep: "约教练做体测" });
   });
 });
 
