@@ -33,6 +33,7 @@ import type { McpRegistry } from "./mcp";
 import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
 import type { MemoryExtractor } from "./memory-extract";
 import { forgetTopic, listUnpromotedTopics, promoteTopicManually, restoreTopic } from "./memory-topics";
+import type { WechatBridge } from "./wechat-bridge";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -65,6 +66,8 @@ export interface ServerDeps {
   notifications: import("./notify").NotificationStore;
   /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
   taskRunner(uid: string, task: import("./tasks").TaskDef, run: import("./tasks").TaskRunTrigger): Promise<void>;
+  /** 微信桥（2026-09-27）：IM 绑定路由用；缺省 = 未装配（相关路由 404）；测试注入 fake fetch 驱动的桥 */
+  wechat?: WechatBridge;
   staticDir?: string;
 }
 
@@ -602,6 +605,40 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         return sendError(res, 404, String((error as Error).message));
       }
     }
+  }
+
+  // ── 微信桥（2026-09-27）：iLink 扫码绑定四路由 ──────────
+  if (path === "/api/wechat/bind/qrcode" && method === "POST") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    try {
+      const qr = await deps.wechat.newQRCode(uid);
+      return sendJson(res, 200, qr);
+    } catch (error) {
+      return sendError(res, 502, `获取登录二维码失败：${String((error as Error).message).slice(0, 200)}`);
+    }
+  }
+  if (path === "/api/wechat/bind/status" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    const qrcode = url.searchParams.get("qrcode") ?? "";
+    if (qrcode === "") return sendError(res, 400, "qrcode 必填");
+    try {
+      const result = await deps.wechat.pollQRStatus(uid, qrcode);
+      if (!result) return sendError(res, 403, "二维码无效或不属于当前账号（重新获取）");
+      // confirmed：凭据落当前登录用户并启动轮询（申请二维码时已记归属，路由身份即绑定身份）
+      if (result.status === "confirmed" && result.creds) await deps.wechat.bind(uid, result.creds);
+      return sendJson(res, 200, { status: result.status });
+    } catch (error) {
+      return sendError(res, 502, `查询扫码状态失败：${String((error as Error).message).slice(0, 200)}`);
+    }
+  }
+  if (path === "/api/wechat/bind" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    return sendJson(res, 200, deps.wechat.status(uid));
+  }
+  if (path === "/api/wechat/bind" && method === "DELETE") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    await deps.wechat.unbind(uid);
+    return sendJson(res, 200, { ok: true });
   }
 
   // ── 智能体（三段配置） ─────────────────────────────────

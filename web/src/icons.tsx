@@ -83,6 +83,13 @@ export const NotifyIcon = (p: P) => (
     <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
   </svg>
 );
+/** IM 通道（2026-09-27 微信桥）：双气泡 */
+export const ImIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M21 11.5a8.38 8.38 0 0 1-9 8.4 8.5 8.5 0 0 1-3.4-.7L3 21l1.9-5a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 17-.7z" />
+    <path d="M8 10h8M8 13.5h5" />
+  </svg>
+);
 export const SunIcon = ({ className = "h-4 w-4" }: P) => (
   <svg {...base(className)}>
     <circle cx="12" cy="12" r="4" />

@@ -157,6 +157,16 @@ CREATE TABLE IF NOT EXISTS notifications (
   PRIMARY KEY (uid, seq)
 );
 
+-- 微信机器人绑定（2026-09-27 iLink 桥）：每用户一个绑定；bot_token 主密钥加密落库
+CREATE TABLE IF NOT EXISTS wechat_binds (
+  uid           TEXT PRIMARY KEY,
+  bot_token_enc TEXT NOT NULL,
+  ilink_bot_id  TEXT NOT NULL,
+  ilink_user_id TEXT NOT NULL,
+  state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','expired')),
+  bound_ts      INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_slots (
   uid        TEXT NOT NULL,
   slot       TEXT NOT NULL CHECK (slot IN ('recent','profile','scope','preferences')),
@@ -392,6 +402,7 @@ export function openDb(dbPath: string): DatabaseSync {
   db.exec(DDL);
   ensureColumn(db, "conversations", "model_provider_id", "TEXT"); // 会话级模型绑定（2026-09-07）
   ensureColumn(db, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0"); // 置顶（定时提醒会话）
+  ensureColumn(db, "tasks", "notify_channel", "TEXT"); // 任务级通知渠道（inapp 默认 | wechat，2026-09-27）
   // 伙伴创建向导（2026-09-07，对齐 DeepTutor）：身份字段 + 回复语言 + 默认模型；persona_md 语义升级为「灵魂」
   ensureColumn(db, "agents", "description", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "agents", "emoji", "TEXT NOT NULL DEFAULT ''");

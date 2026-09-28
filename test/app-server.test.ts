@@ -21,6 +21,7 @@ import { NotificationStore } from "../src/app/notify";
 import { SqliteSessionLog } from "../src/app/session-log";
 import type { TaskDef, TaskRunTrigger } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
+import { WechatBridge } from "../src/app/wechat-bridge";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
 import { sleep } from "./helpers";
@@ -31,6 +32,14 @@ let staticUrl: string;
 let cookie: string;
 /** 会话装配读到的模型能力开关：本文件的图片消息用例按需翻转（模拟「模型接入」里的多模态勾选） */
 let multimodalModel = false;
+// ── 微信桥（2026-09-27）：fake iLink 注入（零网络），路由测试按需改写脚本 ──
+const wechatScript = new Map<string, unknown>();
+const wechatFetch = async (url: string): Promise<{ ok: boolean; status: number; headers: { get(): null }; json(): Promise<unknown>; text(): Promise<string> }> => {
+  const hit = [...wechatScript.entries()].find(([prefix]) => url.includes(prefix));
+  if (!hit) throw new Error(`fake iLink (server test): no script for ${url}`);
+  const body = typeof hit[1] === "string" ? hit[1] : JSON.stringify(hit[1]);
+  return { ok: true, status: 200, headers: { get: () => null }, json: async () => JSON.parse(body), text: async () => body };
+};
 const db = testDb();
 const users = new Map<string, UserRecord>();
 const ledgers = new Map<string, Promise<Ledger>>();
@@ -114,6 +123,7 @@ beforeAll(async () => {
     taskRunner: async (uidRun: string, task: TaskDef, run: TaskRunTrigger) => {
       await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（${run.kind}）${task.instruction}` });
     },
+    wechat: new WechatBridge({ env: { ...nodeEnv, fetch: wechatFetch }, db, masterKey, conversations, notifications }),
   };
   const server = createAppServer(serverDeps);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -816,5 +826,82 @@ describe("静态托管与会话事件分段（2026-09-23 手机浏览器适配�
     expect((await seqsOf("?limit=201")).status).toBe(400);
     expect((await seqsOf("?before=-1")).status).toBe(400);
     expect((await seqsOf("?before=abc")).status).toBe(400);
+  });
+});
+
+describe("微信桥路由（2026-09-27 iLink 绑定）", () => {
+  it("401 门：未登录四个端点全拒", async () => {
+    expect((await fetch(`${baseUrl}/api/wechat/bind/qrcode`, { method: "POST" })).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/wechat/bind/status?qrcode=x`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/wechat/bind`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/wechat/bind`, { method: "DELETE" })).status).toBe(401);
+  });
+
+  it("绑定闭环：qrcode → status(confirmed) 落库启动 → 状态 active → 解绑", async () => {
+    wechatScript.set("/ilink/bot/get_bot_qrcode", { qrcode: "qr-1", qrcode_img_content: "https://img.local/qr-1.png" });
+    wechatScript.set("/ilink/bot/get_qrcode_status", {
+      status: "confirmed",
+      bot_token: "bt-server-1",
+      ilink_bot_id: "ib-server-1",
+      ilink_user_id: "iu-server-1",
+    });
+    wechatScript.set("/ilink/bot/sendmessage", { ret: 0, errcode: 0 }); // 欢迎语
+
+    const qr = await fetch(`${baseUrl}/api/wechat/bind/qrcode`, { method: "POST", headers: { cookie } });
+    expect(qr.status).toBe(200);
+    expect(await qr.json()).toEqual({ qrcode: "qr-1", imgUrl: "https://img.local/qr-1.png" });
+
+    expect((await fetch(`${baseUrl}/api/wechat/bind/status`, { headers: { cookie } })).status).toBe(400); // 缺 qrcode
+
+    const confirmed = await fetch(`${baseUrl}/api/wechat/bind/status?qrcode=qr-1`, { headers: { cookie } });
+    expect(confirmed.status).toBe(200);
+    expect(await confirmed.json()).toEqual({ status: "confirmed" });
+
+    const state = (await (await fetch(`${baseUrl}/api/wechat/bind`, { headers: { cookie } })).json()) as {
+      bound: boolean;
+      state: string;
+      ilinkBotId?: string;
+    };
+    expect(state).toEqual({ bound: true, state: "active", ilinkBotId: "ib-server-1" });
+
+    // 任务通知渠道：非法值 400，wechat 落库往返
+    const bad = await fetch(`${baseUrl}/api/tasks`, {
+      ...json({ title: "t", instruction: "i", trigger: { kind: "daily", time: "09:00" }, notifyChannel: "sms" }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(bad.status).toBe(400);
+    const ok = await fetch(`${baseUrl}/api/tasks`, {
+      ...json({ title: "喝水", instruction: "提醒喝水", trigger: { kind: "daily", time: "09:00" }, notifyChannel: "wechat" }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { notifyChannel?: string }).notifyChannel).toBe("wechat");
+
+    const unbind = await fetch(`${baseUrl}/api/wechat/bind`, { method: "DELETE", headers: { cookie } });
+    expect(unbind.status).toBe(200);
+    expect(await (await fetch(`${baseUrl}/api/wechat/bind`, { headers: { cookie } })).json()).toEqual({ bound: false, state: "active" });
+  });
+
+  it("iLink 故障上抛 502（如二维码接口报错）", async () => {
+    wechatScript.delete("/ilink/bot/get_bot_qrcode");
+    const fail = await fetch(`${baseUrl}/api/wechat/bind/qrcode`, { method: "POST", headers: { cookie } });
+    expect(fail.status).toBe(502);
+  });
+
+  it("qrcode 归属校验：他人账号持码轮询 → 403；申请人本人正常", async () => {
+    wechatScript.set("/ilink/bot/get_bot_qrcode", { qrcode: "qr-o", qrcode_img_content: "https://img.local/o.png" });
+    wechatScript.set("/ilink/bot/get_qrcode_status", { status: "wait" });
+    const qr = await fetch(`${baseUrl}/api/wechat/bind/qrcode`, { method: "POST", headers: { cookie } });
+    expect(qr.status).toBe(200);
+
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "wx-other", password: "pass-1" }));
+    expect(reg.status).toBe(200);
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+
+    const hijack = await fetch(`${baseUrl}/api/wechat/bind/status?qrcode=qr-o`, { headers: { cookie: otherCookie } });
+    expect(hijack.status).toBe(403); // 把他人扫码确认的 bot 绑到自己账号——拦
+    const mine = await fetch(`${baseUrl}/api/wechat/bind/status?qrcode=qr-o`, { headers: { cookie } });
+    expect(mine.status).toBe(200);
+    expect(await mine.json()).toEqual({ status: "wait" });
   });
 });

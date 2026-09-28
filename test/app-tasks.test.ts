@@ -295,3 +295,34 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     await expect(by("delete_task").execute({ taskId: task.id }, ctx)).rejects.toThrow();
   });
 });
+
+describe("TaskStore（任务级通知渠道，2026-09-27）", () => {
+  it("notifyChannel：wechat 入库往返；缺省 NULL；非法值 create/update 都拒绝", async () => {
+    const db = testDb();
+    let seq = 0;
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => `tid-nc-${++seq}` });
+    const task = await store.create("u1", {
+      title: "喝水提醒",
+      instruction: "提醒喝水",
+      trigger: { kind: "daily", time: "10:00" },
+      notifyChannel: "wechat",
+    });
+    expect(task.notifyChannel).toBe("wechat");
+    expect((await store.list("u1"))[0]!.notifyChannel).toBe("wechat");
+
+    const plain = await store.create("u1", { title: "默认站内", instruction: "x", trigger: { kind: "daily", time: "11:00" } });
+    expect(plain.notifyChannel).toBeUndefined();
+    const raw = db.prepare("SELECT notify_channel FROM tasks WHERE id = ?").get(plain.id) as unknown as { notify_channel: string | null };
+    expect(raw.notify_channel).toBeNull();
+
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "12:00" }, notifyChannel: "sms" as never }),
+    ).rejects.toThrow("notifyChannel");
+    await expect(store.update("u1", task.id, { notifyChannel: "email" as never })).rejects.toThrow("notifyChannel");
+
+    const updated = await store.update("u1", task.id, { notifyChannel: "inapp" });
+    expect(updated.notifyChannel).toBe("inapp");
+    const cleared = await store.update("u1", task.id, {}); // 空 patch 原样保留
+    expect(cleared.notifyChannel).toBe("inapp");
+  });
+});
