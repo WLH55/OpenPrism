@@ -332,6 +332,8 @@ export interface TaskLoose {
   trigger: TaskTriggerLoose;
   enabled: boolean;
   agentId?: string;
+  /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送 */
+  notifyChannel?: "inapp" | "wechat";
   lastRunTs?: number;
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
@@ -383,9 +385,9 @@ export interface NotificationLoose {
 
 export const api3 = {
   listTasks: () => request<TaskLoose[]>("/api/tasks"),
-  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string }) =>
+  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string; notifyChannel?: "inapp" | "wechat" }) =>
     request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
-  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title">> & { trigger?: TaskTriggerLoose }) =>
+  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title" | "notifyChannel">> & { trigger?: TaskTriggerLoose }) =>
     request<TaskLoose>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
   runTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}/run`, { method: "POST" }),
@@ -423,4 +425,20 @@ export const api4 = {
     request<{ moved: number }>("/api/panels/merge", { method: "POST", body: JSON.stringify({ from, to }) }),
   archiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/archive", { method: "POST", body: JSON.stringify({ name }) }),
   unarchiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/unarchive", { method: "POST", body: JSON.stringify({ name }) }),
+};
+
+// ── 微信桥（2026-09-27）：iLink 扫码绑定 ──────────────────
+export interface WechatBindState {
+  bound: boolean;
+  state: "active" | "expired";
+  ilinkBotId?: string;
+}
+
+export const apiIm = {
+  /** 申请登录二维码（imgUrl 供 <img> 直展示） */
+  bindQRCode: () => request<{ qrcode: string; imgUrl: string }>("/api/wechat/bind/qrcode", { method: "POST" }),
+  /** 扫码状态长轮询（~35s 一轮；confirmed 即完成绑定） */
+  bindStatus: (qrcode: string) => request<{ status: "wait" | "scaned" | "confirmed" | "expired" }>(`/api/wechat/bind/status?qrcode=${encodeURIComponent(qrcode)}`),
+  bindState: () => request<WechatBindState>("/api/wechat/bind"),
+  unbind: () => request<{ ok: boolean }>("/api/wechat/bind", { method: "DELETE" }),
 };

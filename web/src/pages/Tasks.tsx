@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api2, api3, type AgentLoose, type NotificationLoose, type TaskLoose, type TaskRunLoose, type TaskTriggerLoose } from "../api";
+import { api2, api3, apiIm, type AgentLoose, type NotificationLoose, type TaskLoose, type TaskRunLoose, type TaskTriggerLoose } from "../api";
 import { Toggle } from "../ui";
 
 const WEEKDAY = ["", "一", "二", "三", "四", "五", "六", "日"];
@@ -121,6 +121,9 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [customEndDate, setCustomEndDate] = useState("");
   const [customOpen, setCustomOpen] = useState(false);
   const [agentId, setAgentId] = useState("");
+  // 通知渠道（2026-09-27）：站内（默认）| 微信机器人（站内记录 + 微信推送；未绑定时到点只发站内）
+  const [notifyChannel, setNotifyChannel] = useState<"inapp" | "wechat">("inapp");
+  const [wechatBound, setWechatBound] = useState(false);
 
   const reload = useCallback(async () => {
     setTasks(await api3.listTasks());
@@ -128,6 +131,10 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   useEffect(() => {
     void reload().catch(() => undefined);
     void api2.listAgents().then(setAgents).catch(() => undefined);
+    void apiIm
+      .bindState()
+      .then((state) => setWechatBound(state.bound && state.state === "active"))
+      .catch(() => undefined);
   }, [reload]);
 
   const reloadNotifications = useCallback(async () => {
@@ -182,7 +189,14 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         trigger = { kind: "daily", time: createTime };
     }
     try {
-      await api3.createTask({ title, instruction, trigger, tzOffsetMinutes: TZ_OFFSET_MINUTES, ...(agentId !== "" ? { agentId } : {}) });
+      await api3.createTask({
+        title,
+        instruction,
+        trigger,
+        tzOffsetMinutes: TZ_OFFSET_MINUTES,
+        ...(agentId !== "" ? { agentId } : {}),
+        ...(notifyChannel === "wechat" ? { notifyChannel } : {}),
+      });
       setTitle("");
       setInstruction("");
       setCreateOpen(false);
@@ -320,6 +334,15 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
                 </option>
               ))}
             </select>
+          </div>
+          <div className="mt-2">
+            <select className={inputCls} value={notifyChannel} onChange={(e) => setNotifyChannel(e.target.value === "wechat" ? "wechat" : "inapp")}>
+              <option value="inapp">通知渠道：站内（提醒页）</option>
+              <option value="wechat">通知渠道：微信机器人（站内 + 微信推送）</option>
+            </select>
+            {notifyChannel === "wechat" && !wechatBound && (
+              <p className="mt-1 text-xs text-warm">还没绑定微信机器人——到菜单「IM 通道」扫码绑定前，到点只发站内。</p>
+            )}
           </div>
           <div className="mt-2 space-y-2">
             <div className="text-sm font-medium text-ink">调度</div>

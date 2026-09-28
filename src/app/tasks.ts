@@ -24,6 +24,8 @@ export interface TaskDef {
   instruction: string;
   trigger: TaskTrigger;
   enabled: boolean;
+  /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送；缺省 = inapp */
+  notifyChannel?: "inapp" | "wechat";
   tzOffsetMinutes: number;
   createdTs: number;
   lastRunTs?: number;
@@ -324,6 +326,7 @@ interface TaskRow {
   tz_offset_minutes: number;
   created_ts: number;
   last_run_ts: number | null;
+  notify_channel: string | null;
 }
 
 function rowToTask(row: TaskRow): TaskDef {
@@ -335,6 +338,7 @@ function rowToTask(row: TaskRow): TaskDef {
     instruction: row.instruction,
     trigger: JSON.parse(row.trigger_json) as TaskTrigger,
     enabled: row.enabled === 1,
+    ...(row.notify_channel !== null ? { notifyChannel: row.notify_channel as "inapp" | "wechat" } : {}),
     tzOffsetMinutes: row.tz_offset_minutes,
     createdTs: row.created_ts,
     ...(row.last_run_ts !== null ? { lastRunTs: row.last_run_ts } : {}),
@@ -363,6 +367,9 @@ export class TaskStore {
   ): Promise<TaskDef> {
     if (input.title.trim() === "" || input.instruction.trim() === "") throw new Error("title/instruction 必填");
     validateTrigger(input.trigger);
+    if (input.notifyChannel !== undefined && input.notifyChannel !== "inapp" && input.notifyChannel !== "wechat") {
+      throw new Error("notifyChannel 只支持 inapp | wechat");
+    }
     const task: TaskDef = {
       id: this.deps.randomUUID(),
       uid,
@@ -371,25 +378,29 @@ export class TaskStore {
       instruction: input.instruction.trim(),
       trigger: input.trigger,
       enabled: input.enabled ?? true,
+      ...(input.notifyChannel !== undefined ? { notifyChannel: input.notifyChannel } : {}),
       tzOffsetMinutes: input.tzOffsetMinutes ?? 0,
       createdTs: this.deps.now(),
     };
     this.deps.db
       .prepare(
-        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
       )
-      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs);
+      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs, task.notifyChannel ?? null);
     return task;
   }
 
-  async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger">>): Promise<TaskDef> {
+  async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">>): Promise<TaskDef> {
     const task = await this.get(uid, id);
     if (!task) throw new Error(`task "${id}" 不存在`);
     if (patch.trigger) validateTrigger(patch.trigger);
+    if (patch.notifyChannel !== undefined && patch.notifyChannel !== "inapp" && patch.notifyChannel !== "wechat") {
+      throw new Error("notifyChannel 只支持 inapp | wechat");
+    }
     const next: TaskDef = { ...task, ...patch };
     this.deps.db
-      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ? WHERE id = ? AND uid = ?")
-      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, id, uid);
+      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ?, notify_channel = ? WHERE id = ? AND uid = ?")
+      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, next.notifyChannel ?? null, id, uid);
     return next;
   }
 
@@ -510,6 +521,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       properties: {
         title: { type: "string" },
         instruction: { type: "string", description: "每次到点投给智能体的自然语言指令" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp 站内（默认）| wechat 微信机器人（需用户已在 IM 通道页绑定）" },
         trigger: {
           type: "object",
           description: '如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
@@ -521,11 +533,12 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       render: (_args, value) => [{ type: "text", text: `已建定时任务（${(value as { taskId: string }).taskId}）` }],
     },
     async execute(args) {
-      const input = (args ?? {}) as { title?: string; instruction?: string; trigger?: TaskTrigger };
+      const input = (args ?? {}) as { title?: string; instruction?: string; trigger?: TaskTrigger; notifyChannel?: string };
       const task = await deps.store.create(deps.uid, {
         title: String(input.title ?? ""),
         instruction: String(input.instruction ?? ""),
         trigger: input.trigger as TaskTrigger,
+        ...(input.notifyChannel === "wechat" || input.notifyChannel === "inapp" ? { notifyChannel: input.notifyChannel } : {}),
       });
       return { taskId: task.id };
     },
@@ -569,6 +582,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
             trigger: t.trigger,
             enabled: t.enabled,
             ...(t.agentId !== undefined ? { agentId: t.agentId } : {}),
+            ...(t.notifyChannel !== undefined ? { notifyChannel: t.notifyChannel } : {}),
             ...(t.lastRunTs !== undefined ? { lastRunTs: t.lastRunTs } : {}),
             ...(nextDueAt !== undefined ? { nextDueAt } : {}),
           };
@@ -589,6 +603,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         enabled: { type: "boolean" },
         title: { type: "string" },
         instruction: { type: "string" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp（默认）| wechat" },
         trigger: { type: "object", description: "与 create_task 同格式，整包替换" },
       },
     },
@@ -600,14 +615,18 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { taskId?: string; enabled?: boolean; title?: string; instruction?: string; trigger?: TaskTrigger };
+      const input = (args ?? {}) as { taskId?: string; enabled?: boolean; title?: string; instruction?: string; trigger?: TaskTrigger; notifyChannel?: string };
       if (typeof input.taskId !== "string" || input.taskId === "") throw new Error("taskId 必填（query_tasks 拿）");
       const patch: Parameters<TaskStore["update"]>[2] = {};
       if (input.enabled !== undefined) patch.enabled = Boolean(input.enabled);
       if (input.title !== undefined) patch.title = String(input.title);
       if (input.instruction !== undefined) patch.instruction = String(input.instruction);
       if (input.trigger !== undefined) patch.trigger = input.trigger as TaskTrigger;
-      if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger");
+      if (input.notifyChannel !== undefined) {
+        if (input.notifyChannel !== "inapp" && input.notifyChannel !== "wechat") throw new Error("notifyChannel 只支持 inapp | wechat");
+        patch.notifyChannel = input.notifyChannel;
+      }
+      if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger / notifyChannel");
       const task = await deps.store.update(deps.uid, input.taskId, patch);
       return { id: task.id, title: task.title, enabled: task.enabled };
     },
