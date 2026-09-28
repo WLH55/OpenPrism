@@ -141,6 +141,10 @@ export class WechatBridge {
     }
     runner.cursor = batch.nextCursor;
     for (const msg of batch.msgs) {
+      // 排障（2026-09-28 真机）：入站原始字段现形——定位 from_user_id / context_token 真实形态
+      console.log(
+        `[wechat] 入站 msgId=${msg.messageId} from=${msg.fromUserId}（绑定=${bind.ilink_user_id} ${msg.fromUserId === bind.ilink_user_id ? "匹配" : "不匹配→忽略"}）ctxLen=${msg.contextToken.length} text="${msg.text.slice(0, 40)}"`,
+      );
       await this.handle(uid, bind, msg);
     }
   }
@@ -176,8 +180,10 @@ export class WechatBridge {
     const cid = WECHAT_FEED_CID(uid);
     const agent = await this.deps.conversations.agent(uid, cid);
     const before = agent.sessionLog.readAll().length;
+    console.log(`[wechat] handle 开始（cid=${cid} before=${before} status=${agent.status}）`); // 排障时间线
     await this.deps.conversations.send(uid, cid, msg.text);
     await agent.whenIdle();
+    console.log(`[wechat] whenIdle 返回（before=${before} readAll=${agent.sessionLog.readAll().length}）`); // 排障时间线
     const events = agent.sessionLog.readAll().slice(before);
     const reply = events
       .filter((event) => event.type === "assistant/message")
@@ -199,6 +205,7 @@ export class WechatBridge {
     }
     try {
       await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
+      console.log(`[wechat] 回复已发送（${Math.min(reply.length, REPLY_MAX_CHARS)} 字，msgId=${msg.messageId}）`); // 排障时间线
     } catch (error) {
       // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）——但必须留日志（排障）
       console.error(
