@@ -197,7 +197,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "create_goal", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_goal", "update_task", "void_flow",
     ]);
   });
 
@@ -458,7 +458,7 @@ describe("ConversationStore（会话管理：删除 / 自动命名 / 定时提�
     const db = testDb();
     const deps = makeDeps(db, textAdapter());
     const store = deps.makeStore();
-    const coach = await deps.agents.create(UID, { persona: "# 教练\n盯训练。" });
+    const coach = await deps.agents.create(UID, { name: "教练", persona: "# 教练\n盯训练。" });
     await store.create(UID, "普通会话");
 
     const feed1 = await store.ensureTaskFeed(UID, coach.id);

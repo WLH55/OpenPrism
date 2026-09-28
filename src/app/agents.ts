@@ -1,10 +1,9 @@
 // 智能体三段配置之「身份/灵魂 + 能力绑定」（D4/4.1，ADR 0008 领域表）：
 // agents 表 = 身份（名字/描述/形象 emoji+色盘+头像/回复语言/默认模型）+ persona_md（= 灵魂 SOUL）+ bindings_json（工具开关 + 技能/MCP 绑定）。
-// 2026-09-07 五步向导改版（对齐 DeepTutor）：身份字段入库，名字显式优先（H1 推导仅作创建兜底）。
+// 2026-09-07 五步向导改版（对齐 DeepTutor）：身份字段入库；2026-09-28 起名字只来自表单显式输入，不再从 persona H1 推导。
 // snapshotSync 供 conversations 的 systemPrompt 每步同步取用（node:sqlite 同步 API，语义不破）。
 
 import type { DatabaseSync } from "node:sqlite";
-import { extractAgentName } from "./persona";
 import { validateFace } from "./avatar";
 
 /** 伙伴身份（向导第①步 + 心智的默认模型） */
@@ -114,8 +113,8 @@ export class AgentStore {
   ): Promise<AgentEntry> {
     validateIdentityPatch(input.identity ?? {});
     const id = this.deps.randomUUID();
-    // 名字显式优先；H1 推导只作兜底（向导一定显式给名）
-    const name = input.name?.trim() || extractAgentName(input.persona) || "助手";
+    // 名字固定来自表单；不从 persona 结构推导（缺省「助手」只是直连 API 的兜底，向导必显式给名）
+    const name = input.name?.trim() || "助手";
     const createdTs = this.deps.now();
     const identity = input.identity ?? {};
     this.deps.db

@@ -292,13 +292,65 @@ describe("HTTP API", () => {
     expect(missing.status).toBe(404);
   });
 
+  it("目标层级 API（B2，2026-09-28）：建方向/阶段 → PUT 修订（追加快照）→ GET 层级树；层级违规 400、未知 404", async () => {
+    const created = (await (await fetch(`${baseUrl}/api/goals`, {
+      ...json({ level: "direction", title: "健康", why: "精力" }),
+      headers: { "Content-Type": "application/json", cookie },
+    })).json()) as { goalId: string };
+    expect(created.goalId).toMatch(/^goal-/);
+
+    const phase = await fetch(`${baseUrl}/api/goals`, {
+      ...json({ level: "phase", title: "8 周减脂", parentId: created.goalId, nextStep: "约教练", due: "2026-11-20" }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(phase.status).toBe(200);
+    const phaseBody = (await phase.json()) as { goalId: string };
+
+    // 层级违规与存在性：phase 不挂 direction / 未知 parent → 400
+    expect(
+      (await fetch(`${baseUrl}/api/goals`, { ...json({ level: "phase", title: "孤儿阶段" }), headers: { "Content-Type": "application/json", cookie } })).status,
+    ).toBe(400);
+    expect(
+      (await fetch(`${baseUrl}/api/goals`, {
+        ...json({ level: "phase", title: "坏父", parentId: "goal-nope" }),
+        headers: { "Content-Type": "application/json", cookie },
+      })).status,
+    ).toBe(400);
+
+    // PUT 修订 = 追加快照：改标题与状态，GET 读到最新
+    const updated = await fetch(`${baseUrl}/api/goals/${phaseBody.goalId}`, {
+      ...json({ title: "8 周减脂（修订）", status: "paused" }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(updated.status).toBe(200);
+    expect(
+      (await fetch(`${baseUrl}/api/goals/${phaseBody.goalId}`, {
+        ...json({ status: "oops" }),
+        method: "PUT",
+        headers: { "Content-Type": "application/json", cookie },
+      })).status,
+    ).toBe(400);
+    expect(
+      (await fetch(`${baseUrl}/api/goals/goal-nope`, { ...json({ title: "x" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } })).status,
+    ).toBe(404);
+
+    const view = (await (await fetch(`${baseUrl}/api/goals?tz=480`, { headers: { cookie } })).json()) as {
+      directions: { title: string; children: { title: string; status: string; nextStep?: string }[] }[];
+    };
+    const direction = view.directions.find((d) => d.title === "健康")!;
+    expect(direction.children[0]!.title).toBe("8 周减脂（修订）");
+    expect(direction.children[0]!.status).toBe("paused");
+    expect(direction.children[0]!.nextStep).toBe("约教练"); // 未提供字段沿用
+  });
+
 
 describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
   it("agents：创建（带身份）→列表→详情→改人设（名字保留）→改身份→坏 avatar 400→改绑定→删除", async () => {
     const created = (await (await fetch(`${baseUrl}/api/agents`, {
       method: "POST",
       headers: { "Content-Type": "application/json", cookie },
-      body: JSON.stringify({ persona: "# 教练\n盯训练。", emoji: "🐯", color: "#b0501e", language: "zh" }),
+      body: JSON.stringify({ name: "教练", persona: "# 教练\n盯训练。", emoji: "🐯", color: "#b0501e", language: "zh" }),
     })).json()) as { id: string; name: string };
     expect(created.name).toBe("教练");
     expect((await (await fetch(`${baseUrl}/api/agents`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(1);

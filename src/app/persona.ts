@@ -1,5 +1,6 @@
 // 人设与 system prompt 合成（批次 2：D4 三段配置——人设卡 + 记忆注入 + 纪律）。
-// 人设 = 纯自由 markdown，名字从 H1 推导（4.1）；记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
+// 人设 = 纯自由 markdown（名字等固定身份只在表单字段，不从文本结构推导，2026-09-28 起）；
+// 记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -23,15 +24,6 @@ const DISCIPLINE = `守则：
 
 /** 定时提醒会话的回合规则：触发消息由调度器自动投递，用户不在场（2026-09-23） */
 const TASK_FEED_RULES = `定时提醒会话：本会话里的【定时任务触发】消息由系统按计划自动投递，不是用户此刻打的字。收到这类消息时，直接完成其中的任务内容，把要提醒用户看的内容作为回复正文；重复规则、计划时刻、触发时刻都已经写在消息里，不要拿这些反问用户。确实缺信息时，按最合理的假设完成本次提醒，并在正文里说明这个假设。`;
-
-/** 人设卡名字：首个 H1 文本；无则空串（上层兜底"助手"） */
-export function extractAgentName(markdown: string): string {
-  for (const line of markdown.split("\n")) {
-    const match = /^#\s+(.+?)\s*$/.exec(line);
-    if (match) return match[1]!;
-  }
-  return "";
-}
 
 export interface AgentIdentityPrompt {
   name: string;
