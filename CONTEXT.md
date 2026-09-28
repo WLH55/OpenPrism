@@ -89,7 +89,7 @@ _Avoid_: 记录（泛指）、日志条目
 _Avoid_: 待办、方向、阶段（指目标层概念时——那是"目标（Goal）"）
 
 **目标（Goal）**:
-账本第 4 类生活数据原语（2026-09-28，SDD 个人工作台业务借鉴）：方向（direction，长期）/ 阶段（phase，8—12 周，唯一下一步）/ 项目（project）三层层级；plan 经 goalId 挂树，打卡沿树冒泡聚合出各级进度。修订 = 追加同 goalId 新快照（未 void 的最新一条胜出，历史全保留）——这是更正/作废回路之外**唯一**的例外，与记忆 supersede 链同型；void 仅用于真删。数量约束是软的：折叠层只出 warning，不 block。
+账本第 4 类生活数据原语（2026-09-28，SDD 个人工作台业务借鉴）：方向（direction，长期）/ 阶段（phase，8—12 周，唯一下一步）/ 项目（project）三层层级；plan 经 goalId 挂树，打卡沿树冒泡聚合出各级进度。修订 = 追加同 goalId 新快照（未 void 的最新一条胜出，历史全保留）——这是更正/作废回路之外**唯一**的例外，与记忆 supersede 链同型；真删走 DELETE /api/goals/:goalId（作废该 goalId 全部存活快照，有存活子目标不放行），/api/void 不收 goal 条目。里程碑撤销打卡 = 作废那条 done 打卡（doneEver 语义下追加 done:false 无效）。数量约束是软的：折叠层只出 warning，不 block。
 _Avoid_: 任务清单、OKR（指本概念时）
 
 **打卡（Check-in）**:

@@ -114,6 +114,8 @@ export interface MilestoneLoose {
   due: string;
   goalId: string;
   done: boolean;
+  /** 存活 done 打卡的 seq；撤销打卡 = 逐条作废（旧版服务端无此字段 → undefined，UI 降级为不可撤销） */
+  doneSeqs?: number[];
 }
 
 export type GoalsPageLoose = GoalViewLoose & { milestones: MilestoneLoose[] };
@@ -259,6 +261,9 @@ export const api = {
     request<{ goalId: string; ts: number }>("/api/goals", { method: "POST", body: JSON.stringify(input) }),
   updateGoal: (goalId: string, patch: Omit<Partial<GoalInput>, "level"> & { status?: string }) =>
     request<{ ok: boolean }>(`/api/goals/${encodeURIComponent(goalId)}`, { method: "PUT", body: JSON.stringify(patch) }),
+  /** 真删目标（#B）：作废该 goalId 全部存活快照留痕；有存活子目标时服务端 400 */
+  deleteGoal: (goalId: string) =>
+    request<{ ok: boolean; voided: number }>(`/api/goals/${encodeURIComponent(goalId)}`, { method: "DELETE" }),
   /** UI 建计划/里程碑（挂目标树）；对话建计划走 agent 工具，同一账本 */
   createPlan: (input: { title: string; scope: string; due?: string; goalId?: string }) =>
     request<{ planId: string }>("/api/plans", { method: "POST", body: JSON.stringify(input) }),
