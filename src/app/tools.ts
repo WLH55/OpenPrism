@@ -293,7 +293,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
   const createGoal: ToolDefinition = {
     name: "create_goal",
     description:
-      "建一个目标：direction（长期方向，最多建议同时 3 个）/ phase（8-12 周阶段计划，挂在 direction 下）/ project（项目，挂在 phase 或 direction 下）。里程碑不在这里建——用 create_plan（scope=deadline）挂到阶段下。",
+      "建一个目标：direction（长期方向，最多建议同时 3 个）/ phase（8-12 周阶段计划，挂在 direction 下）/ project（项目，挂在 phase 或 direction 下）。要做的事（下一步/行动/里程碑，都是同一种东西）不在这里建——用 create_plan（scope=deadline）挂到阶段下，第一条未完成的自动成为下一步。",
     parameters: {
       type: "object",
       required: ["level", "title"],
@@ -305,7 +305,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         outcome: { type: "string", description: "可验收的预期结果" },
         metric: { type: "string", description: "direction：衡量指标" },
         due: { type: "string", description: "YYYY-MM-DD（阶段截止日常用）" },
-        nextStep: { type: "string", description: "phase：唯一下一步" },
+        nextStep: { type: "string", description: "（已弃用）下一步统一用 create_plan 建打卡点表达——阶段下第一条未完成的打卡点就是下一步" },
       },
     },
     output: {
