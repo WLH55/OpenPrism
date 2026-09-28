@@ -26,10 +26,15 @@ export interface TaskDef {
   enabled: boolean;
   /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送；缺省 = inapp */
   notifyChannel?: "inapp" | "wechat";
+  /** 内置任务标记（2026-09-29）：每用户种子一次性（users.builtins_seeded），删了不复活；UI 带「内置」徽标 */
+  builtin?: BuiltinTaskKind;
   tzOffsetMinutes: number;
   createdTs: number;
   lastRunTs?: number;
 }
+
+/** 内置三件套（2026-09-29 SDD 逾期处理与内置任务）：标记值即身份 */
+export type BuiltinTaskKind = "daily-brief" | "daily-report" | "weekly-review";
 
 export interface TaskRun {
   ts: number;
@@ -328,6 +333,7 @@ interface TaskRow {
   created_ts: number;
   last_run_ts: number | null;
   notify_channel: string | null;
+  builtin: string | null;
 }
 
 function rowToTask(row: TaskRow): TaskDef {
@@ -340,11 +346,45 @@ function rowToTask(row: TaskRow): TaskDef {
     trigger: JSON.parse(row.trigger_json) as TaskTrigger,
     enabled: row.enabled === 1,
     ...(row.notify_channel !== null ? { notifyChannel: row.notify_channel as "inapp" | "wechat" } : {}),
+    ...(row.builtin !== null ? { builtin: row.builtin as BuiltinTaskKind } : {}),
     tzOffsetMinutes: row.tz_offset_minutes,
     createdTs: row.created_ts,
     ...(row.last_run_ts !== null ? { lastRunTs: row.last_run_ts } : {}),
   };
 }
+
+/**
+ * 内置三件套（2026-09-29 SDD 逾期处理与内置任务）：简报管"今天要干嘛"，晚间汇报管"今天干得怎样"，
+ * 周复盘管"这周值不值"。指令文案集中在此便于热改；到点助手可 query_ledger 读当日实况，不是死模板。
+ */
+const BUILTIN_TASK_DEFS: ReadonlyArray<{
+  builtin: BuiltinTaskKind;
+  title: string;
+  instruction: string;
+  trigger: TaskTrigger;
+}> = [
+  {
+    builtin: "daily-brief",
+    title: "每日简报",
+    instruction:
+      "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段第一条未完成打卡点（下一步）的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
+    trigger: { kind: "daily", time: "08:30" },
+  },
+  {
+    builtin: "daily-report",
+    title: "每日晚间汇报",
+    instruction:
+      "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。",
+    trigger: { kind: "daily", time: "20:00" },
+  },
+  {
+    builtin: "weekly-review",
+    title: "每周复盘",
+    instruction:
+      "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals，回顾这一周：1) 本周计划完成情况与上周对比（在变好还是透支）；2) 各方向里程碑推进变化；3) 行为模式亮点与警示（记录时段/分类的规律）；4) 下周最值得聚焦的一件事及原因。用具体数字说话，最后问用户下周想重点推进什么——回复可以顺势落成新计划。",
+    trigger: { kind: "weekly", days: [7], time: "21:00" },
+  },
+];
 
 export class TaskStore {
   constructor(private deps: TaskStoreDeps) {}
@@ -364,15 +404,18 @@ export class TaskStore {
   async create(
     uid: string,
     input: Omit<TaskDef, "id" | "uid" | "createdTs" | "enabled" | "tzOffsetMinutes"> &
-      Partial<Pick<TaskDef, "enabled" | "tzOffsetMinutes">>,
+      Partial<Pick<TaskDef, "enabled" | "tzOffsetMinutes">> & { id?: string },
   ): Promise<TaskDef> {
     if (input.title.trim() === "" || input.instruction.trim() === "") throw new Error("title/instruction 必填");
     validateTrigger(input.trigger);
     if (input.notifyChannel !== undefined && input.notifyChannel !== "inapp" && input.notifyChannel !== "wechat") {
       throw new Error("notifyChannel 只支持 inapp | wechat");
     }
+    if (input.builtin !== undefined && !BUILTIN_TASK_DEFS.some((d) => d.builtin === input.builtin)) {
+      throw new Error(`builtin 只支持 ${BUILTIN_TASK_DEFS.map((d) => d.builtin).join(" | ")}`);
+    }
     const task: TaskDef = {
-      id: this.deps.randomUUID(),
+      id: input.id ?? this.deps.randomUUID(),
       uid,
       agentId: input.agentId,
       title: input.title.trim(),
@@ -380,15 +423,42 @@ export class TaskStore {
       trigger: input.trigger,
       enabled: input.enabled ?? true,
       ...(input.notifyChannel !== undefined ? { notifyChannel: input.notifyChannel } : {}),
+      ...(input.builtin !== undefined ? { builtin: input.builtin } : {}),
       tzOffsetMinutes: input.tzOffsetMinutes ?? 0,
       createdTs: this.deps.now(),
     };
     this.deps.db
       .prepare(
-        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel, builtin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
       )
-      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs, task.notifyChannel ?? null);
+      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs, task.notifyChannel ?? null, task.builtin ?? null);
     return task;
+  }
+
+  /**
+   * 内置三件套种子（2026-09-29）：种子一次性（users.builtins_seeded 标记）——
+   * 重复调用幂等；用户删除内置任务后重启不复活（标记已置），提醒页模板按钮可一键重建。
+   * 注册路径与进程启动补种共用；tz 默认东八区（单用户自部署，可改）。
+   */
+  async ensureBuiltins(uid: string): Promise<number> {
+    const row = this.deps.db.prepare("SELECT builtins_seeded FROM users WHERE uid = ?").get(uid) as
+      | { builtins_seeded: number }
+      | undefined;
+    if (!row || row.builtins_seeded === 1) return 0;
+    for (const def of BUILTIN_TASK_DEFS) {
+      // 确定性 id（builtin-{kind}-{uid}）：不依赖注入方 uuid 的唯一性（测试夹具常给固定值），三连插不撞主键
+      await this.create(uid, {
+        id: `builtin-${def.builtin}-${uid}`,
+        title: def.title,
+        instruction: def.instruction,
+        trigger: def.trigger,
+        notifyChannel: "inapp",
+        builtin: def.builtin,
+        tzOffsetMinutes: 480,
+      });
+    }
+    this.deps.db.prepare("UPDATE users SET builtins_seeded = 1 WHERE uid = ?").run(uid);
+    return BUILTIN_TASK_DEFS.length;
   }
 
   async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">>): Promise<TaskDef> {

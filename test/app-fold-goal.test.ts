@@ -264,10 +264,12 @@ describe("todayView 增补（B1）", () => {
       NOW,
       TZ,
     );
-    // 顺序：逾期 > 今天截止 > 进行中（月内做过、今日未做）> 待做 > 未开始（明天）> 已完成
-    expect(view.plans.map((p) => p.state)).toEqual(["overdue", "dueToday", "doing", "todo", "upcoming", "done"]);
-    expect(view.plans.map((p) => p.planId)).toEqual(["a", "b", "e", "f", "c", "g"]);
-    expect(view.plans.some((p) => p.planId === "d")).toBe(false); // 历史完成且已过期 → 沉出今天列表
+    // 顺序：逾期 > 今天截止 > 进行中（月内做过、今日未做）> 待做 > 未开始（明天）> 已完成（含历史存档，2026-09-29 全量收编）
+    expect(view.plans.map((p) => p.state)).toEqual(["overdue", "dueToday", "doing", "todo", "upcoming", "done", "done"]);
+    expect(view.plans.map((p) => p.planId)).toEqual(["a", "b", "e", "f", "c", "d", "g"]);
+    expect(view.plans.every((p) => typeof p.seq === "number")).toBe(true); // 跳过（作废 plan）定位用
+    const d = view.plans.find((p) => p.planId === "d")!;
+    expect(d.doneAt).toBe(Date.UTC(2026, 8, 10, 2)); // 完成时刻 = 最新 done 打卡 at（已完成视图排序/过滤用）
     const g = view.plans.find((p) => p.planId === "g")!;
     expect(g.done).toBe(true);
     expect(g.doneSeqs).toHaveLength(1); // 撤销 = 作废该打卡（与计划页同规）

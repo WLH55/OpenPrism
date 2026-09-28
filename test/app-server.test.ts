@@ -70,7 +70,8 @@ beforeAll(async () => {
     { kind: "text", text: "记好了，午餐 28。" },
     // memory/extract：chat 段决策 add（决策制，2026-09-10 条目化）
     { kind: "text", text: '{"memories":[{"action":"add","target":null,"kind":"fact","topic":"测试链","content":"用户在测试记忆链","importance":3,"source":1,"expires_at":null}]}' },
-    // memory/extract：后续段（mc1 会话/账本）无新事实
+    // memory/extract：后续段（mc1 会话/账本/任务）无新事实——任务 surface 因内置三件套非空（2026-09-29）多跑一段
+    { kind: "text", text: '{"memories":[]}' },
     { kind: "text", text: '{"memories":[]}' },
     { kind: "text", text: '{"memories":[]}' },
   ]);
@@ -561,7 +562,12 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
       headers: { "Content-Type": "application/json", cookie },
       body: JSON.stringify({ title: "睡觉提醒", instruction: "提醒睡觉", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: 480 }),
     })).json()) as { id: string };
-    expect((await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(1);
+    expect(created.id).toMatch(/^tid-/);
+    // 注册随号种入内置三件套（2026-09-29）：列表 = 3 内置 + 1 自建；内置标记与默认渠道齐
+    const afterCreate = (await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as { builtin?: string; notifyChannel?: string }[];
+    expect(afterCreate).toHaveLength(4);
+    expect(afterCreate.filter((t) => t.builtin !== undefined).map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+    expect(afterCreate.every((t) => t.builtin === undefined || (t.notifyChannel ?? "inapp") === "inapp")).toBe(true);
     expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },
@@ -580,7 +586,8 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     const notices = (await (await fetch(`${baseUrl}/api/notifications`, { headers: { cookie } })).json()) as { text: string }[];
     expect(notices.some((n) => n.text.startsWith("（manual）"))).toBe(true);
     expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
-    expect((await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[]).toHaveLength(0);
+    const afterDelete = (await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[];
+    expect(afterDelete).toHaveLength(3); // 只剩内置三件套（自建已删）
   });
 
   it("notifications：手动跑产出未读→全部已读", async () => {

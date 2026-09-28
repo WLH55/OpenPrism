@@ -118,6 +118,41 @@ describe("TaskStore", () => {
     expect(await store.runs("u1", task.id)).toHaveLength(0);
   });
 
+  it("内置三件套（2026-09-29）：种三件时刻/tz/渠道正确、幂等、删除不复活（种子一次性）、未知 uid 不种", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    let seq = 0;
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => `tid-b${++seq}` });
+
+    expect(await store.ensureBuiltins("u1")).toBe(3);
+    const list = await store.list("u1");
+    expect(list.map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+    expect(list.find((t) => t.builtin === "daily-brief")!.trigger).toEqual({ kind: "daily", time: "08:30" });
+    expect(list.find((t) => t.builtin === "daily-report")!.trigger).toEqual({ kind: "daily", time: "20:00" });
+    expect(list.find((t) => t.builtin === "weekly-review")!.trigger).toEqual({ kind: "weekly", days: [7], time: "21:00" });
+    expect(list.every((t) => t.tzOffsetMinutes === 480 && (t.notifyChannel ?? "inapp") === "inapp")).toBe(true);
+    expect(list.every((t) => t.enabled)).toBe(true);
+
+    // 幂等：已种用户重复调用不再建
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(3);
+
+    // 删除后不复活：种子一次性（标记已置），想找回走提醒页模板重建
+    await store.remove("u1", list[0]!.id);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(2);
+
+    // 未知 uid 安全返回（不抛、不种）
+    expect(await store.ensureBuiltins("nope")).toBe(0);
+  });
+
+  it("create 的 builtin 值受白名单校验", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-bv" });
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "09:00" }, builtin: "daily-nope" as never }),
+    ).rejects.toThrow();
+  });
+
   it("updateLastRun 推进锚点并持久（同库新实例可见）", async () => {
     const db = testDb();
     const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-2" });

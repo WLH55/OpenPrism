@@ -254,7 +254,14 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         {triggerShort(task.trigger)}
       </span>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[15px] text-ink">{task.title}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-[15px] text-ink">{task.title}</span>
+          {task.builtin !== undefined && (
+            <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent" title="内置任务：注册时自动创建，可改可关，删除后可用模板重建">
+              内置
+            </span>
+          )}
+        </div>
         <div className="truncate text-xs text-ink3">
           {task.instruction}
           {task.lastRunTs ? ` · 上次 ${new Date(task.lastRunTs).toLocaleString()}` : " · 未跑过"}
@@ -487,7 +494,7 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
             </p>
           </div>
-          {/* B4（2026-09-28）简报模板：D7"简报=定时任务用法"的落地入口——一键填好标题/调度/指令 */}
+          {/* B4（2026-09-28）简报模板 + 内置三件套对齐（2026-09-29：周报挪周日 21:00、新增晚间汇报）——一键填好标题/调度/指令 */}
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="text-xs text-ink3">模板：</span>
             <button
@@ -499,7 +506,7 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
                 setHour(8);
                 setMinuteOfHour(30);
                 setInstruction(
-                  "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段计划唯一下一步的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
+                  "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段第一条未完成打卡点（下一步）的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
                 );
               }}
             >
@@ -509,17 +516,32 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               type="button"
               className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
               onClick={() => {
-                setTitle("每周进化报告");
-                setSchedKind("weekly");
-                setWeekdays([1]);
+                setTitle("每日晚间汇报");
+                setSchedKind("daily");
                 setHour(20);
                 setMinuteOfHour(0);
                 setInstruction(
-                  "生成本周进化报告：先用 query_ledger 查 what=today 与 what=goals，总结：1) 本周完成打卡与上周对比（进步还是透支）；2) 各方向里程碑进度变化；3) 行为模式洞察——记录时段与分类的规律；4) 下周建议聚焦的一件事及原因。用具体数字说话。",
+                  "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。",
                 );
               }}
             >
-              📈 每周报告（周一 20:00）
+              🌙 晚间汇报（每天 20:00）
+            </button>
+            <button
+              type="button"
+              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
+              onClick={() => {
+                setTitle("每周复盘");
+                setSchedKind("weekly");
+                setWeekdays([7]);
+                setHour(21);
+                setMinuteOfHour(0);
+                setInstruction(
+                  "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals，回顾这一周：1) 本周计划完成情况与上周对比（在变好还是透支）；2) 各方向里程碑推进变化；3) 行为模式亮点与警示（记录时段/分类的规律）；4) 下周最值得聚焦的一件事及原因。用具体数字说话，最后问用户下周想重点推进什么——回复可以顺势落成新计划。",
+                );
+              }}
+            >
+              📈 每周复盘（周日 21:00）
             </button>
           </div>
           <textarea
