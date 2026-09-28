@@ -6,6 +6,7 @@ import { LightboxHost } from "./lightbox";
 import { Login } from "./pages/Login";
 import { Chat } from "./pages/Chat";
 import { Today } from "./pages/Today";
+import { Plans } from "./pages/Plans";
 import { Settings } from "./pages/Settings";
 import { Agents, AgentEdit } from "./pages/Agents";
 import { Skills } from "./pages/Skills";
@@ -18,11 +19,11 @@ import { IM } from "./pages/IM";
 import { BottomTabs, Drawer } from "./components/MobileNav";
 import {
   AgentsIcon, CategoryIcon, ChatIcon, ChevronDownIcon, ImIcon, LogoutIcon, MemoryIcon,
-  MenuIcon, ModelIcon, MoonIcon, NotifyIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
+  MenuIcon, ModelIcon, MoonIcon, NotifyIcon, PlansIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
 } from "./icons";
 
 export type View =
-  | "chat" | "today" | "category" | "progress"
+  | "chat" | "today" | "plans" | "category" | "progress"
   | "agents" | "agent-edit" | "task" | "skills" | "memory" | "model" | "notify" | "im" | "profile";
 
 function toggleTheme(): void {
@@ -40,6 +41,7 @@ function viewTitle(view: View): string {
   switch (view) {
     case "chat": return "对话";
     case "today": return "今天";
+    case "plans": return "计划";
     case "category": return "盘面";
     case "progress": return "成长";
     case "agents": return "伙伴";
@@ -55,7 +57,7 @@ function viewTitle(view: View): string {
 }
 
 /** 「更多」标签高亮条件：抽屉开着，或当前页是抽屉专属页 */
-const MORE_VIEWS: View[] = ["agents", "agent-edit", "task", "skills", "memory", "model", "notify", "im", "profile"];
+const MORE_VIEWS: View[] = ["category", "agents", "agent-edit", "task", "skills", "memory", "model", "notify", "im", "profile"]; // 2026-09-28 B3：盘面从底部栏下架，归入更多
 
 interface SidebarProps {
   me: MeLoose;
@@ -130,9 +132,10 @@ function SidebarContent({
       <nav className="space-y-1 px-3">
         {navItem("chat", "对话", ChatIcon)}
         {navItem("today", "今天", TodayIcon)}
-        {navItem("category", "盘面", CategoryIcon)}
+        {navItem("plans", "计划", PlansIcon)}
         {navItem("progress", "成长", ProgressIcon)}
         <div className="mx-3 my-2 border-t border-line" />
+        {navItem("category", "盘面", CategoryIcon)}
         {navItem("agents", "伙伴", AgentsIcon)}
         {navItem("task", "提醒", TaskIcon, unread)}
       </nav>
@@ -378,9 +381,10 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
           )}
           {view !== "chat" && (
             <div className="h-full overflow-y-auto">
-              {view === "today" && <Today />}
+              {view === "today" && <Today onOpenPlans={() => setView("plans")} />}
+              {view === "plans" && <Plans />}
               {view === "category" && <Panels />}
-              {view === "progress" && <Progress />}
+              {view === "progress" && <Progress onOpenPlans={() => setView("plans")} />}
               {view === "agents" && (
                 <Agents
                   onEdit={(id) => { setEditingAgentId(id); setView("agent-edit"); }}

@@ -28,12 +28,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid);
 
--- 账本：四类记录（event 流水 / plan 计划 / checkin 打卡 / void 作废）单表继承，
+-- 账本：五类记录（event 流水 / plan 计划 / checkin 打卡 / void 作废 / goal 目标）单表继承，
 -- (uid, seq) 主键 = 用户内追加序；void 引用 target_seq，折叠层剔除、审计保留。
+-- goal（2026-09-28 B1，SDD 个人工作台业务借鉴）：方向/阶段/项目层级一等公民；
+-- 修订 = 追加新快照（同 goalId 最新胜出），void 仅真删；title/due 复用既有列。
 CREATE TABLE IF NOT EXISTS ledger_entries (
   uid         TEXT NOT NULL,
   seq         INTEGER NOT NULL,
-  kind        TEXT NOT NULL CHECK (kind IN ('event','plan','checkin','void')),
+  kind        TEXT NOT NULL CHECK (kind IN ('event','plan','checkin','void','goal')),
   ts          INTEGER NOT NULL,
   source      TEXT NOT NULL CHECK (source IN ('agent','ui')),
   actor_conv  TEXT,
@@ -54,6 +56,15 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   done        INTEGER,
   target_seq  INTEGER,
   reason      TEXT,
+  goal_id     TEXT,
+  level       TEXT,
+  parent_id   TEXT,
+  g_why       TEXT,
+  g_outcome   TEXT,
+  g_metric    TEXT,
+  g_next_step TEXT,
+  g_status    TEXT,
+  plan_goal_id TEXT,
   PRIMARY KEY (uid, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_kind_time ON ledger_entries(uid, kind, time);
@@ -361,8 +372,11 @@ function ensureInterestKind(db: DatabaseSync): void {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'").get() as
     | { sql: string }
     | undefined;
-  if (!row || row.sql.includes("'interest'")) return;
-  db.exec(`
+  if (!row || row.sql.includes("'task','interest'")) return;
+  // 重建跨多条自动提交 DDL——包进事务（SQLite DDL 可回滚），中途崩溃不留半迁移态
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`
     CREATE TABLE memory_items_rebuild (
       uid           TEXT NOT NULL,
       id            TEXT NOT NULL,
@@ -389,6 +403,74 @@ function ensureInterestKind(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_memory_items_key ON memory_items(uid, norm_key, status);
     CREATE INDEX IF NOT EXISTS idx_memory_items_live ON memory_items(uid, status, importance, valid_from);
   `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/**
+ * 存量库 ledger_entries 的 kind CHECK 不含 goal（SQLite 改 CHECK 只能重建表）：
+ * 检测建表 SQL 里没有 'goal' 即重建（数据原样搬运 + 重建索引 + 补 goal 列）；幂等，新库直接跳过。
+ * 导出仅为迁移测试（test/app-fold-goal.test.ts），调用方只有 openDb。
+ */
+export function ensureGoalKind(db: DatabaseSync): void {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ledger_entries'").get() as
+    | { sql: string }
+    | undefined;
+  if (!row || row.sql.includes("'void','goal'")) return;
+  // 重建跨多条自动提交 DDL——包进事务（SQLite DDL 可回滚），中途崩溃不留半迁移态（账本表尤其致命）
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`
+    CREATE TABLE ledger_entries_rebuild (
+      uid         TEXT NOT NULL,
+      seq         INTEGER NOT NULL,
+      kind        TEXT NOT NULL CHECK (kind IN ('event','plan','checkin','void','goal')),
+      ts          INTEGER NOT NULL,
+      source      TEXT NOT NULL CHECK (source IN ('agent','ui')),
+      actor_conv  TEXT,
+      actor_agent TEXT,
+      time        INTEGER,
+      category    TEXT,
+      note        TEXT,
+      value       REAL,
+      unit        TEXT,
+      attrs_json  TEXT,
+      plan_id     TEXT,
+      title       TEXT,
+      scope       TEXT,
+      due         TEXT,
+      ndays       INTEGER,
+      checkin_plan_id TEXT,
+      at          INTEGER,
+      done        INTEGER,
+      target_seq  INTEGER,
+      reason      TEXT,
+      goal_id     TEXT,
+      level       TEXT,
+      parent_id   TEXT,
+      g_why       TEXT,
+      g_outcome   TEXT,
+      g_metric    TEXT,
+      g_next_step TEXT,
+      g_status    TEXT,
+      plan_goal_id TEXT,
+      PRIMARY KEY (uid, seq)
+    );
+    INSERT INTO ledger_entries_rebuild (uid, seq, kind, ts, source, actor_conv, actor_agent, time, category, note, value, unit, attrs_json, plan_id, title, scope, due, ndays, checkin_plan_id, at, done, target_seq, reason)
+      SELECT uid, seq, kind, ts, source, actor_conv, actor_agent, time, category, note, value, unit, attrs_json, plan_id, title, scope, due, ndays, checkin_plan_id, at, done, target_seq, reason FROM ledger_entries;
+    DROP TABLE ledger_entries;
+    ALTER TABLE ledger_entries_rebuild RENAME TO ledger_entries;
+    CREATE INDEX IF NOT EXISTS idx_ledger_kind_time ON ledger_entries(uid, kind, time);
+    CREATE INDEX IF NOT EXISTS idx_ledger_category ON ledger_entries(uid, category, time);
+  `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 /** 打开（或创建）数据库：DDL 幂等；":memory:" 供测试 */
@@ -428,6 +510,7 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "users", "emoji", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "users", "color", "TEXT NOT NULL DEFAULT ''");
   ensureInterestKind(db); // 存量库 kind CHECK 补 interest（重建表，幂等）
+  ensureGoalKind(db); // 存量库 kind CHECK 补 goal + goal 列（重建表，幂等，2026-09-28 B1）
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }
