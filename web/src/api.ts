@@ -43,6 +43,10 @@ export interface TodayPlanView {
   due?: string;
   done: boolean;
   checkinTs?: number;
+  /** 确定性状态：overdue/dueToday/doing/todo/upcoming/done（旧服务端无此字段 → 用 done 兜底） */
+  state?: "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
+  /** deadline 型已完成时的存活打卡 seq；撤销 = 逐条作废（与计划页同规） */
+  doneSeqs?: number[];
 }
 
 export interface TodayFlowView {

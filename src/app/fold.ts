@@ -33,7 +33,19 @@ export interface TodayPlanView {
   due?: string;
   done: boolean;
   checkinTs?: number;
+  /**
+   * 确定性状态（2026-09-28 用户验收：计划要能区分进行中/未开始/已过期/已完成）：
+   * deadline 型看 doneEver + due 与今天的关系；周期型看今日打卡 + 本周期内有无历史打卡。
+   */
+  state: PlanState;
+  /** deadline 型且已完成时的存活 done 打卡 seq（今天页撤销 = 逐条作废，与计划页同规） */
+  doneSeqs?: number[];
 }
+
+export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
+
+/** 今天页计划的展示顺序：逾期 > 今天截止 > 进行中/待做 > 未开始（未来） > 已完成 */
+const STATE_RANK: Record<PlanState, number> = { overdue: 0, dueToday: 1, doing: 2, todo: 3, upcoming: 4, done: 5 };
 
 export interface TodayFlowView {
   seq: number;
@@ -105,20 +117,53 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     .map(({ seq, time, category, note, value, unit }) => ({ seq, time, category, ...(note !== undefined ? { note } : {}), ...(value !== undefined ? { value } : {}), ...(unit !== undefined ? { unit } : {}) }));
 
   const checkinsToday = live.filter((r): r is CheckinRecord => r.kind === "checkin" && r.done && isToday(r.at));
+  // doneEver（打过一次就算）+ 存活 done 打卡 seq：deadline 型的完成判定与撤销口径（与计划页同源）
+  const doneEver = new Set<string>();
+  const doneSeqsByPlan = new Map<string, number[]>();
+  for (const r of live) {
+    if (r.kind !== "checkin" || !r.done) continue;
+    doneEver.add(r.planId);
+    const list = doneSeqsByPlan.get(r.planId) ?? [];
+    list.push(r.seq);
+    doneSeqsByPlan.set(r.planId, list);
+  }
+  const todayStr = dateString(localParts(now, tzOffsetMinutes));
+  // 周期计划"本周期内"是否已有打卡（不含今天）——区分 待做 / 进行中
+  const periodHasCheckin = (plan: PlanRecord): boolean =>
+    live.some((r) => r.kind === "checkin" && r.done && r.planId === plan.planId && planScopeCoversToday(plan, r.at, tzOffsetMinutes) && !isToday(r.at));
+  const stateOf = (plan: PlanRecord, doneToday: boolean): PlanState => {
+    if (plan.scope === "deadline") {
+      if (doneEver.has(plan.planId)) return "done";
+      if (plan.due !== undefined && plan.due < todayStr) return "overdue";
+      if (plan.due === todayStr) return "dueToday";
+      return "upcoming";
+    }
+    if (doneToday) return "done";
+    return periodHasCheckin(plan) ? "doing" : "todo";
+  };
+  // 列表成员：覆盖今天的周期计划 + deadline 计划（未完成的全收——含已过期；完成且 due 已过的沉出，避免历史打卡点刷屏）
   const plans = live
-    .filter((r): r is PlanRecord => r.kind === "plan" && planScopeCoversToday(r, now, tzOffsetMinutes))
-    .sort((a, b) => a.seq - b.seq)
+    .filter((r): r is PlanRecord => {
+      if (r.kind !== "plan") return false;
+      if (r.scope === "deadline") return !doneEver.has(r.planId) || (r.due !== undefined && r.due >= todayStr);
+      return planScopeCoversToday(r, now, tzOffsetMinutes);
+    })
     .map((plan) => {
-      const done = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
+      const doneToday = plan.scope === "deadline" ? doneEver.has(plan.planId) : checkinsToday.some((c) => c.planId === plan.planId);
+      const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
+      const state = stateOf(plan, doneToday);
       return {
         planId: plan.planId,
         title: plan.title,
         scope: plan.scope,
         ...(plan.due !== undefined ? { due: plan.due } : {}),
-        done: Boolean(done),
-        ...(done ? { checkinTs: done.at } : {}),
+        done: doneToday,
+        ...(last !== undefined ? { checkinTs: last.at } : {}),
+        state,
+        ...(plan.scope === "deadline" && state === "done" ? { doneSeqs: doneSeqsByPlan.get(plan.planId) ?? [] } : {}),
       };
-    });
+    })
+    .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.planId.localeCompare(b.planId));
 
   const totals = new Map<string, { total: number; count: number }>();
   for (const flow of live) {

@@ -268,9 +268,9 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
         </div>
       </div>
 
-      {/* 今日计划 */}
+      {/* 计划（2026-09-28 状态折叠）：逾期 > 今天截止 > 进行中/待做 > 未开始（未来）> 已完成，全状态收编 */}
       <section className="mb-6">
-        <h2 className="mb-2 text-sm font-semibold text-ink">今日计划</h2>
+        <h2 className="mb-2 text-sm font-semibold text-ink">计划</h2>
         <div className="space-y-1.5">
           {view.plans.length === 0 && (
             <button
@@ -280,29 +280,59 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
               今天还没有计划——去计划页给阶段加个里程碑，或直接跟助手说一句
             </button>
           )}
-          {view.plans.map((plan) => (
-            <button
-              key={plan.planId}
-              className="flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition hover:bg-surface2/60"
-              onClick={async () => {
-                await api.checkin(plan.planId, !plan.done);
-                reload();
-              }}
-              title={plan.done ? "点击取消打卡" : "点击打卡"}
-            >
-              {plan.done ? (
-                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
-                  <CheckSolidIcon className="h-3.5 w-3.5" />
-                </span>
-              ) : (
-                <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
-              )}
-              <span className={`flex-1 text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
-              <span className={`num text-xs ${plan.done ? "text-ink3" : "text-warm"}`}>
-                {plan.done ? "已完成" : "未开始"}
-              </span>
-            </button>
-          ))}
+          {view.plans.map((plan) => {
+            // 状态标签（旧服务端无 state 时用 done 兜底）；未来的 deadline 显示 明天/N 天后/日期
+            const state = plan.state ?? (plan.done ? "done" : "todo");
+            const daysTo = plan.due !== undefined ? Math.round((new Date(`${plan.due}T00:00:00`).getTime() - new Date(`${view.date}T00:00:00`).getTime()) / 86400000) : null;
+            const stateLabel =
+              state === "done"
+                ? "已完成"
+                : state === "overdue"
+                  ? daysTo !== null && daysTo < 0
+                    ? `已过期 ${-daysTo} 天`
+                    : "已过期"
+                  : state === "dueToday"
+                    ? "今天截止"
+                    : state === "doing"
+                      ? "进行中"
+                      : state === "upcoming"
+                        ? daysTo === 1
+                          ? "明天"
+                          : daysTo !== null && daysTo > 1 && daysTo <= 30
+                            ? `${daysTo} 天后`
+                            : (plan.due ?? "未开始")
+                        : "待做";
+            const stateCls =
+              state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : state === "done" ? "text-ink3" : "text-ink3";
+            return (
+              <button
+                key={plan.planId}
+                className="flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition hover:bg-surface2/60"
+                onClick={async () => {
+                  if (plan.done) {
+                    // deadline 型撤销 = 作废打卡（doneEver 语义下追加 done:false 无效），周期型仍是追加反向打卡
+                    if ((plan.doneSeqs ?? []).length > 0) for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
+                    else await api.checkin(plan.planId, false);
+                  } else {
+                    await api.checkin(plan.planId, true);
+                  }
+                  reload();
+                }}
+                title={plan.done ? ((plan.doneSeqs ?? []).length > 0 ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "点击取消今日打卡") : "点击打卡"}
+              >
+                {plan.done ? (
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
+                    <CheckSolidIcon className="h-3.5 w-3.5" />
+                  </span>
+                ) : (
+                  <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
+                )}
+                <span className={`flex-1 truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
+                {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
+                <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
+              </button>
+            );
+          })}
         </div>
       </section>
 
