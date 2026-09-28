@@ -117,7 +117,7 @@ export interface ConversationMeta {
   agentId?: string;
   /** 会话级模型绑定；缺省 = 跟随全局激活 */
   modelProviderId?: string;
-  switches: { ts: number; agentId: string }[];
+  switches: { ts: number; agentId: string | null }[];
 }
 
 interface ConversationRow {
@@ -233,20 +233,23 @@ export class ConversationStore {
     };
   }
 
-  /** 切换伙伴（D4.2）：只换 system prompt 与装配，历史不丢；切换历史供 UI 画分割线 */
-  async switchAgent(uid: string, cid: string, agentId: string): Promise<void> {
+  /** 切换伙伴（D4.2）：只换 system prompt 与装配，历史不丢；切换历史供 UI 画分割线。
+   * agentId = null 切回默认助手（2026-09-28 微信桥增补：会话唯一固定的场景不能靠新建绕过）。 */
+  async switchAgent(uid: string, cid: string, agentId: string | null): Promise<void> {
     const agents = await this.deps.agents.list(uid);
-    const target = agents.find((a) => a.id === agentId);
-    if (!target) throw new Error(`agent "${agentId}" 不存在`);
+    const target = agentId !== null ? agents.find((a) => a.id === agentId) : undefined;
+    if (agentId !== null && !target) throw new Error(`agent "${agentId}" 不存在`);
     // 会话没绑模型时，伙伴默认模型决定实际模型：历史里有图而目标模型不支持图片 → 拦住切换
+    // （目标 = 默认助手时按全局激活模型判）
     const meta = await this.metaFor(uid, cid);
     if (meta.modelProviderId === undefined && this.conversationHasImages(cid)) {
-      const config = await this.deps.modelConfigFor(uid, target.identity.modelProviderId ?? null);
+      const effective = target?.identity.modelProviderId ?? null;
+      const config = await this.deps.modelConfigFor(uid, effective);
       if (config && !config.multimodal) {
-        throw new ModelNotMultimodalError(`${target.name} 的默认模型不支持图片识别，这个会话里有图片`);
+        throw new ModelNotMultimodalError(`${target?.name ?? "默认助手"} 的默认模型不支持图片识别，这个会话里有图片`);
       }
     }
-    meta.agentId = agentId;
+    meta.agentId = agentId ?? undefined;
     meta.switches.push({ ts: this.deps.now(), agentId });
     this.db
       .prepare("UPDATE conversations SET agent_id = ?, switches_json = ? WHERE cid = ? AND uid = ?")

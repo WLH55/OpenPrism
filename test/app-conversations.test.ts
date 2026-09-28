@@ -275,6 +275,27 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     const entry = await store.create(UID);
     await expect(store.switchAgent(UID, entry.id, "aid-nope")).rejects.toThrow();
   });
+
+  it("switchAgent null = 切回默认助手（2026-09-28 微信桥增补）：agent_id 置空、switches 留痕、meta 往返", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const coach = await deps.agents.create(UID, { persona: "# 教练\n盯训练。" });
+    const entry = await store.create(UID);
+
+    await store.switchAgent(UID, entry.id, coach.id);
+    expect((await store.metaFor(UID, entry.id)).agentId).toBe(coach.id);
+
+    await store.switchAgent(UID, entry.id, null);
+    const meta = await store.metaFor(UID, entry.id);
+    expect(meta.agentId).toBeUndefined(); // 回到默认助手
+    expect(meta.switches).toHaveLength(2);
+    expect(meta.switches[1]).toMatchObject({ agentId: null }); // 切换历史留痕（null 亦记）
+
+    // 语义往返：再切回具体伙伴仍正常
+    await store.switchAgent(UID, entry.id, coach.id);
+    expect((await store.metaFor(UID, entry.id)).agentId).toBe(coach.id);
+  });
 });
 
 describe("ConversationStore（多模态图片输入）", () => {

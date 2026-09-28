@@ -96,6 +96,20 @@ export class WechatBridge {
     return { bound: true, state: bind.state, ilinkBotId: bind.ilink_bot_id };
   }
 
+  /** 「微信对话」会话当前绑定的伙伴（2026-09-28 增补）：null = 默认助手；会话未建也视为 null */
+  async currentAgent(uid: string): Promise<string | null> {
+    const row = this.deps.db
+      .prepare("SELECT agent_id FROM conversations WHERE cid = ? AND uid = ?")
+      .get(WECHAT_FEED_CID(uid), uid) as unknown as { agent_id: string | null } | undefined;
+    return row?.agent_id ?? null;
+  }
+
+  /** 切换「微信对话」会话的伙伴（null = 切回默认助手）；web 与微信同一会话，切换对两端同步生效 */
+  async switchAgent(uid: string, agentId: string | null): Promise<void> {
+    await this.ensureFeed(uid);
+    await this.deps.conversations.switchAgent(uid, WECHAT_FEED_CID(uid), agentId);
+  }
+
   /** 启动时装载全部 active 绑定（重启恢复轮询） */
   startAll(): void {
     const rows = this.deps.db.prepare("SELECT uid FROM wechat_binds WHERE state = 'active'").all() as unknown as { uid: string }[];

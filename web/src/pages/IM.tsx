@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { apiIm, type WechatBindState } from "../api";
+import { api2, apiIm, type AgentLoose, type WechatBindState } from "../api";
 import { CloseIcon } from "../icons";
 
 type ScanPhase = "idle" | "waiting" | "scaned" | "expired";
@@ -13,6 +13,10 @@ export function IM() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [qr, setQr] = useState<{ qrcode: string; content: string } | null>(null);
+  // 对话伙伴（2026-09-28 增补）：null = 默认助手；切换对 web/微信同步生效（同一「微信对话」会话）
+  const [agents, setAgents] = useState<AgentLoose[]>([]);
+  const [agentId, setAgentId] = useState<string | null>(null);
+  const [agentBusy, setAgentBusy] = useState(false);
   const [phase, setPhase] = useState<ScanPhase>("idle");
   // 扫码状态轮询代数：关闭弹层/过期后旧循环自动退场
   const pollGenRef = useRef(0);
@@ -28,7 +32,25 @@ export function IM() {
 
   useEffect(() => {
     void refresh();
+    void api2.listAgents().then(setAgents).catch(() => undefined);
+    void apiIm
+      .bindAgentState()
+      .then((r) => setAgentId(r.agentId))
+      .catch(() => undefined);
   }, [refresh]);
+
+  const pickAgent = async (id: string | null) => {
+    if (id === agentId || agentBusy) return;
+    setAgentBusy(true);
+    try {
+      await apiIm.bindAgent(id);
+      setAgentId(id);
+    } catch (e) {
+      setError(`切换伙伴失败：${(e as Error).message}`);
+    } finally {
+      setAgentBusy(false);
+    }
+  };
 
   /** 扫码状态长轮询循环（每轮 ~35s 由服务端保持；confirmed 即绑定完成） */
   const pollStatus = useCallback(
@@ -135,8 +157,25 @@ export function IM() {
                 <div className="text-sm text-ink2">
                   机器人 ID：<span className="font-mono text-xs text-ink3">{state.ilinkBotId}</span>
                 </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="shrink-0 text-sm text-ink2">对话伙伴</span>
+                  <select
+                    className="min-w-0 flex-1 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink"
+                    value={agentId ?? ""}
+                    disabled={agentBusy}
+                    onChange={(e) => void pickAgent(e.target.value === "" ? null : e.target.value)}
+                  >
+                    <option value="">默认助手</option>
+                    {agents.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <div className="text-xs leading-relaxed text-ink3">
                   在微信里给这个机器人发消息即可对话——内容进「微信对话」会话（web 端同步可见）；只有你本人的微信消息会被响应。
+                  切换「对话伙伴」后，微信里的下一回合就以新伙伴的身份回答。
                   建定时任务时把「通知渠道」选成「微信机器人」，到点提醒就会推到这里。
                 </div>
                 <div className="flex justify-end">
