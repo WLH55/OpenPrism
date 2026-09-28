@@ -87,7 +87,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       required: ["title", "scope"],
       properties: {
         title: { type: "string" },
-        scope: { type: "string", description: "day | week | month | year | ndays | deadline" },
+        scope: {
+          type: "string",
+          description:
+            "day | week | month | year | ndays | deadline。周期习惯用 day/week/month/year/ndays（每个周期重新打卡，如\"每天背单词\"=day、\"每周跑两次\"=week）；一次性的事用 deadline 并填 due（打过一次就算完成，如\"周五前交报告\"）。用户话里没有\"每天/每周\"也没有截止日就先问一句要哪种，不要猜。",
+        },
         due: { type: "string", description: "截止日 YYYY-MM-DD（scope=deadline 必填）" },
         ndays: { type: "integer", description: "最近 N 天（scope=ndays 必填）" },
         goalId: { type: "string", description: "挂到的目标 goalId（里程碑用 deadline scope 挂阶段下）" },
