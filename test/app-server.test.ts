@@ -408,101 +408,33 @@ describe("HTTP API", () => {
     }
   });
 
-  it("目标层级 API（B2，2026-09-28）：建方向/阶段 → PUT 修订（追加快照）→ GET 层级树；层级违规 400、未知 404", async () => {
-    const created = (await (await fetch(`${baseUrl}/api/goals`, {
-      ...json({ level: "direction", title: "健康", why: "精力" }),
-      headers: { "Content-Type": "application/json", cookie },
-    })).json()) as { goalId: string };
-    expect(created.goalId).toMatch(/^goal-/);
-
-    const phase = await fetch(`${baseUrl}/api/goals`, {
-      ...json({ level: "phase", title: "8 周减脂", parentId: created.goalId, nextStep: "约教练", due: "2026-11-20" }),
-      headers: { "Content-Type": "application/json", cookie },
-    });
-    expect(phase.status).toBe(200);
-    const phaseBody = (await phase.json()) as { goalId: string };
-
-    // 层级违规与存在性：phase 不挂 direction / 未知 parent → 400
-    expect(
-      (await fetch(`${baseUrl}/api/goals`, { ...json({ level: "phase", title: "孤儿阶段" }), headers: { "Content-Type": "application/json", cookie } })).status,
-    ).toBe(400);
-    expect(
-      (await fetch(`${baseUrl}/api/goals`, {
-        ...json({ level: "phase", title: "坏父", parentId: "goal-nope" }),
-        headers: { "Content-Type": "application/json", cookie },
-      })).status,
-    ).toBe(400);
-
-    // PUT 修订 = 追加快照：改标题与状态，GET 读到最新
-    const updated = await fetch(`${baseUrl}/api/goals/${phaseBody.goalId}`, {
-      ...json({ title: "8 周减脂（修订）", status: "paused" }),
-      method: "PUT",
-      headers: { "Content-Type": "application/json", cookie },
-    });
-    expect(updated.status).toBe(200);
-    expect(
-      (await fetch(`${baseUrl}/api/goals/${phaseBody.goalId}`, {
-        ...json({ status: "oops" }),
-        method: "PUT",
-        headers: { "Content-Type": "application/json", cookie },
-      })).status,
-    ).toBe(400);
-    expect(
-      (await fetch(`${baseUrl}/api/goals/goal-nope`, { ...json({ title: "x" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } })).status,
-    ).toBe(404);
-
-    const view = (await (await fetch(`${baseUrl}/api/goals?tz=480`, { headers: { cookie } })).json()) as {
-      directions: { title: string; children: { title: string; status: string; nextStep?: string }[] }[];
-    };
-    const direction = view.directions.find((d) => d.title === "健康")!;
-    expect(direction.children[0]!.title).toBe("8 周减脂（修订）");
-    expect(direction.children[0]!.status).toBe("paused");
-    expect(direction.children[0]!.nextStep).toBe("约教练"); // 未提供字段沿用
-  });
-
-  it("目标删除与作废边界（#A/#B，2026-09-28）：/api/void 拒收 goal；DELETE 真删留痕、有子不放行；里程碑撤销=作废打卡", async () => {
+  it("目标层级下线（2026-09-30 SDD）：/api/goals 全套 404；POST/PUT /api/plans 带 goalId → 400；历史 goal 行不可作废", async () => {
     const uid = users.get("lathan")!.uid;
     const ledger = await ledgers.get(uid)!;
     const post = (path: string, body: unknown) =>
       fetch(`${baseUrl}${path}`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
-    const get = (path: string) => fetch(`${baseUrl}${path}`, { headers: { cookie } });
 
-    // 方向 → 阶段 → 里程碑（deadline plan 挂阶段）
-    const dir = (await (await post("/api/goals", { level: "direction", title: "删除术" })).json()) as { goalId: string };
-    const phase = (await (await post("/api/goals", { level: "phase", title: "删除阶段", parentId: dir.goalId })).json()) as { goalId: string };
-    const plan = (await (await post("/api/plans", { title: "删前打卡点", scope: "deadline", due: "2026-10-01", goalId: phase.goalId })).json()) as { planId: string };
-    expect((await post("/api/checkin", { planId: plan.planId, done: true })).status).toBe(200);
+    // 路由整体下线：任何 method/path 组合都不再命中（落到 404）
+    expect((await fetch(`${baseUrl}/api/goals`, { headers: { cookie } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/goals`, { ...json({ level: "direction", title: "x" }), headers: { "Content-Type": "application/json", cookie } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/goals/goal-x`, { ...json({ title: "x" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } })).status).toBe(404);
+    expect((await fetch(`${baseUrl}/api/goals/goal-x`, { method: "DELETE", headers: { cookie } })).status).toBe(404);
 
-    // #A：里程碑 done=true 且带 doneSeqs（存活 done 打卡的 seq）
-    const mid = (await (await get("/api/goals?tz=480")).json()) as { milestones: { planId: string; done: boolean; doneSeqs: number[] }[] };
-    const milestone = mid.milestones.find((m) => m.planId === plan.planId)!;
-    expect(milestone.done).toBe(true);
-    expect(milestone.doneSeqs.length).toBe(1);
-    // 撤销打卡 = 作废那条打卡（checkin 可作废），doneEver 随之回落
-    expect((await post("/api/void", { seq: milestone.doneSeqs[0] })).status).toBe(200);
-    const undone = ((await (await get("/api/goals?tz=480")).json()) as typeof mid).milestones.find((m) => m.planId === plan.planId)!;
-    expect(undone.done).toBe(false);
-    expect(undone.doneSeqs).toEqual([]);
+    // 计划入口不再收 goalId（POST 与 PUT 同规）
+    expect((await post("/api/plans", { title: "挂树尝试", scope: "day", goalId: "goal-any" })).status).toBe(400);
+    const plan = (await (await post("/api/plans", { title: "普通计划", scope: "day" })).json()) as { planId: string };
+    expect((await fetch(`${baseUrl}/api/plans/${plan.planId}`, { ...json({ goalId: "goal-any" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } })).status).toBe(400);
 
-    // #B：goal 快照不走 /api/void（修订=PUT 追加快照，真删=DELETE）
-    const goalSeq = ledger.readAll().find((r) => r.kind === "goal" && (r as { goalId: string }).goalId === dir.goalId)!.seq;
-    const rejected = await post("/api/void", { seq: goalSeq });
-    expect(rejected.status).toBe(400);
-
-    // DELETE：有存活子目标不放行 → 删子 → 删父留痕 → 树里消失 → 再删 404
-    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(400);
-    const deleted = (await (await fetch(`${baseUrl}/api/goals/${phase.goalId}`, { method: "DELETE", headers: { cookie } })).json()) as { voided: number };
-    expect(deleted.voided).toBeGreaterThanOrEqual(1);
-    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
-    const after = (await (await get("/api/goals?tz=480")).json()) as { directions: { title: string }[] };
-    expect(after.directions.some((d) => d.title === "删除术")).toBe(false);
-    expect((await fetch(`${baseUrl}/api/goals/${dir.goalId}`, { method: "DELETE", headers: { cookie } })).status).toBe(404);
-    // 真删=作废快照留痕（审计可查），里程碑 plan 不被连坐
-    const records = ledger.readAll();
-    expect(records.some((r) => r.kind === "void" && (r as { targetSeq: number }).targetSeq === goalSeq)).toBe(true);
-    expect(records.some((r) => r.kind === "plan" && (r as { planId: string }).planId === plan.planId)).toBe(true);
+    // 历史 goal 行休眠保留：直写一笔（模拟存量），/api/void 拒绝作废，today/plans 视图不受影响
+    const goal = await ledger.append({ kind: "goal", source: "ui", goalId: "goal-hist1", level: "direction", title: "历史方向", status: "active" }, 1000);
+    const legacy = await ledger.append({ kind: "plan", source: "ui", planId: "plan-hist0001", title: "挂过树的旧计划", scope: "deadline", due: "2099-01-01", goalId: "goal-hist1" }, 1001);
+    expect((await post("/api/void", { seq: goal.seq })).status).toBe(400);
+    const today = (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as { plans: { planId: string; goalTitle?: string }[] };
+    const legacyRow = today.plans.find((p) => p.planId === "plan-hist0001")!;
+    expect(legacyRow).toBeDefined(); // 挂树历史计划照常出现在今天视图（AC4 口径）
+    expect(legacyRow.goalTitle).toBeUndefined(); // 「属于：xx」信号下线
+    expect(legacy.seq).toBeGreaterThan(0); // 本行只为引用防误删（lint 语义）
   });
-
 
 describe("HTTP API 批次2（agents/skills/mcps/memory/会话切换）", () => {
   it("agents：创建（带身份）→列表→详情→改人设（名字保留）→改身份→坏 avatar 400→改绑定→删除", async () => {

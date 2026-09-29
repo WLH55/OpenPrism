@@ -1,8 +1,7 @@
 // 今天页确定性折叠（D7：面板 = 账本折叠，0 token、0 模型调用）。
 // 时间语义：tzOffsetMinutes = 「UTC 加多少分钟得当地」（如中国 +480；恰为 -new Date().getTimezoneOffset()）。
 
-import type { CheckinRecord, FlowRecord, GoalRecord, LedgerAppend, LedgerRecord, PlanRecord } from "./ledger";
-import { latestGoalSnapshots } from "./goals";
+import type { CheckinRecord, FlowRecord, LedgerAppend, LedgerRecord, PlanRecord } from "./ledger";
 export type { LedgerAppend, LedgerRecord } from "./ledger";
 
 const DAY_MS = 86400000;
@@ -43,8 +42,6 @@ export interface TodayPlanView {
   doneSeqs?: number[];
   /** 最近 10 条存活 done 打卡（倒序，含非今日，at 定位是哪天打的）——撤历史卡的凭据（2026-09-29） */
   checkins?: { seq: number; at: number }[];
-  /** 挂目标树的计划带顶层方向标题（「属于：xx」）——与独立待办的区分信号（2026-09-28） */
-  goalTitle?: string;
   /** 账本 seq：逾期「跳过」= 作废该 plan 记录（2026-09-29） */
   seq: number;
   /** 完成时刻 = 最新存活 done 打卡的 at（2026-09-29）：已完成视图按它倒序/过滤近 30 天 */
@@ -74,14 +71,8 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
-  /** 今日必做（确定性折叠，无模型依赖）：逾期 > 今日截止 > 覆盖今天的未完成 > 阶段第一条未完成打卡点补位（可打卡；存量 nextStep 文字兜底） */
+  /** 今日必做（确定性折叠，无模型依赖）：逾期 > 今日截止 > 覆盖今天的未完成（2026-09-30 目标层级下线，去掉里程碑补位终端） */
   top3: TopItem[];
-  /** 计划卡：3 方向 + 3 阶段 + 软约束提示（B1）；阶段 nextStep = 其第一条未完成打卡点标题 */
-  goalCard: {
-    directions: { goalId: string; title: string; progress: GoalNode["progress"]; updatedAt: number }[];
-    phases: { goalId: string; title: string; due?: string; nextStep?: string }[];
-    warning?: string;
-  };
 }
 
 /** 计划是否覆盖"今天"：scope 决定周期（创建 ts = 周期锚点） */
@@ -146,7 +137,6 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     lastDoneAt.set(r.planId, Math.max(lastDoneAt.get(r.planId) ?? 0, r.at));
   }
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
-  const latestGoals = latestGoalSnapshots(records);
   // 周期计划"本周期内"是否已有打卡（不含今天）——区分 待做 / 进行中
   const periodHasCheckin = (plan: PlanRecord): boolean =>
     live.some((r) => r.kind === "checkin" && r.done && r.planId === plan.planId && planScopeCoversToday(plan, r.at, tzOffsetMinutes) && !isToday(r.at));
@@ -168,7 +158,6 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
       const doneToday = plan.scope === "deadline" ? doneEver.has(plan.planId) : checkinsToday.some((c) => c.planId === plan.planId);
       const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
       const state = stateOf(plan, doneToday);
-      const goalTitle = plan.goalId !== undefined ? goalTopTitle(latestGoals, plan.goalId) : undefined;
       const lastDone = lastDoneAt.get(plan.planId);
       // "今天完成"的确定性口径：周期型=state done（即今日有卡）；deadline 型=最新完成打卡落在今天
       const doneTodayFlag = plan.scope === "deadline" ? lastDone !== undefined && dayKey(lastDone, tzOffsetMinutes) === todayK : doneToday;
@@ -198,7 +187,6 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
                 .slice(0, 10),
             }
           : {}),
-        ...(goalTitle !== undefined ? { goalTitle } : {}),
         seq: plan.seq,
         ...(state === "done" ? { doneAt: lastDone } : {}),
         doneToday: doneTodayFlag,
@@ -233,86 +221,23 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     cursor -= 1;
   }
 
-  // B1：Top3 + 计划卡（同源 records 重复折叠，个人量级毫秒级；goalView/top3 为函数声明，前置调用安全）
-  const goals = goalView(records, now, tzOffsetMinutes);
-  const goalCard = {
-    directions: goals.directions
-      .filter((d) => d.status === "active")
-      .slice(0, 3)
-      .map(({ goalId, title, progress, updatedAt }) => ({ goalId, title, progress, updatedAt })),
-    phases: (() => {
-      const all: GoalNode[] = [];
-      const collect = (nodes: GoalNode[]): void => {
-        for (const node of nodes) {
-          if (node.level === "phase") all.push(node);
-          collect(node.children);
-        }
-      };
-      collect(goals.directions);
-      // 下一步 = 该阶段第一条未完成打卡点（与 Top3 补位同源；旧 nextStep 文字不再是来源，转打卡点后自动衔接）
-      const firstUnchecked = firstUncheckedMilestoneByGoal(live, liveDoneEver(live));
-      return all
-        .filter((p) => p.status === "active")
-        .sort((a, b) => (a.due ?? "9999").localeCompare(b.due ?? "9999") || (a.goalId < b.goalId ? -1 : 1))
-        .slice(0, 3)
-        .map(({ goalId, title, due }) => {
-          const next = firstUnchecked.get(goalId);
-          return { goalId, title, ...(due !== undefined ? { due } : {}), ...(next !== undefined ? { nextStep: next.title } : {}) };
-        });
-    })(),
-    ...(goals.warning !== undefined ? { warning: goals.warning } : {}),
-  };
+  // Top3（确定性，0 模型；2026-09-30 目标层级下线——goalCard/goalView 整体移除，只剩计划终端）
   const topItems = top3(records, now, tzOffsetMinutes);
 
-  return { date: dateString(localParts(now, tzOffsetMinutes)), flows, plans, totalByCategory, streakDays, top3: topItems, goalCard };
+  return { date: dateString(localParts(now, tzOffsetMinutes)), flows, plans, totalByCategory, streakDays, top3: topItems };
 }
 
-// ── B1：目标层级折叠（2026-09-28，SDD 个人工作台业务借鉴 §4）──────────────
-// goal 语义：同 goalId 多条快照，未 void 的最新一条胜出（修订 = 追加，不消耗 void）；
-// 里程碑 = 挂目标树的 deadline 型 plan（done = 曾有 done 打卡）；
-// 周期计划今日执行 = planScopeCoversToday && 今日有 done（与 todayView 打卡口径一致）；
-// 数量约束是软的：折叠层只给 warning，不 block（agent/UI 呈现层负责"3 的剧场"）。
+// ── 计划/打卡折叠共用（2026-09-30 目标层级下线：goal 树折叠整体移除，历史 goal 行在投影层不可见） ──
 
-/** 剔除 void 目标与 void 本身（goalView/top3 共用；与 todayView 同语义） */
-function liveRecords(records: LedgerRecord[]): Array<FlowRecord | PlanRecord | CheckinRecord | GoalRecord> {
+/** 剔除 void 记录本身（top3 共用；与 todayView 同语义） */
+function liveRecords(records: LedgerRecord[]): Array<FlowRecord | PlanRecord | CheckinRecord> {
   const voided = new Set(
     records.filter((r): r is Extract<LedgerRecord, { kind: "void" }> => r.kind === "void").map((r) => r.targetSeq),
   );
-  return records.filter((r) => r.kind !== "void" && !voided.has(r.seq)) as Array<
-    FlowRecord | PlanRecord | CheckinRecord | GoalRecord
-  >;
+  return records.filter((r) => r.kind !== "void" && !voided.has(r.seq)) as Array<FlowRecord | PlanRecord | CheckinRecord>;
 }
 
-export interface GoalNode {
-  goalId: string;
-  level: GoalRecord["level"];
-  title: string;
-  status: GoalRecord["status"];
-  parentId?: string;
-  why?: string;
-  outcome?: string;
-  metric?: string;
-  due?: string;
-  nextStep?: string;
-  /** 当前快照的 ts */
-  updatedAt: number;
-  children: GoalNode[];
-  /** 子树里程碑进度（deadline 型 plan） */
-  progress: { done: number; total: number; rate: number };
-  /** 子树周期计划今日执行（覆盖今天 && 今日 done） */
-  recurring: { doneToday: number; total: number };
-}
-
-export interface GoalView {
-  /** 顶层树（direction 为正常根；孤儿/成环节点上提为根保证可见） */
-  directions: GoalNode[];
-  activeDirectionCount: number;
-  activePhaseCount: number;
-  /** 软约束提醒（active 方向或阶段 > 3 时给出，不 block） */
-  warning?: string;
-}
-
-/** 存活 done 打卡的 planId 集合（doneEver 语义：打过一次就算）——top3/goalCard 共用 */
+/** 存活 done 打卡的 planId 集合（doneEver 语义：打过一次就算）——top3 共用 */
 function liveDoneEver(live: LedgerRecord[]): Set<string> {
   const set = new Set<string>();
   for (const r of live) {
@@ -321,147 +246,14 @@ function liveDoneEver(live: LedgerRecord[]): Set<string> {
   return set;
 }
 
-/** 各 goalId 名下第一条未完成打卡点（deadline 型 plan，按 due 升序）——「下一步」的统一来源（2026-09-28 统一执行项） */
-function firstUncheckedMilestoneByGoal(live: LedgerRecord[], doneEver: Set<string>): Map<string, PlanRecord> {
-  const map = new Map<string, PlanRecord>();
-  for (const r of live) {
-    if (r.kind !== "plan" || r.scope !== "deadline" || r.goalId === undefined || doneEver.has(r.planId)) continue;
-    const cur = map.get(r.goalId);
-    if (cur === undefined || (r.due ?? "9999") < (cur.due ?? "9999")) map.set(r.goalId, r);
-  }
-  return map;
-}
-
-/** 归属链顶层方向标题（seen 防环）：Top3「属于：xx」与今天页计划列表的归属显示同源 */
-function goalTopTitle(latest: ReturnType<typeof latestGoalSnapshots>, goalId: string): string | undefined {
-  const seen = new Set<string>();
-  let cur = latest.get(goalId);
-  while (cur !== undefined && !seen.has(cur.goalId)) {
-    seen.add(cur.goalId);
-    const up = cur.parentId !== undefined ? latest.get(cur.parentId) : undefined;
-    if (up === undefined) return cur.title;
-    cur = up;
-  }
-  return undefined;
-}
-
-export function goalView(records: LedgerRecord[], now: number, tzOffsetMinutes: number): GoalView {
-  const live = liveRecords(records);
-  const latest = latestGoalSnapshots(records);
-
-  const todayK = dayKey(now, tzOffsetMinutes);
-  const doneEver = new Set<string>();
-  const doneToday = new Set<string>();
-  for (const r of live) {
-    if (r.kind !== "checkin" || !r.done) continue;
-    doneEver.add(r.planId);
-    if (dayKey(r.at, tzOffsetMinutes) === todayK) doneToday.add(r.planId);
-  }
-
-  const nodes = new Map<string, GoalNode>();
-  for (const g of latest.values()) {
-    nodes.set(g.goalId, {
-      goalId: g.goalId,
-      level: g.level,
-      title: g.title,
-      status: g.status,
-      ...(g.parentId !== undefined ? { parentId: g.parentId } : {}),
-      ...(g.why !== undefined ? { why: g.why } : {}),
-      ...(g.outcome !== undefined ? { outcome: g.outcome } : {}),
-      ...(g.metric !== undefined ? { metric: g.metric } : {}),
-      ...(g.due !== undefined ? { due: g.due } : {}),
-      ...(g.nextStep !== undefined ? { nextStep: g.nextStep } : {}),
-      updatedAt: g.ts,
-      children: [],
-      progress: { done: 0, total: 0, rate: 0 },
-      recurring: { doneToday: 0, total: 0 },
-    });
-  }
-
-  // plan 归属到直接节点（孤儿引用宽容跳过——完整性由 B2 工具校验兜底）
-  const own = new Map<string, { progress: { done: number; total: number }; recurring: { doneToday: number; total: number } }>();
-  for (const r of live) {
-    if (r.kind !== "plan" || r.goalId === undefined || !nodes.has(r.goalId)) continue;
-    const slot = own.get(r.goalId) ?? { progress: { done: 0, total: 0 }, recurring: { doneToday: 0, total: 0 } };
-    if (r.scope === "deadline") {
-      slot.progress.total += 1;
-      if (doneEver.has(r.planId)) slot.progress.done += 1;
-    } else if (planScopeCoversToday(r, now, tzOffsetMinutes)) {
-      slot.recurring.total += 1;
-      if (doneToday.has(r.planId)) slot.recurring.doneToday += 1;
-    }
-    own.set(r.goalId, slot);
-  }
-
-  // 组树：挂直接 parent；parent 缺失或成环 → 上提为根（防 agg 无限递归）
-  const roots: GoalNode[] = [];
-  for (const node of nodes.values()) {
-    const parentId = node.parentId;
-    const parent = parentId !== undefined ? nodes.get(parentId) : undefined;
-    let cyclic = false;
-    if (parent !== undefined) {
-      const seen = new Set([node.goalId]);
-      let cur: GoalNode | undefined = parent;
-      while (cur !== undefined) {
-        if (seen.has(cur.goalId)) {
-          cyclic = true;
-          break;
-        }
-        seen.add(cur.goalId);
-        cur = cur.parentId !== undefined ? nodes.get(cur.parentId) : undefined;
-      }
-    }
-    if (parent !== undefined && !cyclic) parent.children.push(node);
-    else roots.push(node);
-  }
-  const byUpdated = (a: GoalNode, b: GoalNode) => a.updatedAt - b.updatedAt || (a.goalId < b.goalId ? -1 : 1);
-  roots.sort(byUpdated);
-  for (const node of nodes.values()) node.children.sort(byUpdated);
-
-  // 自底向上冒泡：根上的 progress/recurring = 自身 + 全部子孙
-  const aggregate = (node: GoalNode): { d: number; t: number; rd: number; rt: number } => {
-    const o = own.get(node.goalId) ?? { progress: { done: 0, total: 0 }, recurring: { doneToday: 0, total: 0 } };
-    let d = o.progress.done;
-    let t = o.progress.total;
-    let rd = o.recurring.doneToday;
-    let rt = o.recurring.total;
-    for (const child of node.children) {
-      const s = aggregate(child);
-      d += s.d;
-      t += s.t;
-      rd += s.rd;
-      rt += s.rt;
-    }
-    node.progress = { done: d, total: t, rate: t === 0 ? 0 : d / t };
-    node.recurring = { doneToday: rd, total: rt };
-    return { d, t, rd, rt };
-  };
-  roots.forEach(aggregate);
-
-  let activeDirectionCount = 0;
-  let activePhaseCount = 0;
-  for (const g of latest.values()) {
-    if (g.status !== "active") continue;
-    if (g.level === "direction") activeDirectionCount += 1;
-    else if (g.level === "phase") activePhaseCount += 1;
-  }
-  let warning: string | undefined;
-  if (activeDirectionCount > 3) warning = `同时推进 ${activeDirectionCount} 个方向，注意力容易稀释——考虑先聚焦 3 个以内`;
-  else if (activePhaseCount > 3) warning = `同时推进 ${activePhaseCount} 个阶段计划，节奏可能太满——考虑先聚焦 3 个以内`;
-
-  return { directions: roots, activeDirectionCount, activePhaseCount, ...(warning !== undefined ? { warning } : {}) };
-}
-
 export interface TopItem {
-  kind: "overdue" | "dueToday" | "today" | "nextStep";
+  kind: "overdue" | "dueToday" | "today";
   title: string;
   planId?: string;
   due?: string;
-  /** 归属链顶层目标的标题（无归属则无） */
-  goalTitle?: string;
 }
 
-/** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成；不足 3 用 active 阶段第一条未完成打卡点补位 */
+/** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成 */
 export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: number): TopItem[] {
   const live = liveRecords(records);
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
@@ -473,19 +265,12 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
     if (dayKey(r.at, tzOffsetMinutes) === todayK) doneToday.add(r.planId);
   }
 
-  // 归属链顶层标题（seen 防环）
-  const latest = latestGoalSnapshots(records);
-  const topTitleOf = (goalId: string): string | undefined => goalTopTitle(latest, goalId);
-  const itemFor = (plan: PlanRecord, kind: TopItem["kind"]): TopItem => {
-    const goalTitle = plan.goalId !== undefined ? topTitleOf(plan.goalId) : undefined;
-    return {
-      kind,
-      title: plan.title,
-      planId: plan.planId,
-      ...(plan.due !== undefined ? { due: plan.due } : {}),
-      ...(goalTitle !== undefined ? { goalTitle } : {}),
-    };
-  };
+  const itemFor = (plan: PlanRecord, kind: TopItem["kind"]): TopItem => ({
+    kind,
+    title: plan.title,
+    planId: plan.planId,
+    ...(plan.due !== undefined ? { due: plan.due } : {}),
+  });
 
   const overdue: TopItem[] = [];
   const dueToday: TopItem[] = [];
@@ -493,7 +278,7 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
   for (const r of live) {
     if (r.kind !== "plan") continue;
     if (r.scope === "deadline") {
-      if (doneEver.has(r.planId) || r.due === undefined) continue; // 里程碑已完成/无 due 不进
+      if (doneEver.has(r.planId) || r.due === undefined) continue; // 已完成/无 due 不进
       if (r.due < todayStr) overdue.push(itemFor(r, "overdue"));
       else if (r.due === todayStr && !doneToday.has(r.planId)) dueToday.push(itemFor(r, "dueToday"));
       continue;
@@ -501,39 +286,7 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
     if (planScopeCoversToday(r, now, tzOffsetMinutes) && !doneToday.has(r.planId)) todayItems.push(itemFor(r, "today"));
   }
 
-  const items = [...overdue, ...dueToday, ...todayItems].slice(0, 3);
-  if (items.length < 3) {
-    // 下一步补位（2026-09-28 统一执行项）：active 阶段的第一条未完成打卡点（带 planId，今天页可直接打卡）；
-    // 存量阶段还挂着旧 nextStep 文字（未转打卡点）的兜底显示——不可打卡，计划页有"转为打卡点"入口
-    const taken = new Set(items.map((i) => i.planId));
-    const firstUnchecked = firstUncheckedMilestoneByGoal(live, doneEver);
-    const phases = [...latest.values()]
-      .filter((g) => g.level === "phase" && g.status === "active")
-      .sort((a, b) => (a.due ?? "9999").localeCompare(b.due ?? "9999") || (a.goalId < b.goalId ? -1 : 1));
-    for (const phase of phases) {
-      if (items.length >= 3) break;
-      const first = firstUnchecked.get(phase.goalId);
-      if (first !== undefined) {
-        // 打卡点存在即终局（评审 2026-09-29 C4）：第一条未完成打卡点已在 top3（如以 overdue 身份）时不再补位，
-        // 也不落回旧 nextStep 文字——同一件事不出现两次
-        if (!taken.has(first.planId)) {
-          items.push(itemFor(first, "nextStep"));
-          taken.add(first.planId);
-        }
-        continue;
-      }
-      if (phase.nextStep !== undefined && phase.nextStep !== "") {
-        const goalTitle = phase.parentId !== undefined ? topTitleOf(phase.parentId) : undefined;
-        items.push({
-          kind: "nextStep",
-          title: `推进「${phase.title}」：${phase.nextStep}`,
-          ...(phase.due !== undefined ? { due: phase.due } : {}),
-          ...(goalTitle !== undefined ? { goalTitle } : {}),
-        });
-      }
-    }
-  }
-  return items;
+  return [...overdue, ...dueToday, ...todayItems].slice(0, 3);
 }
 
 // ── 批次 4：分类页与进步页（D7.2 / D11.3，全部确定性折叠） ──────────────

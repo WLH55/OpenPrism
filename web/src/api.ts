@@ -49,8 +49,6 @@ export interface TodayPlanView {
   doneSeqs?: number[];
   /** 最近 10 条存活 done 打卡（倒序，含非今日）——撤历史卡凭据 */
   checkins?: { seq: number; at: number }[];
-  /** 挂目标树的计划带顶层方向标题——独立待办没有此字段 */
-  goalTitle?: string;
   /** 账本 seq：逾期「跳过」= 作废该 plan 记录 */
   seq?: number;
   /** 完成时刻（最新存活 done 打卡）——已完成视图按它倒序/过滤近 30 天 */
@@ -74,75 +72,16 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
-  /** B1（2026-09-28）：今日必做 + 计划卡 */
+  /** 今日必做（确定性折叠：逾期 > 今日截止 > 覆盖今天的未完成；目标层级 2026-09-30 下线后无补位终端） */
   top3: TopItemLoose[];
-  goalCard: {
-    directions: { goalId: string; title: string; progress: { done: number; total: number; rate: number }; updatedAt: number }[];
-    phases: { goalId: string; title: string; due?: string; nextStep?: string }[];
-    warning?: string;
-  };
 }
 
-/** 今日必做条目（确定性折叠：逾期 > 今日截止 > 覆盖今天 > 阶段下一步补位） */
+/** 今日必做条目（确定性折叠：逾期 > 今日截止 > 覆盖今天） */
 export interface TopItemLoose {
-  kind: "overdue" | "dueToday" | "today" | "nextStep";
+  kind: "overdue" | "dueToday" | "today";
   title: string;
   planId?: string;
   due?: string;
-  goalTitle?: string;
-}
-
-export type GoalLevel = "direction" | "phase" | "project";
-
-/** 目标节点（服务端 goalView 的层级树成员） */
-export interface GoalNodeLoose {
-  goalId: string;
-  level: GoalLevel;
-  title: string;
-  status: "active" | "paused" | "done" | "archived";
-  parentId?: string;
-  why?: string;
-  outcome?: string;
-  metric?: string;
-  due?: string;
-  nextStep?: string;
-  updatedAt: number;
-  children: GoalNodeLoose[];
-  /** 子树里程碑进度（deadline 型 plan） */
-  progress: { done: number; total: number; rate: number };
-  /** 子树周期计划今日执行 */
-  recurring: { doneToday: number; total: number };
-}
-
-export interface GoalViewLoose {
-  directions: GoalNodeLoose[];
-  activeDirectionCount: number;
-  activePhaseCount: number;
-  warning?: string;
-}
-
-/** 里程碑明细（deadline 型 plan，挂目标树；计划页打卡按钮用） */
-export interface MilestoneLoose {
-  planId: string;
-  title: string;
-  due: string;
-  goalId: string;
-  done: boolean;
-  /** 存活 done 打卡的 seq；撤销打卡 = 逐条作废（旧版服务端无此字段 → undefined，UI 降级为不可撤销） */
-  doneSeqs?: number[];
-}
-
-export type GoalsPageLoose = GoalViewLoose & { milestones: MilestoneLoose[] };
-
-export interface GoalInput {
-  level: GoalLevel;
-  title: string;
-  parentId?: string;
-  why?: string;
-  outcome?: string;
-  metric?: string;
-  due?: string;
-  nextStep?: string;
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
@@ -275,19 +214,11 @@ export const api = {
     }),
 
   // ── 目标层级（B3，2026-09-28）：方向/阶段/项目树 + UI 写入（修订=追加快照） ──
-  goals: () => request<GoalsPageLoose>(`/api/goals?tz=${-new Date().getTimezoneOffset()}`),
-  createGoal: (input: GoalInput) =>
-    request<{ goalId: string; ts: number }>("/api/goals", { method: "POST", body: JSON.stringify(input) }),
-  updateGoal: (goalId: string, patch: Omit<Partial<GoalInput>, "level"> & { status?: string }) =>
-    request<{ ok: boolean }>(`/api/goals/${encodeURIComponent(goalId)}`, { method: "PUT", body: JSON.stringify(patch) }),
-  /** 真删目标（#B）：作废该 goalId 全部存活快照留痕；有存活子目标时服务端 400 */
-  deleteGoal: (goalId: string) =>
-    request<{ ok: boolean; voided: number }>(`/api/goals/${encodeURIComponent(goalId)}`, { method: "DELETE" }),
   /** UI 建计划/里程碑（挂目标树）；对话建计划走 agent 工具，同一账本 */
-  createPlan: (input: { title: string; scope: string; due?: string; goalId?: string }) =>
+  createPlan: (input: { title: string; scope: string; due?: string; ndays?: number }) =>
     request<{ planId: string }>("/api/plans", { method: "POST", body: JSON.stringify(input) }),
   /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定 */
-  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string }) =>
+  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number }) =>
     request<{ ok: boolean; planId: string; title: string }>(`/api/plans/${encodeURIComponent(planId)}`, {
       method: "PUT",
       body: JSON.stringify(patch),
