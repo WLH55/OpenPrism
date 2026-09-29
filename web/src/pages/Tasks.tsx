@@ -106,6 +106,13 @@ function triggerShort(trigger: TaskTriggerLoose): string {
   }
 }
 
+/** 模板按钮的图标与顺序（文案/时刻来自服务端投影） */
+const TPL_ICONS: [string, string][] = [
+  ["daily-brief", "☀️"],
+  ["daily-report", "🌙"],
+  ["weekly-review", "📈"],
+];
+
 /** 提醒页：统计 + 每日/每周每月/已停用分组 + 最近通知，结构照 prototype 页 6 */
 export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChange: (n: number) => void }) {
   const [tasks, setTasks] = useState<TaskLoose[]>([]);
@@ -114,6 +121,27 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [message, setMessage] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationLoose[]>([]);
+  // 内置三件套模板（评审 2026-09-29 #13 单源）：服务端 BUILTIN_TASK_DEFS 投影，模板按钮唯一文案来源
+  const [templates, setTemplates] = useState<{ builtin: string; title: string; instruction: string; trigger: TaskTriggerLoose; label: string }[] | null>(null);
+  useEffect(() => {
+    void api.taskTemplates().then(setTemplates).catch(() => undefined);
+  }, []);
+  const applyTemplate = (t: { title: string; instruction: string; trigger: TaskTriggerLoose }): void => {
+    setTitle(t.title);
+    setInstruction(t.instruction);
+    if (t.trigger.kind === "daily") {
+      setSchedKind("daily");
+      const [h, m] = t.trigger.time.split(":");
+      setHour(Number(h));
+      setMinuteOfHour(Number(m));
+    } else if (t.trigger.kind === "weekly") {
+      setSchedKind("weekly");
+      setWeekdays(t.trigger.days ?? [1]);
+      const [h, m] = t.trigger.time.split(":");
+      setHour(Number(h));
+      setMinuteOfHour(Number(m));
+    }
+  };
   // 新建表单（结构化调度）
   const [title, setTitle] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -494,55 +522,23 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
             </p>
           </div>
-          {/* B4（2026-09-28）简报模板 + 内置三件套对齐（2026-09-29：周报挪周日 21:00、新增晚间汇报）——一键填好标题/调度/指令 */}
+          {/* 模板按钮 = 服务端 BUILTIN_TASK_DEFS 单源投影（评审 2026-09-29 #13）：文案/时刻与种子同源，改指令只改 tasks.ts 一处 */}
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="text-xs text-ink3">模板：</span>
-            <button
-              type="button"
-              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
-              onClick={() => {
-                setTitle("每日简报");
-                setSchedKind("daily");
-                setHour(8);
-                setMinuteOfHour(30);
-                setInstruction(
-                  "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段第一条未完成打卡点（下一步）的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
-                );
-              }}
-            >
-              ☀️ 每日简报（每天 08:30）
-            </button>
-            <button
-              type="button"
-              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
-              onClick={() => {
-                setTitle("每日晚间汇报");
-                setSchedKind("daily");
-                setHour(20);
-                setMinuteOfHour(0);
-                setInstruction(
-                  "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。",
-                );
-              }}
-            >
-              🌙 晚间汇报（每天 20:00）
-            </button>
-            <button
-              type="button"
-              className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
-              onClick={() => {
-                setTitle("每周复盘");
-                setSchedKind("weekly");
-                setWeekdays([7]);
-                setHour(21);
-                setMinuteOfHour(0);
-                setInstruction(
-                  "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals，回顾这一周：1) 本周计划完成情况与上周对比（在变好还是透支）；2) 各方向里程碑推进变化；3) 行为模式亮点与警示（记录时段/分类的规律）；4) 下周最值得聚焦的一件事及原因。用具体数字说话，最后问用户下周想重点推进什么——回复可以顺势落成新计划。",
-                );
-              }}
-            >
-              📈 每周复盘（周日 21:00）
-            </button>
+            {TPL_ICONS.map(([key, icon]) => {
+              const t = templates?.find((x) => x.builtin === key);
+              if (t === undefined) return null;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className="rounded-lg border border-line px-2.5 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
+                  onClick={() => applyTemplate(t)}
+                >
+                  {icon} {t.title}（{t.label}）
+                </button>
+              );
+            })}
           </div>
           <textarea
             className={`${inputCls} mt-2 w-full`}

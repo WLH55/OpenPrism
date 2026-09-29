@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS users (
   avatar     TEXT,
   emoji      TEXT NOT NULL DEFAULT '',
   color      TEXT NOT NULL DEFAULT '',
-  builtins_seeded INTEGER NOT NULL DEFAULT 0
+  builtins_seeded INTEGER NOT NULL DEFAULT 0,
+  tz_offset_minutes INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -490,6 +491,7 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "tasks", "notify_channel", "TEXT"); // 任务级通知渠道（inapp 默认 | wechat，2026-09-27）
   ensureColumn(db, "tasks", "builtin", "TEXT"); // 内置任务标记（daily-brief|daily-report|weekly-review，2026-09-29）
   ensureColumn(db, "users", "builtins_seeded", "INTEGER NOT NULL DEFAULT 0"); // 内置三件套种子一次性标记（删了不复活，2026-09-29）
+  ensureColumn(db, "users", "tz_offset_minutes", "INTEGER"); // 用户档案时区（2026-09-29：浏览器上报/个人资料页可改；agent 工具层与微信对话统一口径）
   // 伙伴创建向导（2026-09-07，对齐 DeepTutor）：身份字段 + 回复语言 + 默认模型；persona_md 语义升级为「灵魂」
   ensureColumn(db, "agents", "description", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "agents", "emoji", "TEXT NOT NULL DEFAULT ''");

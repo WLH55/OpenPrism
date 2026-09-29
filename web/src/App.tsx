@@ -423,7 +423,14 @@ export function App() {
   useEffect(() => {
     api
       .me()
-      .then(setMe)
+      .then((loaded) => {
+        setMe(loaded);
+        // 时区静默上报（2026-09-29，幂等）：浏览器偏移 ≠ 档案值才写库——档案是 agent 工具层/微信/定时任务的统一钟面，DST 靠下次打开覆盖
+        const browserTz = -new Date().getTimezoneOffset();
+        if (loaded.tzOffsetMinutes !== browserTz) {
+          void api.updateProfile({ tzOffsetMinutes: browserTz }).catch(() => undefined);
+        }
+      })
       .catch(() => setMe(null));
   }, []);
 

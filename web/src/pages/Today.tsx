@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type TodayView, type TopItemLoose } from "../api";
+import { api, type TodayPlanView, type TodayView, type TopItemLoose } from "../api";
 import { catColor } from "../catcolor";
+import { daysUntil } from "../days";
 import { CheckSolidIcon } from "../icons";
 
 function hhmm(ts: number): string {
@@ -23,6 +24,190 @@ const TOP_KIND_LABEL: Record<TopItemLoose["kind"], string> = {
   today: "今日",
   nextStep: "下一步",
 };
+
+/** 计划行（2026-09-29 提取为组件以承载行内交互）：打卡/撤销 + 编辑（标题/due，planId 稳定）+ 周期补卡（date ≤ 今天） */
+function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate: string; onChanged: () => void }) {
+  const state = plan.state ?? (plan.done ? "done" : "todo");
+  const daysTo = plan.due !== undefined ? daysUntil(plan.due, viewDate) : null;
+  // 撤销降级（评审 2026-09-29 簇 A）：无 seq（旧服务端）时完成态不可交互，不给"可取消"的假象——与计划页 MilestoneRow 同规
+  const undoable = plan.done && (plan.doneSeqs ?? []).length > 0;
+  const [editing, setEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(plan.title);
+  const [dueDraft, setDueDraft] = useState(plan.due ?? "");
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillDate, setBackfillDate] = useState("");
+  const [busy, setBusy] = useState(false);
+  const canBackfill = plan.scope !== "deadline" && !plan.done;
+
+  const stateLabel =
+    state === "done"
+      ? "已完成"
+      : state === "overdue"
+        ? daysTo !== null && daysTo < 0
+          ? `已过期 ${-daysTo} 天`
+          : "已过期"
+        : state === "dueToday"
+          ? "今天截止"
+          : state === "doing"
+            ? "进行中"
+            : state === "upcoming"
+              ? daysTo === 1
+                ? "明天"
+                : daysTo !== null && daysTo > 1 && daysTo <= 30
+                  ? `${daysTo} 天后`
+                  : (plan.due ?? "未开始")
+              : "待做";
+  const stateCls = state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : "text-ink3";
+  const skip = async () => {
+    if (plan.seq === undefined || !window.confirm(`跳过「${plan.title}」？= 作废这条计划（留痕可审计）。`)) return;
+    try {
+      await api.voidRecord(plan.seq);
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    }
+    onChanged();
+  };
+  const save = async () => {
+    if (titleDraft.trim() === "") {
+      window.alert("标题不能为空");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.updatePlan(plan.planId, { title: titleDraft.trim(), ...(dueDraft !== "" ? { due: dueDraft } : {}) });
+      setEditing(false);
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+    onChanged();
+  };
+  const backfill = async () => {
+    if (backfillDate === "") {
+      window.alert("先选补卡日期");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.checkin(plan.planId, true, backfillDate);
+      setBackfilling(false);
+      setBackfillDate("");
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+    onChanged();
+  };
+
+  const field = "min-w-0 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-accent";
+  if (editing) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-surface px-4 py-3">
+        <input className={`${field} flex-1`} value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)} placeholder="标题" />
+        <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="截止日（仅 deadline 型生效）" />
+        <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
+          保存
+        </button>
+        <button
+          className="text-xs text-ink3 transition hover:text-ink"
+          onClick={() => {
+            setEditing(false);
+            setTitleDraft(plan.title);
+            setDueDraft(plan.due ?? "");
+          }}
+        >
+          取消
+        </button>
+      </div>
+    );
+  }
+  if (backfilling) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-surface px-4 py-3">
+        <span className="text-sm text-ink2">补卡（{plan.title}）：</span>
+        <input className={field} type="date" value={backfillDate} max={viewDate} onChange={(e) => setBackfillDate(e.target.value)} />
+        <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void backfill()}>
+          记为当天已做
+        </button>
+        <button className="text-xs text-ink3 transition hover:text-ink" onClick={() => setBackfilling(false)}>
+          取消
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div
+      className={`flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition ${
+        undoable || !plan.done ? "cursor-pointer hover:bg-surface2/60" : "opacity-90"
+      }`}
+      onClick={async () => {
+        if (plan.done && !undoable) return;
+        try {
+          if (plan.done) {
+            // 撤销 = 作废打卡（deadline=全部存活 done 打卡；周期=今日打卡），追加 done:false 对两者都无效
+            for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
+          } else {
+            await api.checkin(plan.planId, true);
+          }
+        } catch (e) {
+          window.alert(String((e as Error).message));
+        }
+        onChanged();
+      }}
+      title={plan.done ? (undoable ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "已完成") : "点击打卡（逾期项 = 现在补做）"}
+    >
+      {plan.done ? (
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
+          <CheckSolidIcon className="h-3.5 w-3.5" />
+        </span>
+      ) : (
+        <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
+      )}
+      <span className="min-w-0 flex-1">
+        <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
+        {plan.goalTitle !== undefined && <span className="block truncate text-xs text-ink3">属于：{plan.goalTitle}</span>}
+      </span>
+      {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
+      <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
+      {canBackfill && (
+        <button
+          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-accent/10 hover:text-accent"
+          title="之前做了忘了打：选过去的日期补卡"
+          onClick={(e) => {
+            e.stopPropagation();
+            setBackfilling(true);
+          }}
+        >
+          补卡
+        </button>
+      )}
+      <button
+        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-surface2 hover:text-ink"
+        title="编辑标题/截止日（planId 不变，历史打卡保留）"
+        onClick={(e) => {
+          e.stopPropagation();
+          setEditing(true);
+        }}
+      >
+        编辑
+      </button>
+      {(state === "overdue" || (state === "upcoming" && plan.scope === "deadline")) && (
+        <button
+          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-warm/10 hover:text-warm"
+          title="这事不做了：作废该计划（留痕可审计）——未来的独立待办/孤儿打卡点也可在此取消"
+          onClick={(e) => {
+            e.stopPropagation();
+            void skip();
+          }}
+        >
+          跳过
+        </button>
+      )}
+    </div>
+  );
+}
 
 /** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新 */
 function Top3Card({ items, onCheckin, onOpenPlans }: { items: TopItemLoose[]; onCheckin: () => void; onOpenPlans: () => void }) {
@@ -181,7 +366,7 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
 
   const weekday = ["日", "一", "二", "三", "四", "五", "六"][new Date().getDay()];
 
-  // 计划四段范围（2026-09-29 B4）：数据一次载荷（服务端全量收编），视图谓词前端算
+  // 计划四段范围（2026-09-29 B4 + 评审 M1 谓词单源）：数据一次载荷（服务端全量收编+30 天存档窗口），视图谓词前端算
   const ymd = (ts: number): string => {
     const d = new Date(ts);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -192,26 +377,29 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
   const sundayStr = ymd(sunday.getTime());
   const doneToday = (p: TodayView["plans"][number]): boolean => p.doneAt !== undefined && ymd(p.doneAt) === view.date;
   const inToday = (p: TodayView["plans"][number]): boolean => (p.state !== "upcoming" && p.state !== "done") || doneToday(p);
+  const done30d = (p: TodayView["plans"][number]): boolean =>
+    p.state === "done" && p.doneAt !== undefined && p.doneAt >= Date.now() - 30 * 86400000;
+  // 谓词表 = 角标计数与列表过滤的唯一来源（评审 M1：双份维护必漂移）
+  const TAB_PRED: Record<typeof planTab, (p: TodayView["plans"][number]) => boolean> = {
+    today: inToday,
+    week: (p) => inToday(p) || (p.state === "upcoming" && p.due !== undefined && p.due <= sundayStr),
+    all: (p) => inToday(p) || p.state === "upcoming",
+    done: done30d,
+  };
   const tabPlans =
     planTab === "done"
-      ? [...view.plans.filter((p) => p.state === "done" && p.doneAt !== undefined && p.doneAt >= Date.now() - 30 * 86400000)].sort(
-          (a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0),
-        )
-      : view.plans.filter((p) =>
-          planTab === "today"
-            ? inToday(p)
-            : planTab === "week"
-              ? inToday(p) || (p.state === "upcoming" && p.due !== undefined && p.due <= sundayStr)
-              : inToday(p) || p.state === "upcoming",
-        );
-  const todayPlans = view.plans.filter(inToday); // 统计卡口径 = 今天视图（全量收编后不宜直接用 view.plans）
+      ? [...view.plans.filter(TAB_PRED.done)].sort((a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0))
+      : view.plans.filter(TAB_PRED[planTab]);
+  const todayPlans = view.plans.filter(TAB_PRED.today); // 统计卡口径 = 今天视图（全量收编后不宜直接用 view.plans）
   const doneCount = todayPlans.filter((p) => p.done).length;
-  const PLAN_TABS: { key: typeof planTab; label: string; count: number }[] = [
-    { key: "today", label: "今天", count: todayPlans.length },
-    { key: "week", label: "本周", count: view.plans.filter((p) => inToday(p) || (p.state === "upcoming" && p.due !== undefined && p.due <= sundayStr)).length },
-    { key: "all", label: "全部", count: view.plans.filter((p) => inToday(p) || p.state === "upcoming").length },
-    { key: "done", label: "已完成", count: view.plans.filter((p) => p.state === "done" && p.doneAt !== undefined && p.doneAt >= Date.now() - 30 * 86400000).length },
-  ];
+  const PLAN_TABS = (
+    [
+      { key: "today", label: "今天" },
+      { key: "week", label: "本周" },
+      { key: "all", label: "全部" },
+      { key: "done", label: "已完成" },
+    ] as { key: typeof planTab; label: string }[]
+  ).map((t) => ({ ...t, count: view.plans.filter(TAB_PRED[t.key]).length }));
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -331,80 +519,9 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
               {planTab === "done" ? "最近 30 天还没有完成的计划" : "这个范围没有计划"}
             </div>
           )}
-          {tabPlans.map((plan) => {
-            const state = plan.state ?? (plan.done ? "done" : "todo");
-            const daysTo = plan.due !== undefined ? Math.round((new Date(`${plan.due}T00:00:00`).getTime() - new Date(`${view.date}T00:00:00`).getTime()) / 86400000) : null;
-            const stateLabel =
-              state === "done"
-                ? "已完成"
-                : state === "overdue"
-                  ? daysTo !== null && daysTo < 0
-                    ? `已过期 ${-daysTo} 天`
-                    : "已过期"
-                  : state === "dueToday"
-                    ? "今天截止"
-                    : state === "doing"
-                      ? "进行中"
-                      : state === "upcoming"
-                        ? daysTo === 1
-                          ? "明天"
-                          : daysTo !== null && daysTo > 1 && daysTo <= 30
-                            ? `${daysTo} 天后`
-                            : (plan.due ?? "未开始")
-                        : "待做";
-            const stateCls = state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : "text-ink3";
-            const skip = async () => {
-              if (plan.seq === undefined || !window.confirm(`跳过「${plan.title}」？= 作废这条计划（留痕可审计）。`)) return;
-              try {
-                await api.voidRecord(plan.seq);
-              } catch (e) {
-                window.alert(String((e as Error).message));
-              }
-              reload();
-            };
-            return (
-              <div
-                key={plan.planId}
-                className="flex w-full cursor-pointer items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition hover:bg-surface2/60"
-                onClick={async () => {
-                  if (plan.done) {
-                    if ((plan.doneSeqs ?? []).length > 0) for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
-                    else await api.checkin(plan.planId, false);
-                  } else {
-                    await api.checkin(plan.planId, true);
-                  }
-                  reload();
-                }}
-                title={plan.done ? ((plan.doneSeqs ?? []).length > 0 ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "点击取消今日打卡") : "点击打卡（逾期项 = 现在补做）"}
-              >
-                {plan.done ? (
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
-                    <CheckSolidIcon className="h-3.5 w-3.5" />
-                  </span>
-                ) : (
-                  <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
-                )}
-                <span className="min-w-0 flex-1">
-                  <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
-                  {plan.goalTitle !== undefined && <span className="block truncate text-xs text-ink3">属于：{plan.goalTitle}</span>}
-                </span>
-                {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
-                <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
-                {state === "overdue" && (
-                  <button
-                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-warm/10 hover:text-warm"
-                    title="这事不做了：作废该计划（留痕可审计）"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void skip();
-                    }}
-                  >
-                    跳过
-                  </button>
-                )}
-              </div>
-            );
-          })}
+          {tabPlans.map((plan) => (
+            <PlanRow key={plan.planId} plan={plan} viewDate={view.date} onChanged={reload} />
+          ))}
         </div>
       </section>
 

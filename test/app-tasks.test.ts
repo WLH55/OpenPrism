@@ -144,6 +144,17 @@ describe("TaskStore", () => {
 
     // 未知 uid 安全返回（不抛、不种）
     expect(await store.ensureBuiltins("nope")).toBe(0);
+
+    // 部分种子自愈（评审 2026-09-29）：中途失败留下的行不撞主键，重入补齐并置标记
+    db.prepare("DELETE FROM users WHERE uid = 'u1'").run();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    db.prepare(
+      "INSERT INTO tasks (id, uid, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel, builtin) VALUES ('builtin-daily-brief-u1', 'u1', 'x', 'y', ?, 1, 480, 1, NULL, NULL, 'daily-brief')",
+    ).run(JSON.stringify({ kind: "daily", time: "08:30" }));
+    expect(await store.ensureBuiltins("u1")).toBe(3); // 跳过已存在、补齐另两件
+    const completed = await store.list("u1");
+    expect(completed).toHaveLength(3);
+    expect(completed.map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
   });
 
   it("create 的 builtin 值受白名单校验", async () => {
@@ -298,6 +309,15 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(by("query_tasks").isConcurrencySafe?.({})).toBe(true);
   });
 
+  it("create_task 按用户钟面落 tz（评审 2026-09-29 #17）：tzOffsetMinutes 注入不再落 UTC 缺省", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-tz" });
+    const tools = createTaskTools({ store, uid: "u-tz", now: () => NOW, tzOffsetMinutes: TZ });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    await by("create_task").execute({ title: "明早八点叫我", instruction: "x", trigger: { kind: "daily", time: "08:00" } }, ctx);
+    const task = (await store.list("u-tz"))[0]!;
+    expect(task.tzOffsetMinutes).toBe(TZ); // 08:00 按用户当地解释，不再是 UTC 的 16:00
+  });
+
   it("query_tasks：列出 id/触发/启用态，nextDueAt 按任务时区算；enabled 过滤", async () => {
     const { store, by } = makeTools("u-query");
     await store.create("u-query", { title: "睡觉", instruction: "x", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
@@ -309,6 +329,21 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(new Date(result.tasks[0]!.nextDueAt + TZ * 60000).toISOString()).toBe("2026-09-03T23:00:00.000Z");
     const off = (await by("query_tasks").execute({ enabled: false }, ctx)) as { tasks: unknown[] };
     expect(off.tasks).toHaveLength(0);
+  });
+
+  it("query_tasks 带内置标记（评审 O4）：builtin 字段与「（内置）」回执标注——模型可定位'把内置的简报挪到九点'", async () => {
+    let seq = 0;
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => `tid-bq-${++seq}` });
+    const tools = createTaskTools({ store, uid: "u-bq", now: () => NOW });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    await store.create("u-bq", { title: "每日简报", instruction: "x", trigger: { kind: "daily", time: "08:30" }, builtin: "daily-brief", tzOffsetMinutes: 480 });
+    await store.create("u-bq", { title: "喝水", instruction: "x", trigger: { kind: "daily", time: "10:00" } });
+    const result = (await by("query_tasks").execute({}, ctx)) as { tasks: { title: string; builtin?: string }[] };
+    expect(result.tasks.find((t) => t.title === "每日简报")!.builtin).toBe("daily-brief");
+    expect(result.tasks.find((t) => t.title === "喝水")!.builtin).toBeUndefined();
+    const blocks = by("query_tasks").output.render!({}, result) as { text: string }[];
+    expect(blocks[0]!.text).toContain("每日简报（内置）");
+    expect(blocks[0]!.text).not.toContain("喝水（内置）");
   });
 
   it("update_task：停用/改触发；坏 trigger 拒绝；空 patch 拒绝", async () => {

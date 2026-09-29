@@ -381,13 +381,30 @@ const BUILTIN_TASK_DEFS: ReadonlyArray<{
     builtin: "weekly-review",
     title: "每周复盘",
     instruction:
-      "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals，回顾这一周：1) 本周计划完成情况与上周对比（在变好还是透支）；2) 各方向里程碑推进变化；3) 行为模式亮点与警示（记录时段/分类的规律）；4) 下周最值得聚焦的一件事及原因。用具体数字说话，最后问用户下周想重点推进什么——回复可以顺势落成新计划。",
+      "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals。计划载荷含近 30 天完成存档（每条带 doneAt 完成时刻），从中按 doneAt 归类自然周即可得到本周/上周完成数——数字只能来自载荷，数据不足就明说，不要编。给出：1) 本周完成 vs 上周（含仍在逾期与进行中的事项）；2) what=goals 里各方向里程碑推进情况；3) 一条本周行为观察（可参考本周流水规律）；4) 下周最值得聚焦的一件事及原因。最后问用户下周想重点推进什么——回复可顺势落成新计划。",
     trigger: { kind: "weekly", days: [7], time: "21:00" },
   },
 ];
 
-export class TaskStore {
-  constructor(private deps: TaskStoreDeps) {}
+/** 内置三件套的模板投影（GET /api/tasks/templates，评审 2026-09-29 #13）：提醒页模板按钮的唯一文案来源，
+ *  与 BUILTIN_TASK_DEFS 单源——改指令只改一处，模板按钮不再手抄漂移 */
+export function builtinTaskTemplates(): Array<{
+  builtin: BuiltinTaskKind;
+  title: string;
+  instruction: string;
+  trigger: TaskTrigger;
+  label: string;
+}> {
+  return BUILTIN_TASK_DEFS.map((def) => ({
+    builtin: def.builtin,
+    title: def.title,
+    instruction: def.instruction,
+    trigger: def.trigger,
+    label: describeTrigger(def.trigger, 480),
+  }));
+}
+
+export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
 
   async list(uid: string): Promise<TaskDef[]> {
     const rows = this.deps.db
@@ -447,8 +464,11 @@ export class TaskStore {
     if (!row || row.builtins_seeded === 1) return 0;
     for (const def of BUILTIN_TASK_DEFS) {
       // 确定性 id（builtin-{kind}-{uid}）：不依赖注入方 uuid 的唯一性（测试夹具常给固定值），三连插不撞主键
+      const id = `builtin-${def.builtin}-${uid}`;
+      // 部分种子自愈（评审 2026-09-29）：上次中途失败留下的行直接跳过，重入不撞主键；标记兜底在循环后
+      if ((await this.get(uid, id)) !== null) continue;
       await this.create(uid, {
-        id: `builtin-${def.builtin}-${uid}`,
+        id,
         title: def.title,
         instruction: def.instruction,
         trigger: def.trigger,
@@ -517,6 +537,9 @@ const CATCHUP_WINDOW_MS = 24 * 3600 * 1000;
 
 export class Scheduler {
   private timer: ReturnType<typeof setInterval> | undefined;
+  /** 重入防护（评审 2026-09-29 pre-existing）：模型回合可超 tick 间隔（last_run_ts 要等 whenIdle 后才写），
+   *  上一轮未结束时跳过本轮——慢回合不再二次投递同任务（双通知/双 ran），其他到期任务顺延到下轮 */
+  private ticking = false;
 
   constructor(private deps: SchedulerDeps) {}
 
@@ -532,6 +555,16 @@ export class Scheduler {
 
   /** 触发到点/补跑；返回实际执行数（测试用）。锚点 = lastRunTs ?? createdTs。 */
   async tick(): Promise<number> {
+    if (this.ticking) return 0;
+    this.ticking = true;
+    try {
+      return await this.tickInner();
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async tickInner(): Promise<number> {
     const now = this.deps.now();
     let fired = 0;
     for (const uid of this.deps.uids()) {
@@ -580,6 +613,8 @@ export interface TaskToolsDeps {
   uid: string;
   /** nextDueAt 展示用（query_tasks）；缺省 0（once 任务原样回 at） */
   now(): number;
+  /** 用户本地时区偏置（评审 2026-09-29 #17）：agent 建任务的触发时刻按用户钟面解释，缺省取进程本地 */
+  tzOffsetMinutes?: number;
 }
 
 export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
@@ -595,7 +630,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         notifyChannel: { type: "string", description: "通知渠道：inapp 站内（默认）| wechat 微信机器人（需用户已在 IM 通道页绑定）" },
         trigger: {
           type: "object",
-          description: '如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
+          description: '时刻按用户当地钟面解释（如用户说"明早 8 点"就填 08:00，系统按用户时区调度）。如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
         },
       },
     },
@@ -610,6 +645,8 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         instruction: String(input.instruction ?? ""),
         trigger: input.trigger as TaskTrigger,
         ...(input.notifyChannel === "wechat" || input.notifyChannel === "inapp" ? { notifyChannel: input.notifyChannel } : {}),
+        // 触发时刻按用户钟面解释（评审 #17）：会话注入 tz，不再落 UTC 缺省导致"明早 8 点"变 16:30
+        tzOffsetMinutes: deps.tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
       });
       return { taskId: task.id };
     },
@@ -628,8 +665,8 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     output: {
       schema: { type: "object", required: ["tasks"], properties: { tasks: { type: "array" } } },
       render: (_args, value) => {
-        const tasks = (value as { tasks: { title: string }[] }).tasks ?? [];
-        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => t.title).join("；")}`;
+        const tasks = (value as { tasks: { title: string; builtin?: string }[] }).tasks ?? [];
+        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => (t.builtin !== undefined ? `${t.title}（内置）` : t.title)).join("；")}`;
         return [{ type: "text", text }];
       },
     },
@@ -652,6 +689,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
             instruction: t.instruction,
             trigger: t.trigger,
             enabled: t.enabled,
+            ...(t.builtin !== undefined ? { builtin: t.builtin } : {}), // 内置标记（评审 O4）：模型可定位"把内置的简报挪到九点"
             ...(t.agentId !== undefined ? { agentId: t.agentId } : {}),
             ...(t.notifyChannel !== undefined ? { notifyChannel: t.notifyChannel } : {}),
             ...(t.lastRunTs !== undefined ? { lastRunTs: t.lastRunTs } : {}),

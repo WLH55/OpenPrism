@@ -41,8 +41,8 @@ export interface ConversationDeps {
   /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行） */
   adapterFactory(uid: string, providerId: string | null, config: ModelConfig): LlmAdapter;
   now(): number;
-  /** 用户当地时区（分钟，UTC+local）；缺省按服务器本地时区 */
-  tzOffsetMinutes?(): number;
+  /** 用户档案时区（分钟，UTC+local；2026-09-29 起按会话 uid 读——浏览器上报/个人资料页可改）；缺省按服务器本地时区 */
+  tzOffsetMinutes?(uid: string): number;
   agents: AgentStore;
   skills: SkillStoreLike;
   mcps: McpRegistry;
@@ -450,6 +450,8 @@ export class ConversationStore {
     const ledgerTools = createLedgerTools({
       ledger,
       now,
+      // 工具层视图口径与 persona/任务同源（2026-09-29）：用户档案时区，缺省服务器本机
+      tzOffsetMinutes: () => this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
       actor: () => {
         const agentNow = this.syncCurrentAgent(uid, metaOf());
         return { conversationId, agentName: agentNow.name };
@@ -472,7 +474,15 @@ export class ConversationStore {
       }),
     );
     if (this.deps.tasks) {
-      tools.push(...createTaskTools({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid, now }));
+      tools.push(
+        ...createTaskTools({
+          store: this.deps.tasks as unknown as import("./tasks").TaskStore,
+          uid,
+          now,
+          // 触发时刻按用户钟面解释（评审 2026-09-29 #17）
+          tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
+        }),
+      );
     }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));
@@ -532,7 +542,7 @@ export class ConversationStore {
       ...(merged !== "" ? { memoryBlock: merged } : {}),
       taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
       now: this.deps.now,
-      tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? -new Date().getTimezoneOffset(),
+      tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
     });
   }
 

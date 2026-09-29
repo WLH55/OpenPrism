@@ -289,6 +289,39 @@ describe("todayView 增补（B1）", () => {
     expect(view.plans.find((p) => p.planId === "m1")!.goalTitle).toBe("健康");
     expect(view.plans.find((p) => p.planId === "t1")!.goalTitle).toBeUndefined();
   });
+
+  it("撤销口径与存档窗口（评审 2026-09-29）：周期型今日完成带今日打卡 seq（撤销=作废今日）；完成超 30 天的存档沉出载荷", () => {
+    const view = todayView(
+      records(
+        { kind: "plan", ts: NOW - 9000, source: "ui", planId: "h1", title: "每日习惯", scope: "day" },
+        { kind: "checkin", ts: NOW - 1000, source: "ui", planId: "h1", at: NOW - 1000, done: true },
+        { kind: "plan", ts: NOW - 50000, source: "ui", planId: "old", title: "老存档", scope: "deadline", due: "2026-08-01" },
+        { kind: "checkin", ts: Date.UTC(2026, 7, 20, 2), source: "ui", planId: "old", at: Date.UTC(2026, 7, 20, 2), done: true },
+      ),
+      NOW,
+      TZ,
+    );
+    const h1 = view.plans.find((p) => p.planId === "h1")!;
+    expect(h1.state).toBe("done");
+    expect(h1.doneSeqs).toHaveLength(1); // 周期型=今日存活 done 打卡 seq（不是全历史——撤销只退今天）
+    expect(h1.doneToday).toBe(true); // #14：今天完成的确定性标记
+    expect(view.plans.some((p) => p.planId === "old")).toBe(false); // doneAt 39 天前 → 30 天窗口外沉出（agent 面/载荷界）
+  });
+
+  it("doneToday 与 done 分离（评审 #14）：上周完成的打卡点 state=done 但 doneToday=false——晚间汇报不再把历史完成算进今天", () => {
+    const view = todayView(
+      records(
+        { kind: "plan", ts: NOW - 90000, source: "ui", planId: "m-old", title: "上周做完的打卡点", scope: "deadline", due: "2026-09-25" },
+        { kind: "checkin", ts: NOW - 3 * 86400000, source: "ui", planId: "m-old", at: NOW - 3 * 86400000, done: true },
+      ),
+      NOW,
+      TZ,
+    );
+    const m = view.plans.find((p) => p.planId === "m-old")!;
+    expect(m.state).toBe("done");
+    expect(m.done).toBe(true); // deadline 的 done = doneEver
+    expect(m.doneToday).toBe(false); // 但不是今天完成的
+  });
 });
 
 describe("goal 持久化与迁移（B1）", () => {

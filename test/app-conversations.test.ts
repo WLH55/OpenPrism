@@ -197,7 +197,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_goal", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_goal", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "create_goal", "create_plan", "create_task", "delete_goal", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_goal", "update_plan", "update_task", "void_flow",
     ]);
   });
 
@@ -639,5 +639,28 @@ describe("ConversationStore（打断与归属加固，2026-09-27）", () => {
     expect(texts).toEqual(["原问题", "改问这个"]);
     const final = events.filter((e) => e.type === "assistant/message").at(-1) as { message: { interrupted?: boolean } };
     expect(final.message.interrupted).toBeUndefined();
+  });
+});
+
+describe("档案时区装配（2026-09-29 SDD 用户档案时区）", () => {
+  it("tzOffsetMinutes 按会话 uid 读 → persona 日期行按档案钟面（东八区）算", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    let seenUid = "";
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, tzOffsetMinutes: (uid) => { seenUid = uid; return 480; } },
+      db,
+    );
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "hi");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(seenUid).toBe(UID); // 装配按 uid 取档案（多用户单例不串）
+    const nowMs = NOW();
+    const shifted = new Date(nowMs + 480 * 60000);
+    const expectDate = `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
+    expect(mock.requests[0]!.system).toContain(expectDate); // NOW=UTC 9-3 12:00 → 东八区 9-3 20:00，日期行 9-3（UTC 口径同为 9-3 时不断言差，故下面再断周几按东八钟面）
+    const shiftedDay = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][shifted.getUTCDay()]!;
+    expect(mock.requests[0]!.system).toContain(`今天是 ${expectDate} ${shiftedDay}`);
   });
 });

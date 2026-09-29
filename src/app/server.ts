@@ -10,6 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { LlmAdapter, PlatformEnv } from "../harness/index";
 import { createOpenAICompatAdapter } from "../harness/index";
 import { appendUser, hashPassword, SessionStore, verifyPassword } from "./auth";
+import { builtinTaskTemplates } from "./tasks";
 import {
   activeModelId,
   addModelProvider,
@@ -26,10 +27,11 @@ import {
 import type { Ledger } from "./ledger";
 import { categoryView, goalView, listCategories, progressView, todayView } from "./fold";
 import { latestGoalSnapshots, validateGoalParenting } from "./goals";
-import type { GoalRecord } from "./ledger";
+import { mergePlanUpdate, parseAt } from "./plans";
+import type { GoalRecord, PlanRecord } from "./ledger";
 import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
 import { parseAttachments } from "./attachments";
-import { faceOf, updateUserFace, type UserRecord } from "./auth";
+import { faceOf, readUserTz, updateUserFace, updateUserTz, validateTzOffsetMinutes, type UserRecord } from "./auth";
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
@@ -265,7 +267,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     deps.users.set(username, user);
     deps.usersByUid?.set(uid, user);
     await deps.ledgerFor(uid); // 注册即开账本（空账本入缓存）
-    await deps.tasks.ensureBuiltins(uid); // 内置三件套随号种入（种子一次性，2026-09-29）
+    try {
+      await deps.tasks.ensureBuiltins(uid); // 内置三件套随号种入（尽力而为：失败不阻断建号，启动补种按确定性 id 自愈）
+    } catch (error) {
+      process.stdout.write(`[openprism] builtin seed on register failed: ${String((error as Error).message)}\n`);
+    }
     const token = deps.sessions.issue(uid);
     return sendJson(res, 200, { uid, username }, sessionCookie(token));
   }
@@ -296,22 +302,26 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (!uid || !user) return sendError(res, 401, "unauthorized");
 
   if (method === "GET" && path === "/api/auth/me") {
-    return sendJson(res, 200, { uid, username: user.username, face: faceOf(user) });
+    return sendJson(res, 200, { uid, username: user.username, face: faceOf(user), ...(user.tzOffsetMinutes !== undefined ? { tzOffsetMinutes: user.tzOffsetMinutes } : {}) });
   }
 
-  // 个人资料：形象（头像图片 / emoji / 色盘）读写；用户名与口令不改
+  // 个人资料：形象（头像图片 / emoji / 色盘）+ 档案时区读写；用户名与口令不改。
+  // tzOffsetMinutes 同时是浏览器静默上报通道（值相同幂等，前端打开网页时刷新——DST 靠下次打开覆盖）
   if (path === "/api/auth/profile" && method === "PUT") {
-    const body = (await readBody(req)) as { avatar?: string; emoji?: string; color?: string };
+    const body = (await readBody(req)) as { avatar?: string; emoji?: string; color?: string; tzOffsetMinutes?: number };
     const patch: { avatar?: string; emoji?: string; color?: string } = {};
     for (const key of ["avatar", "emoji", "color"] as const) {
       if (body[key] !== undefined) patch[key] = String(body[key]);
     }
     try {
+      if (body.tzOffsetMinutes !== undefined) {
+        user.tzOffsetMinutes = updateUserTz(deps.db, uid, body.tzOffsetMinutes); // 校验 ±840 整数，非法 400
+      }
       const face = updateUserFace(deps.db, uid, patch);
       user.avatar = face.avatar === "" ? undefined : face.avatar;
       user.emoji = face.emoji;
       user.color = face.color;
-      return sendJson(res, 200, { uid, username: user.username, face });
+      return sendJson(res, 200, { uid, username: user.username, face, ...(user.tzOffsetMinutes !== undefined ? { tzOffsetMinutes: user.tzOffsetMinutes } : {}) });
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
     }
@@ -993,17 +1003,26 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   if (method === "POST" && path === "/api/checkin") {
-    const body = (await readBody(req)) as { planId?: string; done?: boolean };
+    const body = (await readBody(req)) as { planId?: string; done?: boolean; date?: string; time?: string };
     const planId = String(body.planId ?? "");
     if (planId === "") return sendError(res, 400, "planId 必填");
     const ledger = await deps.ledgerFor(uid);
     const exists = ledger.activeRecords().some((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
     if (!exists) return sendError(res, 404, "planId 不存在");
+    // 补历史卡（2026-09-29）：date/time 与工具侧 parseAt 同源；未来日期拒绝
+    let at = deps.env.now();
+    if (body.date !== undefined || body.time !== undefined) {
+      try {
+        at = parseAt(body.date, body.time, deps.env.now());
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+    }
     const record = await ledger.append({
       kind: "checkin",
       source: "ui",
       planId,
-      at: deps.env.now(),
+      at,
       done: body.done ?? true,
     });
     return sendJson(res, 200, { ok: true, ts: record.ts });
@@ -1042,7 +1061,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
     const scope = scopes.find((s) => s === body.scope);
     if (!scope) return sendError(res, 400, `scope 必须是 ${scopes.join(" | ")}`);
-    if (scope === "deadline" && typeof body.due !== "string") return sendError(res, 400, "scope=deadline 需要 due（YYYY-MM-DD）");
+    if (scope === "deadline") {
+      if (typeof body.due !== "string") return sendError(res, 400, "scope=deadline 需要 due（YYYY-MM-DD）");
+      // due 是折叠层字典序比较的键（评审 2026-09-29 簇 C）：非 ISO 日期会让真逾期项永久卡在 upcoming——入口收紧
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(body.due) || Number.isNaN(Date.parse(`${body.due}T00:00:00Z`))) {
+        return sendError(res, 400, "due 需为合法日期 YYYY-MM-DD（如 2026-10-04）");
+      }
+    }
     if (scope === "ndays" && (typeof body.ndays !== "number" || body.ndays < 1)) return sendError(res, 400, "scope=ndays 需要 ndays ≥ 1");
     const ledger = await deps.ledgerFor(uid);
     if (body.goalId !== undefined && !latestGoalSnapshots(ledger.readAll()).has(body.goalId)) {
@@ -1059,6 +1084,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       ...(body.goalId !== undefined && body.goalId !== "" ? { goalId: body.goalId } : {}),
     });
     return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
+  }
+
+  // 修订计划（2026-09-29 SDD 撤历史打卡与UI计划编辑补卡）：与 update_plan 工具同源（plans.ts mergePlanUpdate）——
+  // 追加新版本 + void 旧记录，planId 稳定、历史打卡引用不断；source=ui 区分写入方
+  const planMatch = /^\/api\/plans\/([^/]+)$/.exec(path);
+  if (planMatch && method === "PUT") {
+    const planId = decodeURIComponent(planMatch[1]!);
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    const ledger = await deps.ledgerFor(uid);
+    const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
+    if (!hit) return sendError(res, 404, `planId "${planId}" 不存在`);
+    try {
+      const merged = mergePlanUpdate(hit as PlanRecord, body, latestGoalSnapshots(ledger.readAll()));
+      await ledger.append({ ...merged, kind: "plan", source: "ui" });
+      await ledger.append({ kind: "void", source: "ui", targetSeq: hit.seq, reason: "更新计划" });
+      return sendJson(res, 200, { ok: true, planId, title: merged.title });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
   }
 
   if (method === "POST" && path === "/api/goals") {
@@ -1168,12 +1212,19 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
     if (method === "GET") return sendJson(res, 200, await deps.tasks.list(uid));
     const body = (await readBody(req)) as Record<string, unknown>;
+    // id/builtin 是服务端专属（评审 2026-09-29 B3）：客户端提供的 id 会撞全局主键（内置确定性 id 可被抢占致种子永久卡死）、
+    // builtin 可伪造「内置」徽标——HTTP 边界一律剥离，服务端自行分配
+    const { id: _id, builtin: _builtin, ...taskInput } = body;
     try {
-      const task = await deps.tasks.create(uid, body as never);
+      const task = await deps.tasks.create(uid, taskInput as never);
       return sendJson(res, 200, task);
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
     }
+  }
+  // 内置三件套模板投影（评审 2026-09-29 #13 单源）：提醒页模板按钮从这取文案；置于 taskMatch 前，避免被当作任务 id
+  if (method === "GET" && path === "/api/tasks/templates") {
+    return sendJson(res, 200, builtinTaskTemplates());
   }
   const taskMatch = /^\/api\/tasks\/([^/]+)(\/[^/]*)?$/.exec(path);
   if (taskMatch) {
