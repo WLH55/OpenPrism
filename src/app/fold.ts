@@ -38,14 +38,20 @@ export interface TodayPlanView {
    * deadline 型看 doneEver + due 与今天的关系；周期型看今日打卡 + 本周期内有无历史打卡。
    */
   state: PlanState;
-  /** deadline 型且已完成时的存活 done 打卡 seq（今天页撤销 = 逐条作废，与计划页同规） */
+  /** 当前可撤销的打卡 seq（2026-09-29 语义统一，与产出逻辑对齐）：deadline 型完成 = 全部存活 done 打卡；
+   * 周期型今日 done = 今日存活打卡——作废即回退，追加 done:false 无效 */
   doneSeqs?: number[];
+  /** 最近 10 条存活 done 打卡（倒序，含非今日，at 定位是哪天打的）——撤历史卡的凭据（2026-09-29） */
+  checkins?: { seq: number; at: number }[];
   /** 挂目标树的计划带顶层方向标题（「属于：xx」）——与独立待办的区分信号（2026-09-28） */
   goalTitle?: string;
   /** 账本 seq：逾期「跳过」= 作废该 plan 记录（2026-09-29） */
   seq: number;
   /** 完成时刻 = 最新存活 done 打卡的 at（2026-09-29）：已完成视图按它倒序/过滤近 30 天 */
   doneAt?: number;
+  /** 今天完成的确定性标记（评审 2026-09-29 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天。
+   * 与 done 的区别：deadline 的 done=doneEver（上周完成的打卡点 done=true 但 doneToday=false），模型/前端按它归因"今天的完成度" */
+  doneToday: boolean;
 }
 
 export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
@@ -123,16 +129,20 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     .map(({ seq, time, category, note, value, unit }) => ({ seq, time, category, ...(note !== undefined ? { note } : {}), ...(value !== undefined ? { value } : {}), ...(unit !== undefined ? { unit } : {}) }));
 
   const checkinsToday = live.filter((r): r is CheckinRecord => r.kind === "checkin" && r.done && isToday(r.at));
-  // doneEver（打过一次就算）+ 存活 done 打卡 seq + 最新完成时刻：deadline 型的完成判定/撤销/完成视图排序三口径同源
+  // doneEver（打过一次就算）+ 存活 done 打卡 seq + 最新完成时刻 + 最近打卡凭据：deadline 型的完成判定/撤销/完成视图排序同源
   const doneEver = new Set<string>();
   const doneSeqsByPlan = new Map<string, number[]>();
   const lastDoneAt = new Map<string, number>();
+  const checkinsByPlan = new Map<string, { seq: number; at: number }[]>();
   for (const r of live) {
     if (r.kind !== "checkin" || !r.done) continue;
     doneEver.add(r.planId);
     const list = doneSeqsByPlan.get(r.planId) ?? [];
     list.push(r.seq);
     doneSeqsByPlan.set(r.planId, list);
+    const pairs = checkinsByPlan.get(r.planId) ?? [];
+    pairs.push({ seq: r.seq, at: r.at });
+    checkinsByPlan.set(r.planId, pairs);
     lastDoneAt.set(r.planId, Math.max(lastDoneAt.get(r.planId) ?? 0, r.at));
   }
   const todayStr = dateString(localParts(now, tzOffsetMinutes));
@@ -159,6 +169,9 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
       const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
       const state = stateOf(plan, doneToday);
       const goalTitle = plan.goalId !== undefined ? goalTopTitle(latestGoals, plan.goalId) : undefined;
+      const lastDone = lastDoneAt.get(plan.planId);
+      // "今天完成"的确定性口径：周期型=state done（即今日有卡）；deadline 型=最新完成打卡落在今天
+      const doneTodayFlag = plan.scope === "deadline" ? lastDone !== undefined && dayKey(lastDone, tzOffsetMinutes) === todayK : doneToday;
       return {
         planId: plan.planId,
         title: plan.title,
@@ -167,12 +180,33 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         done: doneToday,
         ...(last !== undefined ? { checkinTs: last.at } : {}),
         state,
-        ...(plan.scope === "deadline" && state === "done" ? { doneSeqs: doneSeqsByPlan.get(plan.planId) ?? [] } : {}),
+        // 撤销口径（评审 2026-09-29 簇 A）：done 项都给可作废的打卡 seq——deadline 型=全部存活 done 打卡（doneEver），
+        // 周期型=今日存活 done 打卡（撤销只退今天，不动历史）；追加 done:false 对两者都无效（CONTEXT.md 语义）
+        ...(state === "done"
+          ? {
+              doneSeqs:
+                plan.scope === "deadline"
+                  ? (doneSeqsByPlan.get(plan.planId) ?? [])
+                  : checkinsToday.filter((c) => c.planId === plan.planId).map((c) => c.seq),
+            }
+          : {}),
+        // 撤历史卡凭据：最近 10 条存活 done 打卡倒序（含非今日；at 相同按后打的在前）
+        ...((checkinsByPlan.get(plan.planId) ?? []).length > 0
+          ? {
+              checkins: [...(checkinsByPlan.get(plan.planId) ?? [])]
+                .sort((a, b) => b.at - a.at || b.seq - a.seq)
+                .slice(0, 10),
+            }
+          : {}),
         ...(goalTitle !== undefined ? { goalTitle } : {}),
         seq: plan.seq,
-        ...(state === "done" ? { doneAt: lastDoneAt.get(plan.planId) } : {}),
+        ...(state === "done" ? { doneAt: lastDone } : {}),
+        doneToday: doneTodayFlag,
       };
     })
+    // 已完成存档的 30 天窗口（评审 2026-09-29：载荷/模型上下文无界增长）——「已完成」视图本就按 30 天过滤，
+    // 折叠层同口径截断后 UI 无感、agent 面（query_ledger what=today）不再全量灌历史
+    .filter((p) => p.state !== "done" || (p.doneAt ?? 0) >= now - 30 * 86400000)
     .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.planId.localeCompare(b.planId));
 
   const totals = new Map<string, { total: number; count: number }>();
@@ -479,9 +513,13 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
     for (const phase of phases) {
       if (items.length >= 3) break;
       const first = firstUnchecked.get(phase.goalId);
-      if (first !== undefined && !taken.has(first.planId)) {
-        items.push(itemFor(first, "nextStep"));
-        taken.add(first.planId);
+      if (first !== undefined) {
+        // 打卡点存在即终局（评审 2026-09-29 C4）：第一条未完成打卡点已在 top3（如以 overdue 身份）时不再补位，
+        // 也不落回旧 nextStep 文字——同一件事不出现两次
+        if (!taken.has(first.planId)) {
+          items.push(itemFor(first, "nextStep"));
+          taken.add(first.planId);
+        }
         continue;
       }
       if (phase.nextStep !== undefined && phase.nextStep !== "") {

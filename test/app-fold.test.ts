@@ -127,3 +127,45 @@ describe("planScopeCoversToday", () => {
     expect(planScopeCoversToday(mkPlan({ scope: "deadline", due: "2026-09-02" }, NOW - 2 * DAY), NOW, TZ)).toBe(false);
   });
 });
+
+describe("todayView checkins/doneSeqs（2026-09-29 撤历史卡凭据）", () => {
+  it("checkins：存活 done 打卡倒序（含非今日），seq+at 供定位撤哪一天的卡", () => {
+    const view = todayView(
+      records(
+        { kind: "plan", ts: NOW - 3600000, source: "ui", planId: "p1", title: "背单词", scope: "week" },
+        { kind: "checkin", ts: 10, source: "ui", planId: "p1", at: Date.UTC(2026, 8, 2, 5, 0), done: true }, // 当地 9-2 13:00，昨天
+        { kind: "checkin", ts: 11, source: "ui", planId: "p1", at: Date.UTC(2026, 8, 3, 1, 0), done: true }, // 当地 9-3 09:00，今天
+      ),
+      NOW,
+      TZ,
+    );
+    const plan = view.plans.find((p) => p.planId === "p1")!;
+    expect(plan.checkins).toHaveLength(2);
+    expect(plan.checkins![0]!.at).toBe(Date.UTC(2026, 8, 3, 1, 0)); // 倒序：最近在前
+    expect(plan.checkins![1]!.seq).toBe(1); // 昨天那条的 seq（撤历史卡凭据）
+  });
+
+  it("checkins 上限 10 条保留最近；周期今日 done 的 doneSeqs=今日打卡（UI 撤零改动可用）", () => {
+    const yesterday = Array.from({ length: 12 }, (_, i) => ({
+      kind: "checkin" as const,
+      ts: 100 + i,
+      source: "ui" as const,
+      planId: "p1",
+      at: Date.UTC(2026, 8, 2, 1, 0) + i * 3600000, // 当地 9-2 09:00 起每小时一笔（均在本周）
+      done: true,
+    }));
+    const view = todayView(
+      records(
+        { kind: "plan", ts: NOW - 3600000, source: "ui", planId: "p1", title: "背单词", scope: "week" },
+        ...yesterday,
+        { kind: "checkin", ts: 200, source: "ui", planId: "p1", at: Date.UTC(2026, 8, 3, 2, 0), done: true }, // 当地今天 10:00
+      ),
+      NOW,
+      TZ,
+    );
+    const plan = view.plans.find((p) => p.planId === "p1")!;
+    expect(plan.checkins).toHaveLength(10); // 13 条存活取最近 10
+    expect(plan.checkins![0]!.at).toBe(Date.UTC(2026, 8, 3, 2, 0));
+    expect(plan.doneSeqs).toEqual([13]); // 今日打卡 seq（第 14 条记录）——周期撤销只退今天
+  });
+});

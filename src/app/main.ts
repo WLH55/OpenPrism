@@ -9,7 +9,7 @@ import { nodeEnv } from "./env";
 import { appPaths } from "./store";
 import { openDb } from "./db";
 import { migrateLegacy, migrateLegacyModelConfig } from "./migrate";
-import { loadUsers, SessionStore } from "./auth";
+import { loadUsers, readUserTz, SessionStore } from "./auth";
 import { loadOrCreateMasterKey, open, readModelConfig, readModelProviderConfig, type ModelConfig } from "./secretbox";
 import { Ledger } from "./ledger";
 import { ConversationStore } from "./conversations";
@@ -107,6 +107,8 @@ async function main(): Promise<void> {
       modelConfigFor,
       adapterFactory,
       now: () => Date.now(),
+      // 用户档案时区（2026-09-29）：网页/微信/定时任务统一口径；未上报退服务器本机
+      tzOffsetMinutes: (uid) => readUserTz(db, uid) ?? -new Date().getTimezoneOffset(),
       agents,
       skills,
       mcps,

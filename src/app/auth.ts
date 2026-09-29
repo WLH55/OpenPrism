@@ -45,6 +45,31 @@ export interface UserRecord {
   avatar?: string;
   emoji?: string;
   color?: string;
+  /** 用户档案时区（分钟，UTC+local；2026-09-29）：缺省 = 未上报，装配层退服务器本机 */
+  tzOffsetMinutes?: number;
+}
+
+/** 时区值校验（±840 分钟 = UTC-14~+14 极值；整数分钟）——profile 写入口与装配兜底共用 */
+export function validateTzOffsetMinutes(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || Math.abs(value) > 840) {
+    throw new Error("tzOffsetMinutes 需为不超过 ±840 的整数（分钟）");
+  }
+  return value;
+}
+
+/** 现读用户档案时区（未上报 = undefined，调用方决定兜底） */
+export function readUserTz(db: DatabaseSync, uid: string): number | undefined {
+  const row = db.prepare("SELECT tz_offset_minutes FROM users WHERE uid = ?").get(uid) as { tz_offset_minutes: number | null } | undefined;
+  if (!row) throw new Error(`user "${uid}" 不存在`);
+  return row.tz_offset_minutes ?? undefined;
+}
+
+/** 用户档案时区落库（校验后写；浏览器自动上报与个人资料页修改共用） */
+export function updateUserTz(db: DatabaseSync, uid: string, tz: number): number {
+  const valid = validateTzOffsetMinutes(tz);
+  const hit = db.prepare("UPDATE users SET tz_offset_minutes = ? WHERE uid = ?").run(valid, uid);
+  if (hit.changes === 0) throw new Error(`user "${uid}" 不存在`);
+  return valid;
 }
 
 /** 用户形象视图（/api/auth/me 与个人资料页共用） */
@@ -86,7 +111,7 @@ export function updateUserFace(db: DatabaseSync, uid: string, patch: { avatar?: 
 /** 用户表全量载入（注册表只有几行，非用户数据；注册/登录后写穿 SQL） */
 export async function loadUsers(db: DatabaseSync): Promise<Map<string, UserRecord>> {
   const map = new Map<string, UserRecord>();
-  const rows = db.prepare("SELECT uid, username, salt, pwd_hash, created_ts, avatar, emoji, color FROM users").all() as unknown as {
+  const rows = db.prepare("SELECT uid, username, salt, pwd_hash, created_ts, avatar, emoji, color, tz_offset_minutes FROM users").all() as unknown as {
     uid: string;
     username: string;
     salt: string;
@@ -95,6 +120,7 @@ export async function loadUsers(db: DatabaseSync): Promise<Map<string, UserRecor
     avatar: string | null;
     emoji: string;
     color: string;
+    tz_offset_minutes: number | null;
   }[];
   for (const row of rows) {
     map.set(row.username, {
@@ -103,6 +129,7 @@ export async function loadUsers(db: DatabaseSync): Promise<Map<string, UserRecor
       password: { salt: row.salt, hash: row.pwd_hash },
       createdTs: row.created_ts,
       ...faceOf(row),
+      ...(row.tz_offset_minutes !== null ? { tzOffsetMinutes: row.tz_offset_minutes } : {}),
     });
   }
   return map;

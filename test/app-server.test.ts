@@ -8,7 +8,7 @@ import { get as httpGet } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
-import { SessionStore, type UserRecord } from "../src/app/auth";
+import { readUserTz, SessionStore, type UserRecord } from "../src/app/auth";
 import { Ledger } from "../src/app/ledger";
 import { ConversationStore } from "../src/app/conversations";
 import { AgentStore } from "../src/app/agents";
@@ -96,6 +96,8 @@ beforeAll(async () => {
       modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1", ...(multimodalModel ? { multimodal: true } : {}) }),
       adapterFactory: () => adapter as LlmAdapter,
       now: () => Date.now(),
+      // 与生产同形态（2026-09-29 时区 spec）：装配按 uid 读用户档案，未上报退服务器本机
+      tzOffsetMinutes: (uid) => readUserTz(db, uid) ?? -new Date().getTimezoneOffset(),
       agents,
       skills,
       mcps,
@@ -291,6 +293,119 @@ describe("HTTP API", () => {
       headers: { "Content-Type": "application/json", cookie },
     });
     expect(missing.status).toBe(404);
+  });
+
+  it("计划 due 格式校验（评审 2026-09-29 簇 C）：非 ISO 日期 400——折叠层字典序键不容脏数据", async () => {
+    for (const bad of ["2026/10/01", "2026-9-30", "2026-13-45", ""]) {
+      const res = await fetch(`${baseUrl}/api/plans`, {
+        ...json({ title: "坏日期", scope: "deadline", due: bad }),
+        headers: { "Content-Type": "application/json", cookie },
+      });
+      expect(res.status, `due="${bad}"`).toBe(400);
+    }
+    expect((await fetch(`${baseUrl}/api/plans`, {
+      ...json({ title: "好日期", scope: "deadline", due: "2026-10-04" }),
+      headers: { "Content-Type": "application/json", cookie },
+    })).status).toBe(200);
+  });
+
+  it("PUT /api/plans/:planId（2026-09-29）：改标题/due 生效、planId 不变、旧记录 void；未知 404、非法 scope 400", async () => {
+    const uid = users.get("lathan")!.uid;
+    const ledger = await ledgers.get(uid)!;
+    const created = await fetch(`${baseUrl}/api/plans`, {
+      ...json({ title: "交报告", scope: "deadline", due: "2026-10-05" }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    const { planId } = (await created.json()) as { planId: string };
+    const upd = await fetch(`${baseUrl}/api/plans/${planId}`, {
+      ...json({ title: "交年度报告", due: "2026-10-10" }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(upd.status).toBe(200);
+    const today = (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as {
+      plans: { planId: string; title: string; due?: string }[];
+    };
+    const plan = today.plans.find((p) => p.planId === planId)!;
+    expect(plan.title).toBe("交年度报告");
+    expect(plan.due).toBe("2026-10-10");
+    expect(today.plans.filter((p) => p.planId === planId)).toHaveLength(1); // planId 稳定不重复
+    // 修订留痕：账本里同 planId 两条 plan（旧版+新版），折叠层只剩新版（旧版被 void）
+    const allOfPlan = ledger.readAll().filter((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
+    expect(allOfPlan).toHaveLength(2);
+    expect(ledger.activeRecords().filter((r) => r.kind === "plan" && (r as { planId: string }).planId === planId)).toHaveLength(1);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/plans/plan-nope`, {
+          ...json({ title: "x" }),
+          method: "PUT",
+          headers: { "Content-Type": "application/json", cookie },
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/plans/${planId}`, {
+          ...json({ scope: "daily" }),
+          method: "PUT",
+          headers: { "Content-Type": "application/json", cookie },
+        })
+      ).status,
+    ).toBe(400);
+  });
+
+  it("checkin 补卡（2026-09-29）：带 date 补历史卡 → today 的 checkins 出凭据；未来 400、非法格式 400", async () => {
+    const uid = users.get("lathan")!.uid;
+    const ledger = await ledgers.get(uid)!;
+    await ledger.append({ kind: "plan", source: "ui", planId: "p-backfill", title: "背单词", scope: "week" });
+    const yesterday = new Date(Date.now() - 86400000); // 真实时钟下取昨天（与既有 UI 打卡用例同模式，相对断言不依赖具体值）
+    const dateStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
+    const ok = await fetch(`${baseUrl}/api/checkin`, {
+      ...json({ planId: "p-backfill", date: dateStr }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(ok.status).toBe(200);
+    const today = (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as {
+      plans: { planId: string; checkins?: { seq: number; at: number }[] }[];
+    };
+    const plan = today.plans.find((p) => p.planId === "p-backfill")!;
+    expect(plan.checkins).toHaveLength(1); // 补卡凭据可见（seq 供撤销）
+    expect(
+      (
+        await fetch(`${baseUrl}/api/checkin`, {
+          ...json({ planId: "p-backfill", date: "2999-01-01" }), // 绝对未来
+          headers: { "Content-Type": "application/json", cookie },
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/checkin`, {
+          ...json({ planId: "p-backfill", date: "12-31" }), // 非法格式
+          headers: { "Content-Type": "application/json", cookie },
+        })
+      ).status,
+    ).toBe(400);
+  });
+
+  it("档案时区（2026-09-29）：profile 读写 tz；越界/非整数/字符串 400", async () => {
+    const ok = await fetch(`${baseUrl}/api/auth/profile`, {
+      ...json({ tzOffsetMinutes: 480 }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { tzOffsetMinutes?: number }).tzOffsetMinutes).toBe(480);
+    const me = (await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json()) as { tzOffsetMinutes?: number };
+    expect(me.tzOffsetMinutes).toBe(480);
+    for (const bad of [9999, 1.5, "480"]) {
+      const res = await fetch(`${baseUrl}/api/auth/profile`, {
+        ...json({ tzOffsetMinutes: bad }),
+        method: "PUT",
+        headers: { "Content-Type": "application/json", cookie },
+      });
+      expect(res.status, `tz=${String(bad)}`).toBe(400);
+    }
   });
 
   it("目标层级 API（B2，2026-09-28）：建方向/阶段 → PUT 修订（追加快照）→ GET 层级树；层级违规 400、未知 404", async () => {
@@ -568,6 +683,23 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     expect(afterCreate).toHaveLength(4);
     expect(afterCreate.filter((t) => t.builtin !== undefined).map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
     expect(afterCreate.every((t) => t.builtin === undefined || (t.notifyChannel ?? "inapp") === "inapp")).toBe(true);
+    // HTTP 边界剥离客户端 id/builtin（评审 2026-09-29 B3）：伪造内置身份/抢占确定性 id 无效
+    const spoof = (await (await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ id: "builtin-daily-brief-hax", builtin: "daily-brief", title: "伪内置", instruction: "x", trigger: { kind: "daily", time: "09:00" } }),
+    })).json()) as { id: string; builtin?: string };
+    expect(spoof.id).not.toBe("builtin-daily-brief-hax");
+    expect(spoof.builtin).toBeUndefined();
+    expect((await fetch(`${baseUrl}/api/tasks/${spoof.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200); // 测试垃圾清理
+    // 模板投影端点（评审 #13 单源）：三件套与内置任务同源，label 可读
+    const templates = (await (await fetch(`${baseUrl}/api/tasks/templates`, { headers: { cookie } })).json()) as {
+      builtin: string;
+      title: string;
+      label: string;
+    }[];
+    expect(templates.map((t) => t.builtin)).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+    expect(templates.every((t) => t.title !== "" && t.label !== "")).toBe(true);
     expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },

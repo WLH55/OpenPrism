@@ -45,14 +45,18 @@ export interface TodayPlanView {
   checkinTs?: number;
   /** 确定性状态：overdue/dueToday/doing/todo/upcoming/done（旧服务端无此字段 → 用 done 兜底） */
   state?: "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
-  /** deadline 型已完成时的存活打卡 seq；撤销 = 逐条作废（与计划页同规） */
+  /** 当前可撤销的打卡 seq：deadline 型完成=全部存活 done 打卡；周期型今日 done=今日打卡——撤销=逐条作废（与计划页同规） */
   doneSeqs?: number[];
+  /** 最近 10 条存活 done 打卡（倒序，含非今日）——撤历史卡凭据 */
+  checkins?: { seq: number; at: number }[];
   /** 挂目标树的计划带顶层方向标题——独立待办没有此字段 */
   goalTitle?: string;
   /** 账本 seq：逾期「跳过」= 作废该 plan 记录 */
   seq?: number;
   /** 完成时刻（最新存活 done 打卡）——已完成视图按它倒序/过滤近 30 天 */
   doneAt?: number;
+  /** 今天完成的确定性标记（评审 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天（上周完成的里程碑 state=done 但 doneToday=false） */
+  doneToday?: boolean;
 }
 
 export interface TodayFlowView {
@@ -204,6 +208,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export interface MeLoose {
   username: string;
   face: FaceLoose;
+  /** 用户档案时区（分钟；缺省 = 未上报，前端静默补报） */
+  tzOffsetMinutes?: number;
 }
 
 /** 一条待发附件（浏览器加工后的形态） */
@@ -224,7 +230,7 @@ export const api = {
     request<{ uid: string; username: string }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   me: () => request<MeLoose>("/api/auth/me"),
-  updateProfile: (patch: { avatar?: string; emoji?: string; color?: string }) =>
+  updateProfile: (patch: { avatar?: string; emoji?: string; color?: string; tzOffsetMinutes?: number }) =>
     request<MeLoose>("/api/auth/profile", { method: "PUT", body: JSON.stringify(patch) }),
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
@@ -262,8 +268,11 @@ export const api = {
   quickFlow: (input: { category: string; note?: string; value?: number; unit?: string }) =>
     request<{ seq: number }>("/api/flows", { method: "POST", body: JSON.stringify(input) }),
   voidRecord: (seq: number) => request<{ ok: boolean }>("/api/void", { method: "POST", body: JSON.stringify({ seq }) }),
-  checkin: (planId: string, done = true) =>
-    request<{ ok: boolean }>("/api/checkin", { method: "POST", body: JSON.stringify({ planId, done }) }),
+  checkin: (planId: string, done = true, date?: string) =>
+    request<{ ok: boolean }>("/api/checkin", {
+      method: "POST",
+      body: JSON.stringify({ planId, done, ...(date !== undefined ? { date } : {}) }),
+    }),
 
   // ── 目标层级（B3，2026-09-28）：方向/阶段/项目树 + UI 写入（修订=追加快照） ──
   goals: () => request<GoalsPageLoose>(`/api/goals?tz=${-new Date().getTimezoneOffset()}`),
@@ -277,6 +286,12 @@ export const api = {
   /** UI 建计划/里程碑（挂目标树）；对话建计划走 agent 工具，同一账本 */
   createPlan: (input: { title: string; scope: string; due?: string; goalId?: string }) =>
     request<{ planId: string }>("/api/plans", { method: "POST", body: JSON.stringify(input) }),
+  /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定 */
+  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string }) =>
+    request<{ ok: boolean; planId: string; title: string }>(`/api/plans/${encodeURIComponent(planId)}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
 };
 
 export function openConversationStream(cid: string, onEvent: (event: LiveEventLoose) => void): () => void {
@@ -479,11 +494,12 @@ export interface NotificationLoose {
 
 export const api3 = {
   listTasks: () => request<TaskLoose[]>("/api/tasks"),
-  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string; notifyChannel?: "inapp" | "wechat" }) =>
-    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
+  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string; notifyChannel?: "inapp" | "wechat" }) =>    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
   updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title" | "notifyChannel">> & { trigger?: TaskTriggerLoose }) =>
     request<TaskLoose>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
+  /** 内置三件套模板投影（评审 #13 单源）：与服务端 BUILTIN_TASK_DEFS 同源，提醒页模板按钮取此文案 */
+  taskTemplates: () => request<{ builtin: string; title: string; instruction: string; trigger: TaskTriggerLoose; label: string }[]>("/api/tasks/templates"),
   runTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}/run`, { method: "POST" }),
   taskRuns: (id: string) => request<TaskRunLoose[]>(`/api/tasks/${id}/runs`),
 

@@ -106,20 +106,23 @@ describe("void_flow / cancel_plan（作废回路，2026-09-04 补）", () => {
 });
 
 describe("工具契约", () => {
-  it("八工具齐备；写工具 exclusive、查询 parallel", async () => {
+  it("十工具齐备；写工具 exclusive、查询 parallel", async () => {
     const { tools, by } = await freshTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "cancel_plan",
       "checkin_plan",
       "create_goal",
       "create_plan",
+      "delete_goal",
       "query_ledger",
       "record_flow",
       "update_goal",
+      "update_plan",
       "void_flow",
     ]);
     expect(by("record_flow").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("void_flow").isConcurrencySafe?.({})).toBeFalsy();
+    expect(by("update_plan").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("create_goal").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("update_goal").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("query_ledger").isConcurrencySafe?.({})).toBe(true);
@@ -220,6 +223,187 @@ describe("create_goal / update_goal / query_ledger what=goals（B2，2026-09-28�
   });
 });
 
+describe("update_plan（2026-09-29 账本工具能力补全）", () => {
+  it("改标题与顺延 due：planId 不变、旧记录被 void、查询反映新值", async () => {
+    const { ledger, by } = await freshTools();
+    const plan = (await by("create_plan").execute({ title: "交报告", scope: "deadline", due: "2026-09-05" }, ctx)) as { planId: string };
+    const upd = (await by("update_plan").execute({ planId: plan.planId, title: "交年度报告", due: "2026-09-10" }, ctx)) as {
+      planId: string;
+      title: string;
+    };
+    expect(upd).toMatchObject({ planId: plan.planId, title: "交年度报告" });
+    const plans = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; title: string; due: string }[] };
+    expect(plans.plans[0]).toMatchObject({ planId: plan.planId, title: "交年度报告", due: "2026-09-10" });
+    // 折叠层只剩一条该 planId 的 plan；readAll 里旧记录被 void 引用（历史审计保留）
+    expect(ledger.activeRecords().filter((r) => r.kind === "plan" && (r as PlanRecord).planId === plan.planId)).toHaveLength(1);
+    expect(ledger.readAll().filter((r) => r.kind === "void")).toHaveLength(1);
+  });
+
+  it("goalId 换挂与空串解除挂载；已打的卡不因修订丢失", async () => {
+    const { by } = await freshTools();
+    const d1 = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
+    const d2 = (await by("create_goal").execute({ level: "direction", title: "学习" }, ctx)) as { goalId: string };
+    const plan = (await by("create_plan").execute({ title: "里程碑", scope: "deadline", due: "2026-10-01", goalId: d1.goalId }, ctx)) as { planId: string };
+    await by("checkin_plan").execute({ planId: plan.planId }, ctx);
+    await by("update_plan").execute({ planId: plan.planId, goalId: d2.goalId }, ctx);
+    const scoped = (await by("query_ledger").execute({ what: "plans", goalId: d2.goalId }, ctx)) as { plans: { planId: string }[] };
+    expect(scoped.plans.map((p) => p.planId)).toContain(plan.planId);
+    await by("update_plan").execute({ planId: plan.planId, goalId: "" }, ctx);
+    const afterDetach = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; goalId?: string }[] };
+    expect(afterDetach.plans.find((p) => p.planId === plan.planId)!.goalId).toBeUndefined();
+    const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { plans: { planId: string; state: string }[] };
+    expect(today.plans.find((p) => p.planId === plan.planId)!.state).toBe("done");
+  });
+
+  it("报错路径：planId 不存在 / scope 换 deadline 缺 due / goalId 不存在", async () => {
+    const { by } = await freshTools();
+    await expect(by("update_plan").execute({ planId: "plan-nope", title: "x" }, ctx)).rejects.toThrow("不存在");
+    const plan = (await by("create_plan").execute({ title: "日记", scope: "day" }, ctx)) as { planId: string };
+    await expect(by("update_plan").execute({ planId: plan.planId, scope: "deadline" }, ctx)).rejects.toThrow("due");
+    await expect(by("update_plan").execute({ planId: plan.planId, goalId: "goal-nope" }, ctx)).rejects.toThrow("不存在");
+  });
+});
+
+describe("checkin_plan 补卡 + void_flow 撤卡（2026-09-29）", () => {
+  it("date/time 补历史卡：at 落在指定当地日与时刻；回执带 seq（撤卡凭据）", async () => {
+    const { by } = await freshTools();
+    const plan = (await by("create_plan").execute({ title: "背单词", scope: "day" }, ctx)) as { planId: string };
+    const checkin = (await by("checkin_plan").execute({ planId: plan.planId, date: "2026-09-01", time: "09:30" }, ctx)) as {
+      at: number;
+      seq: number;
+    };
+    expect(Number.isInteger(checkin.seq)).toBe(true);
+    const d = new Date(checkin.at);
+    expect(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`).toBe("2026-09-01");
+    expect(`${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`).toBe("09:30");
+  });
+
+  it("未来日期拒绝；非法 date/time 格式拒绝", async () => {
+    const { by } = await freshTools();
+    const plan = (await by("create_plan").execute({ title: "背单词", scope: "day" }, ctx)) as { planId: string };
+    await expect(by("checkin_plan").execute({ planId: plan.planId, date: "2026-12-31" }, ctx)).rejects.toThrow("未来");
+    await expect(by("checkin_plan").execute({ planId: plan.planId, date: "09-01" }, ctx)).rejects.toThrow("YYYY-MM-DD");
+    await expect(by("checkin_plan").execute({ planId: plan.planId, time: "9点" }, ctx)).rejects.toThrow("HH:mm");
+  });
+
+  it("撤卡：day 型打完 void 后回到待做；deadline 型 doneEver 消失回到未开始", async () => {
+    const { by } = await freshTools();
+    const stateOf = async (planId: string) => {
+      const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { plans: { planId: string; state: string }[] };
+      return today.plans.find((p) => p.planId === planId)!.state;
+    };
+    const day = (await by("create_plan").execute({ title: "跑步", scope: "day" }, ctx)) as { planId: string };
+    const c1 = (await by("checkin_plan").execute({ planId: day.planId }, ctx)) as { seq: number };
+    expect(await stateOf(day.planId)).toBe("done");
+    await by("void_flow").execute({ seq: c1.seq, reason: "打错了" }, ctx);
+    expect(await stateOf(day.planId)).toBe("todo");
+
+    const dl = (await by("create_plan").execute({ title: "交报告", scope: "deadline", due: "2026-09-10" }, ctx)) as { planId: string };
+    const c2 = (await by("checkin_plan").execute({ planId: dl.planId }, ctx)) as { seq: number };
+    expect(await stateOf(dl.planId)).toBe("done");
+    await by("void_flow").execute({ seq: c2.seq }, ctx);
+    expect(await stateOf(dl.planId)).toBe("upcoming"); // due 在未来 → 打回未开始
+  });
+
+  it("void_flow 指向 plan/goal seq → 报错引导专用工具", async () => {
+    const { ledger, by } = await freshTools();
+    await by("create_plan").execute({ title: "跑步", scope: "day" }, ctx);
+    const planSeq = ledger.activeRecords().find((r) => r.kind === "plan")!.seq;
+    await expect(by("void_flow").execute({ seq: planSeq }, ctx)).rejects.toThrow("cancel_plan");
+    await by("create_goal").execute({ level: "direction", title: "健康" }, ctx);
+    const goalSeq = ledger.activeRecords().find((r) => r.kind === "goal")!.seq;
+    await expect(by("void_flow").execute({ seq: goalSeq }, ctx)).rejects.toThrow("update_goal");
+  });
+});
+
+describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
+  it("goalId 过滤只返回挂该目标的计划；limit 截断带 total/truncated；limit 非法拒绝", async () => {
+    const { by } = await freshTools();
+    const d = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
+    await by("create_plan").execute({ title: "a", scope: "day", goalId: d.goalId }, ctx);
+    await by("create_plan").execute({ title: "b", scope: "week", goalId: d.goalId }, ctx);
+    await by("create_plan").execute({ title: "c", scope: "day" }, ctx);
+    const scoped = (await by("query_ledger").execute({ what: "plans", goalId: d.goalId }, ctx)) as {
+      plans: { title: string }[];
+      total: number;
+      truncated: boolean;
+    };
+    expect(scoped.plans.map((p) => p.title).sort()).toEqual(["a", "b"]);
+    expect(scoped).toMatchObject({ total: 2, truncated: false });
+    const limited = (await by("query_ledger").execute({ what: "plans", limit: 2 }, ctx)) as { plans: unknown[]; total: number; truncated: boolean };
+    expect(limited.plans).toHaveLength(2);
+    expect(limited).toMatchObject({ total: 3, truncated: true });
+    await expect(by("query_ledger").execute({ what: "plans", limit: 0 }, ctx)).rejects.toThrow("limit");
+  });
+
+  it("flows limit 截断：时间倒序 + 同刻后记优先，保留最新一批", async () => {
+    const { by } = await freshTools();
+    await by("record_flow").execute({ category: "餐饮", value: 10 }, ctx);
+    await by("record_flow").execute({ category: "餐饮", value: 20 }, ctx);
+    await by("record_flow").execute({ category: "运动", value: 30 }, ctx);
+    const limited = (await by("query_ledger").execute({ what: "flows", limit: 2 }, ctx)) as {
+      flows: { value?: number }[];
+      total: number;
+      truncated: boolean;
+    };
+    expect(limited.flows.map((f) => f.value)).toEqual([30, 20]);
+    expect(limited).toMatchObject({ total: 3, truncated: true });
+  });
+
+  it("render 四种视角均为人话摘要而非 JSON 串；凭据保留——today/plans 摘要带 planId（评审 O8）", async () => {
+    const { by } = await freshTools();
+    await by("record_flow").execute({ category: "餐饮", value: 28 }, ctx);
+    const created = (await by("create_plan").execute({ title: "读书", scope: "day" }, ctx)) as { planId: string };
+    const render = (value: unknown) => (by("query_ledger").output!.render!({}, value) as { text: string }[])[0]!.text;
+    const today = await by("query_ledger").execute({ what: "today" }, ctx);
+    expect(render(today)).toContain("1 笔流水");
+    expect(render(today)).toContain("连续记录");
+    expect(render(today)).toContain(created.planId); // 未完成计划行带 planId——取消/打卡要拿它调工具
+    const plans = await by("query_ledger").execute({ what: "plans" }, ctx);
+    expect(render(plans)).toContain("1 个计划");
+    expect(render(plans)).toContain(created.planId); // plans 摘要同样保留凭据
+    const flows = await by("query_ledger").execute({ what: "flows" }, ctx);
+    expect(render(flows)).toContain("1 笔流水");
+    expect(render(flows)).toContain("餐饮×1");
+    const goals = await by("query_ledger").execute({ what: "goals" }, ctx);
+    expect(render(goals)).toContain("0 个方向");
+    for (const value of [today, plans, flows, goals]) expect(render(value)).not.toContain('{"');
+  });
+
+  it("update_goal 用弃用的 nextStep 时回执当面提醒（评审 O5）", async () => {
+    const { by } = await freshTools();
+    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
+    await by("update_goal").execute({ goalId: dir.goalId, nextStep: "约教练" }, ctx);
+    const blocks = by("update_goal").output.render!({ goalId: dir.goalId, nextStep: "约教练" }, { goalId: dir.goalId, title: "健康", status: "active" });
+    expect((blocks[0] as { text: string }).text).toContain("已弃用");
+    const clean = by("update_goal").output.render!({ goalId: dir.goalId }, { goalId: dir.goalId, title: "健康", status: "active" });
+    expect((clean[0] as { text: string }).text).not.toContain("已弃用"); // 没用弃用参数不唠叨
+  });
+
+  it("delete_goal：真删作废全部快照留痕、有子不放行、未知 404 同义报错（评审 O6）", async () => {
+    const { by } = await freshTools();
+    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
+    const phase = (await by("create_goal").execute({ level: "phase", title: "8 周减脂", parentId: dir.goalId }, ctx)) as { goalId: string };
+    await expect(by("delete_goal").execute({ goalId: dir.goalId }, ctx)).rejects.toThrow("先删除它们");
+    const deleted = (await by("delete_goal").execute({ goalId: phase.goalId, reason: "建错了" }, ctx)) as { voided: number };
+    expect(deleted.voided).toBe(1);
+    const gone = (await by("delete_goal").execute({ goalId: dir.goalId }, ctx)) as { voided: number };
+    expect(gone.voided).toBe(1);
+    await expect(by("delete_goal").execute({ goalId: dir.goalId }, ctx)).rejects.toThrow("不存在");
+    const goals = (await by("query_ledger").execute({ what: "goals" }, ctx)) as { directions: unknown[] };
+    expect(goals.directions).toHaveLength(0);
+  });
+
+  it("update_goal 空串语义与弃用标注写入 schema；update_plan 进装配清单", async () => {
+    const { by } = await freshTools();
+    const schema = JSON.stringify(by("update_goal").parameters);
+    expect(schema).toContain("空串 = 解除父级");
+    expect(schema).toContain("已弃用");
+    expect(by("update_plan").name).toBe("update_plan");
+    expect(JSON.stringify(by("checkin_plan").parameters)).toContain("补卡日期");
+  });
+});
+
 describe("defaultAssistantPrompt", () => {
   it("注入当地日期与星期、写账纪律与工具名，零预设分类", () => {
     const prompt = defaultAssistantPrompt({ now: () => NOW, tzOffsetMinutes: 480 });
@@ -228,5 +412,46 @@ describe("defaultAssistantPrompt", () => {
     expect(prompt).toContain("record_flow");
     expect(prompt).toContain("query_ledger");
     expect(prompt).not.toContain("健身"); // 不举例任何默认分类
+  });
+});
+
+describe("撤历史卡闭环（2026-09-29：today 的 checkins 提供凭据）", () => {
+  it("补周一的卡 → today checkins 给非今日 seq → void_flow 作废 → 周期判定从进行中回退待做", async () => {
+    const { by } = await freshTools();
+    const plan = (await by("create_plan").execute({ title: "背单词", scope: "week" }, ctx)) as { planId: string };
+    await by("checkin_plan").execute({ planId: plan.planId, date: "2026-09-01" }, ctx); // 周二（锚周内非今日，任何机器时区下都成立）
+    const read = () =>
+      by("query_ledger").execute({ what: "today" }, ctx) as Promise<{
+        plans: { planId: string; state: string; checkins?: { seq: number; at: number }[] }[];
+      }>;
+    let today = await read();
+    const target = today.plans.find((p) => p.planId === plan.planId)!;
+    expect(target.state).toBe("doing"); // 本周有非今日打卡 → 进行中
+    expect(target.checkins).toHaveLength(1);
+    await by("void_flow").execute({ seq: target.checkins![0]!.seq, reason: "那天其实没背" }, ctx);
+    today = await read();
+    expect(today.plans.find((p) => p.planId === plan.planId)!.state).toBe("todo"); // 历史卡撤掉 → 回到待做
+  });
+});
+
+describe("档案时区口径（2026-09-29：tzOffsetMinutes 注入）", () => {
+  it("tz=480：today/flows 按东八区日界折叠；缺省不传仍 UTC（现状兼容）", async () => {
+    const NOW2 = Date.UTC(2026, 8, 3, 18, 0, 0); // UTC 9-3 18:00 = 东八区 9-4 02:00
+    const ledger = await Ledger.open(testDb(), "u-tz");
+    const tools = createLedgerTools({ ledger, now: () => NOW2, tzOffsetMinutes: () => 480 });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    await ledger.append({ kind: "event", source: "ui", time: Date.UTC(2026, 8, 3, 16, 30), category: "夜宵" }, NOW2); // 东八区 9-4 00:30
+    const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { date: string; flows: { category: string }[] };
+    expect(today.date).toBe("2026-09-04");
+    expect(today.flows.map((f) => f.category)).toContain("夜宵");
+    const flowsFrom4 = (await by("query_ledger").execute({ what: "flows", from: "2026-09-04" }, ctx)) as { flows: { category: string }[] };
+    expect(flowsFrom4.flows.some((f) => f.category === "夜宵")).toBe(true); // 东八区口径下属 9-4
+    const flowsFrom5 = (await by("query_ledger").execute({ what: "flows", from: "2026-09-05" }, ctx)) as { flows: unknown[] };
+    expect(flowsFrom5.flows).toHaveLength(0);
+    const ledgerUtc = await Ledger.open(testDb(), "u-tz-2");
+    await ledgerUtc.append({ kind: "event", source: "ui", time: Date.UTC(2026, 8, 3, 16, 30), category: "夜宵" }, NOW2);
+    const toolsUtc = createLedgerTools({ ledger: ledgerUtc, now: () => NOW2 });
+    const todayUtc = (await toolsUtc.find((t) => t.name === "query_ledger")!.execute({ what: "today" }, ctx)) as { date: string };
+    expect(todayUtc.date).toBe("2026-09-03"); // 缺省 UTC：同一时刻的"今天"还是 9-3
   });
 });

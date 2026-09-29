@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type GoalNodeLoose, type GoalsPageLoose } from "../api";
+import { todayLocal, daysUntil } from "../days";
 import { CheckSolidIcon } from "../icons";
 
 const LEVEL_LABEL: Record<GoalNodeLoose["level"], string> = {
@@ -21,10 +22,9 @@ function pct(rate: number): string {
 
 function daysLeft(due: string): number | null {
   if (due === "") return null;
-  const today = new Date();
   const dueDate = new Date(`${due}T00:00:00`);
   if (Number.isNaN(dueDate.getTime())) return null;
-  return Math.floor((dueDate.getTime() - new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) / 86400000);
+  return daysUntil(due, todayLocal()); // 共享日差（评审 M4：与今天页同语义，DST 不漂移）
 }
 
 /** 进度条：里程碑完成度（无里程碑时隐藏，不给无意义的空条） */
@@ -113,24 +113,83 @@ function GoalForm({
  * 里程碑行：点圈打卡；撤销 = 作废那条打卡记录（#A，2026-09-28）。
  * 里程碑完成判定是 doneEver（打过一次就算），追加 done:false 打卡不会撤销它——所以撤销走账本作废回路，历史留痕。
  * 无存活打卡 seq（旧服务端）时退化为静态完成态，不给"可点"的假象。
+ * 2026-09-29：根元素 button→div（行内要嵌「编辑」按钮，HTML 不允许 button 套 button）；编辑 = updatePlan（planId 稳定）。
  */
 function MilestoneRow({ planId, title, due, done, doneSeqs, isNext = false, onChanged }: { planId: string; title: string; due: string; done: boolean; doneSeqs: number[]; isNext?: boolean; onChanged: () => void }) {
   const left = daysLeft(due);
   const undoable = done && doneSeqs.length > 0;
+  const frozen = done && !undoable;
+  const [editing, setEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(title);
+  const [dueDraft, setDueDraft] = useState(due);
+  const [busy, setBusy] = useState(false);
   const toggle = async () => {
-    if (done) {
-      for (const seq of doneSeqs) await api.voidRecord(seq);
-    } else {
-      await api.checkin(planId, true);
+    try {
+      if (done) {
+        for (const seq of doneSeqs) await api.voidRecord(seq);
+      } else {
+        await api.checkin(planId, true);
+      }
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    }
+    onChanged();
+  };
+  const save = async () => {
+    if (titleDraft.trim() === "") {
+      window.alert("标题不能为空");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.updatePlan(planId, { title: titleDraft.trim(), ...(dueDraft !== "" ? { due: dueDraft } : {}) });
+      setEditing(false);
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
     }
     onChanged();
   };
   const hint = done ? (undoable ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "已完成") : "点击打卡";
+  if (editing) {
+    const field = "min-w-0 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-accent";
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-lg bg-surface px-2 py-1.5">
+        <input className={`${field} flex-1`} value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)} placeholder="打卡点标题" />
+        <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="截止日" />
+        <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
+          保存
+        </button>
+        <button
+          className="text-xs text-ink3 transition hover:text-ink"
+          onClick={() => {
+            setEditing(false);
+            setTitleDraft(title);
+            setDueDraft(due);
+          }}
+        >
+          取消
+        </button>
+      </div>
+    );
+  }
   return (
-    <button
-      className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60 disabled:cursor-default disabled:hover:bg-transparent"
-      disabled={done && !undoable}
-      onClick={() => void toggle()}
+    <div
+      className={`flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition ${frozen ? "cursor-default" : "cursor-pointer hover:bg-surface2/60"}`}
+      role="button"
+      tabIndex={frozen ? -1 : 0}
+      aria-disabled={frozen}
+      onClick={() => {
+        if (frozen) return;
+        void toggle();
+      }}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && !frozen) {
+          e.preventDefault();
+          void toggle();
+        }
+      }}
       title={hint}
     >
       {done ? (
@@ -148,7 +207,17 @@ function MilestoneRow({ planId, title, due, done, doneSeqs, isNext = false, onCh
           {!done && left !== null && left < 0 ? " · 逾期" : !done && left !== null && left <= 3 ? " · 临近" : ""}
         </span>
       )}
-    </button>
+      <button
+        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-surface2 hover:text-ink"
+        title="编辑标题/截止日（planId 不变，历史打卡保留）"
+        onClick={(e) => {
+          e.stopPropagation();
+          setEditing(true);
+        }}
+      >
+        编辑
+      </button>
+    </div>
   );
 }
 
@@ -176,17 +245,21 @@ function PhaseCard({ node, milestones, onChanged }: { node: GoalNodeLoose; miles
     onChanged();
   };
 
-  /** 旧「唯一下一步」文字 → 今天的打卡点 + 清空字段（迁移一次性，转完这行就没了） */
+  /** 旧「唯一下一步」文字 → 今天的打卡点 + 清空字段（迁移一次性，转完这行就没了）；失败可见不静默（评审 2026-09-29） */
   const convertNextStep = async () => {
     if (converting || !node.nextStep) return;
     setConverting(true);
     try {
-      await api.createPlan({ title: node.nextStep, scope: "deadline", due: new Date().toISOString().slice(0, 10), goalId: node.goalId });
+      const d = new Date(); // 本地日期（UTC 的 toISOString 在东八区 0-8 点会给出"昨天"，评审 C3）
+      const due = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      await api.createPlan({ title: node.nextStep, scope: "deadline", due, goalId: node.goalId });
       await api.updateGoal(node.goalId, { nextStep: "" });
-      onChanged();
+    } catch (e) {
+      window.alert(String((e as Error).message));
     } finally {
       setConverting(false);
     }
+    onChanged(); // 两步非原子：中途失败也刷新，已建的打卡点可见、旧文字仍在可重试
   };
 
   return (
