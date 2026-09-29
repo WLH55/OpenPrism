@@ -367,7 +367,7 @@ const BUILTIN_TASK_DEFS: ReadonlyArray<{
     builtin: "daily-brief",
     title: "每日简报",
     instruction:
-      "生成今日简报：先用 query_ledger 查 what=today（含 top3 与 goalCard），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 各阶段第一条未完成打卡点（下一步）的推进建议；4) 一句对齐提醒——今天的行动和长期方向是什么关系。语气温和，最后提醒可以去 web 端「今天/计划」页看完整视图。",
+      "生成今日简报：先用 query_ledger 查 what=today（含 top3），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 一个今日聚焦建议——从待做计划里挑最值得先动的一件。语气温和，最后提醒可以去 web 端「今天」页看完整视图。",
     trigger: { kind: "daily", time: "08:30" },
   },
   {
@@ -381,7 +381,7 @@ const BUILTIN_TASK_DEFS: ReadonlyArray<{
     builtin: "weekly-review",
     title: "每周复盘",
     instruction:
-      "每周复盘时间。先用 query_ledger 查 what=today 与 what=goals。计划载荷含近 30 天完成存档（每条带 doneAt 完成时刻），从中按 doneAt 归类自然周即可得到本周/上周完成数——数字只能来自载荷，数据不足就明说，不要编。给出：1) 本周完成 vs 上周（含仍在逾期与进行中的事项）；2) what=goals 里各方向里程碑推进情况；3) 一条本周行为观察（可参考本周流水规律）；4) 下周最值得聚焦的一件事及原因。最后问用户下周想重点推进什么——回复可顺势落成新计划。",
+      "每周复盘时间。先用 query_ledger 查 what=today 与 what=plans。today 载荷的计划含近 30 天完成存档（每条带 doneAt 完成时刻），按 doneAt 归类自然周即可得到本周/上周完成数——数字只能来自载荷，数据不足就明说，不要编。给出：1) 本周完成 vs 上周（含仍在逾期与进行中的事项）；2) 一条本周行为观察（可参考本周流水规律）；3) 下周最值得聚焦的一件事及原因。最后问用户下周想重点推进什么——回复可顺势落成新计划。",
     trigger: { kind: "weekly", days: [7], time: "21:00" },
   },
 ];

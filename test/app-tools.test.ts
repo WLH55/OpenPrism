@@ -106,25 +106,20 @@ describe("void_flow / cancel_plan（作废回路，2026-09-04 补）", () => {
 });
 
 describe("工具契约", () => {
-  it("十工具齐备；写工具 exclusive、查询 parallel", async () => {
+  it("七工具齐备（目标层级 2026-09-30 下线，goal 三件移除）；写工具 exclusive、查询 parallel", async () => {
     const { tools, by } = await freshTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "cancel_plan",
       "checkin_plan",
-      "create_goal",
       "create_plan",
-      "delete_goal",
       "query_ledger",
       "record_flow",
-      "update_goal",
       "update_plan",
       "void_flow",
     ]);
     expect(by("record_flow").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("void_flow").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("update_plan").isConcurrencySafe?.({})).toBeFalsy();
-    expect(by("create_goal").isConcurrencySafe?.({})).toBeFalsy();
-    expect(by("update_goal").isConcurrencySafe?.({})).toBeFalsy();
     expect(by("query_ledger").isConcurrencySafe?.({})).toBe(true);
   });
 
@@ -137,89 +132,21 @@ describe("工具契约", () => {
   });
 });
 
-describe("create_goal / update_goal / query_ledger what=goals（B2，2026-09-28）", () => {
-  it("层级规则：phase 必须挂 direction；project 挂 phase/direction；direction 不允许 parentId", async () => {
+describe("目标层级下线（2026-09-30 SDD）：goal 工具不存在、goalId 入参明确报错、what=goals 下线", () => {
+  it("create_plan/update_plan 传 goalId → 明确报错而非静默忽略（防老对话上下文错行为）", async () => {
     const { by } = await freshTools();
-    const direction = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    await expect(by("create_goal").execute({ level: "phase", title: "8 周减脂" }, ctx)).rejects.toThrow("parentId");
-    await expect(
-      by("create_goal").execute({ level: "phase", title: "阶段", parentId: "goal-nope" }, ctx),
-    ).rejects.toThrow("不存在");
-    const phase = (await by("create_goal").execute({ level: "phase", title: "8 周减脂", parentId: direction.goalId, nextStep: "约教练" }, ctx)) as { goalId: string };
-    const project = (await by("create_goal").execute({ level: "project", title: "跑步计划", parentId: phase.goalId }, ctx)) as { goalId: string };
-    await expect(
-      by("create_goal").execute({ level: "project", title: "子项目", parentId: project.goalId }, ctx),
-    ).rejects.toThrow("project");
-    await expect(
-      by("create_goal").execute({ level: "direction", title: "带父的方向", parentId: direction.goalId }, ctx),
-    ).rejects.toThrow("不挂父级");
+    await expect(by("create_plan").execute({ title: "里程碑", scope: "deadline", due: "2026-10-15", goalId: "goal-any" }, ctx)).rejects.toThrow("已下线");
+    const plan = (await by("create_plan").execute({ title: "日记", scope: "day" }, ctx)) as { planId: string };
+    await expect(by("update_plan").execute({ planId: plan.planId, goalId: "goal-any" }, ctx)).rejects.toThrow("已下线");
+    await expect(by("update_plan").execute({ planId: plan.planId, goalId: "" }, ctx)).rejects.toThrow("已下线"); // 空串（原"解除挂载"语义）同样拒绝
   });
 
-  it("软约束不 block：前 3 个同层 active 无提醒，建第 4 个仍成功且回执带聚焦提醒", async () => {
+  it("query_ledger what=goals 报未知视角；schema 无 goalId 参数", async () => {
     const { by } = await freshTools();
-    for (let i = 1; i <= 3; i += 1) {
-      const r = (await by("create_goal").execute({ level: "direction", title: `方向${i}` }, ctx)) as { hint?: string };
-      expect(r.hint).toBeUndefined();
-    }
-    const fourth = (await by("create_goal").execute({ level: "direction", title: "方向4" }, ctx)) as { goalId: string; hint?: string };
-    expect(fourth.goalId).toMatch(/^goal-/); // 不 block
-    expect(fourth.hint).toContain("3 个"); // 提醒已有 3 个进行中
-  });
-
-  it("update_goal 修订 = 追加快照：未提供字段沿用当前值；非法 status 抛错", async () => {
-    const { ledger, by } = await freshTools();
-    const direction = (await by("create_goal").execute({ level: "direction", title: "健康", why: "精力" }, ctx)) as { goalId: string };
-    await by("update_goal").execute({ goalId: direction.goalId, title: "健康（修订）", status: "paused" }, ctx);
-    const updated = (await by("query_ledger").execute({ what: "goals" }, ctx)) as {
-      directions: { goalId: string; title: string; status: string; why?: string }[];
-    };
-    const node = updated.directions.find((d) => d.goalId === direction.goalId)!;
-    expect(node.title).toBe("健康（修订）");
-    expect(node.status).toBe("paused");
-    expect(node.why).toBe("精力"); // 未提供字段沿用
-    // 历史保留：两条 goal 快照都在账本里
-    const snapshots = ledger.readAll().filter((r) => r.kind === "goal");
-    expect(snapshots).toHaveLength(2);
-    await expect(by("update_goal").execute({ goalId: direction.goalId, status: "oops" }, ctx)).rejects.toThrow("status");
-    await expect(by("update_goal").execute({ goalId: "goal-nope", title: "x" }, ctx)).rejects.toThrow("不存在");
-  });
-
-  it("update_goal 换父级拒绝成环", async () => {
-    const { by } = await freshTools();
-    const d = (await by("create_goal").execute({ level: "direction", title: "方向" }, ctx)) as { goalId: string };
-    const p = (await by("create_goal").execute({ level: "phase", title: "阶段", parentId: d.goalId }, ctx)) as { goalId: string };
-    // 阶段想反过来当方向的父（层级违规先拦）；用两个 phase 互挂测环需先绕过层级——改为直接把方向挂到阶段下（层级违规）
-    await expect(by("update_goal").execute({ goalId: d.goalId, parentId: p.goalId }, ctx)).rejects.toThrow();
-  });
-
-  it("create_plan 挂 goalId（等价外键）：不存在拒绝；goalTitle 回执", async () => {
-    const { ledger, by } = await freshTools();
-    const direction = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    const plan = (await by("create_plan").execute({ title: "体测里程碑", scope: "deadline", due: "2026-10-15", goalId: direction.goalId }, ctx)) as {
-      planId: string;
-      goalTitle?: string;
-    };
-    expect(plan.goalTitle).toBe("健康");
-    const record = ledger.activeRecords().find((r) => r.kind === "plan") as { goalId?: string };
-    expect(record.goalId).toBe(direction.goalId);
-    await expect(
-      by("create_plan").execute({ title: "幽灵", scope: "day", goalId: "goal-nope" }, ctx),
-    ).rejects.toThrow("不存在");
-  });
-
-  it("query_ledger what=goals 返回层级树 + 进度", async () => {
-    const { by } = await freshTools();
-    const d = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    const p = (await by("create_goal").execute({ level: "phase", title: "8 周减脂", parentId: d.goalId, nextStep: "约教练" }, ctx)) as { goalId: string };
-    await by("create_plan").execute({ title: "里程碑", scope: "deadline", due: "2026-10-15", goalId: p.goalId }, ctx);
-    const plan = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string }[] };
-    await by("checkin_plan").execute({ planId: plan.plans[0]!.planId }, ctx);
-    const view = (await by("query_ledger").execute({ what: "goals" }, ctx)) as {
-      directions: { title: string; children: { title: string; progress: { done: number; total: number } }[]; progress: { done: number; total: number } }[];
-    };
-    const direction = view.directions[0]!;
-    expect(direction.children[0]!.title).toBe("8 周减脂");
-    expect(direction.progress).toEqual({ done: 1, total: 1, rate: 1 }); // 里程碑打卡冒泡到方向
+    await expect(by("query_ledger").execute({ what: "goals" }, ctx)).rejects.toThrow("today | plans | flows");
+    expect(JSON.stringify(by("create_plan").parameters)).not.toContain("goalId");
+    expect(JSON.stringify(by("update_plan").parameters)).not.toContain("goalId");
+    expect(JSON.stringify(by("query_ledger").parameters)).not.toContain("goalId");
   });
 });
 
@@ -239,28 +166,26 @@ describe("update_plan（2026-09-29 账本工具能力补全）", () => {
     expect(ledger.readAll().filter((r) => r.kind === "void")).toHaveLength(1);
   });
 
-  it("goalId 换挂与空串解除挂载；已打的卡不因修订丢失", async () => {
-    const { by } = await freshTools();
-    const d1 = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    const d2 = (await by("create_goal").execute({ level: "direction", title: "学习" }, ctx)) as { goalId: string };
-    const plan = (await by("create_plan").execute({ title: "里程碑", scope: "deadline", due: "2026-10-01", goalId: d1.goalId }, ctx)) as { planId: string };
-    await by("checkin_plan").execute({ planId: plan.planId }, ctx);
-    await by("update_plan").execute({ planId: plan.planId, goalId: d2.goalId }, ctx);
-    const scoped = (await by("query_ledger").execute({ what: "plans", goalId: d2.goalId }, ctx)) as { plans: { planId: string }[] };
-    expect(scoped.plans.map((p) => p.planId)).toContain(plan.planId);
-    await by("update_plan").execute({ planId: plan.planId, goalId: "" }, ctx);
-    const afterDetach = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; goalId?: string }[] };
-    expect(afterDetach.plans.find((p) => p.planId === plan.planId)!.goalId).toBeUndefined();
+  it("修订剥离历史 goalId（目标层级下线）：修订后的新版本不带 goalId，已打的卡不因修订丢失", async () => {
+    const { ledger, by } = await freshTools();
+    // 直写一笔带 goalId 的历史计划（工具面已无法产生，模拟存量数据）
+    const legacy = await ledger.append({ kind: "plan", source: "ui", planId: "plan-legacy01", title: "挂过树的旧打卡点", scope: "deadline", due: "2026-10-01", goalId: "goal-dead" }, 1000);
+    await by("checkin_plan").execute({ planId: "plan-legacy01" }, ctx);
+    await by("update_plan").execute({ planId: "plan-legacy01", title: "改名后的旧打卡点" }, ctx);
+    const after = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; title: string; goalId?: string }[] };
+    const row = after.plans.find((p) => p.planId === "plan-legacy01")!;
+    expect(row.title).toBe("改名后的旧打卡点");
+    expect(row.goalId).toBeUndefined(); // 修订即降级为独立计划（goalId 剥离）
     const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { plans: { planId: string; state: string }[] };
-    expect(today.plans.find((p) => p.planId === plan.planId)!.state).toBe("done");
+    expect(today.plans.find((p) => p.planId === "plan-legacy01")!.state).toBe("done"); // 打卡史保留
+    expect(ledger.readAll().some((r) => r.seq === legacy.seq && r.kind === "plan")).toBe(true); // 旧行留痕未删
   });
 
-  it("报错路径：planId 不存在 / scope 换 deadline 缺 due / goalId 不存在", async () => {
+  it("报错路径：planId 不存在 / scope 换 deadline 缺 due", async () => {
     const { by } = await freshTools();
     await expect(by("update_plan").execute({ planId: "plan-nope", title: "x" }, ctx)).rejects.toThrow("不存在");
     const plan = (await by("create_plan").execute({ title: "日记", scope: "day" }, ctx)) as { planId: string };
     await expect(by("update_plan").execute({ planId: plan.planId, scope: "deadline" }, ctx)).rejects.toThrow("due");
-    await expect(by("update_plan").execute({ planId: plan.planId, goalId: "goal-nope" }, ctx)).rejects.toThrow("不存在");
   });
 });
 
@@ -305,31 +230,26 @@ describe("checkin_plan 补卡 + void_flow 撤卡（2026-09-29）", () => {
     expect(await stateOf(dl.planId)).toBe("upcoming"); // due 在未来 → 打回未开始
   });
 
-  it("void_flow 指向 plan/goal seq → 报错引导专用工具", async () => {
+  it("void_flow 指向 plan/goal seq → 报错引导专用工具/历史休眠", async () => {
     const { ledger, by } = await freshTools();
     await by("create_plan").execute({ title: "跑步", scope: "day" }, ctx);
     const planSeq = ledger.activeRecords().find((r) => r.kind === "plan")!.seq;
     await expect(by("void_flow").execute({ seq: planSeq }, ctx)).rejects.toThrow("cancel_plan");
-    await by("create_goal").execute({ level: "direction", title: "健康" }, ctx);
-    const goalSeq = ledger.activeRecords().find((r) => r.kind === "goal")!.seq;
-    await expect(by("void_flow").execute({ seq: goalSeq }, ctx)).rejects.toThrow("update_goal");
+    // 历史 goal 行休眠保留（目标层级下线）：不可作废，报错明说
+    const goal = await ledger.append({ kind: "goal", source: "ui", goalId: "goal-hist", level: "direction", title: "健康", status: "active" }, 1000);
+    await expect(by("void_flow").execute({ seq: goal.seq }, ctx)).rejects.toThrow("已下线");
   });
 });
 
 describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
-  it("goalId 过滤只返回挂该目标的计划；limit 截断带 total/truncated；limit 非法拒绝", async () => {
+  it("plans 全量列出（goalId 过滤随目标层级下线）；limit 截断带 total/truncated；limit 非法拒绝", async () => {
     const { by } = await freshTools();
-    const d = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    await by("create_plan").execute({ title: "a", scope: "day", goalId: d.goalId }, ctx);
-    await by("create_plan").execute({ title: "b", scope: "week", goalId: d.goalId }, ctx);
+    await by("create_plan").execute({ title: "a", scope: "day" }, ctx);
+    await by("create_plan").execute({ title: "b", scope: "week" }, ctx);
     await by("create_plan").execute({ title: "c", scope: "day" }, ctx);
-    const scoped = (await by("query_ledger").execute({ what: "plans", goalId: d.goalId }, ctx)) as {
-      plans: { title: string }[];
-      total: number;
-      truncated: boolean;
-    };
-    expect(scoped.plans.map((p) => p.title).sort()).toEqual(["a", "b"]);
-    expect(scoped).toMatchObject({ total: 2, truncated: false });
+    const all = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { title: string }[]; total: number; truncated: boolean };
+    expect(all.plans.map((p) => p.title).sort()).toEqual(["a", "b", "c"]);
+    expect(all).toMatchObject({ total: 3, truncated: false });
     const limited = (await by("query_ledger").execute({ what: "plans", limit: 2 }, ctx)) as { plans: unknown[]; total: number; truncated: boolean };
     expect(limited.plans).toHaveLength(2);
     expect(limited).toMatchObject({ total: 3, truncated: true });
@@ -350,7 +270,7 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
     expect(limited).toMatchObject({ total: 3, truncated: true });
   });
 
-  it("render 四种视角均为人话摘要而非 JSON 串；凭据保留——today/plans 带 planId、goals/建方向带 goalId（评审 O8）", async () => {
+  it("render 三视角均为人话摘要而非 JSON 串；凭据保留——today/plans 带 planId（评审 O8；goals 视角随目标层级下线）", async () => {
     const { by } = await freshTools();
     await by("record_flow").execute({ category: "餐饮", value: 28 }, ctx);
     const created = (await by("create_plan").execute({ title: "读书", scope: "day" }, ctx)) as { planId: string };
@@ -359,66 +279,15 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
     expect(render(today)).toContain("1 笔流水");
     expect(render(today)).toContain("连续记录");
     expect(render(today)).toContain(created.planId); // 未完成计划行带 planId——取消/打卡要拿它调工具
+    expect(render(today)).not.toContain("方向进度"); // 目标层级话术零残留
+    expect(render(today)).not.toContain("阶段：");
     const plans = await by("query_ledger").execute({ what: "plans" }, ctx);
     expect(render(plans)).toContain("1 个计划");
     expect(render(plans)).toContain(created.planId); // plans 摘要同样保留凭据
     const flows = await by("query_ledger").execute({ what: "flows" }, ctx);
     expect(render(flows)).toContain("1 笔流水");
     expect(render(flows)).toContain("餐饮×1");
-
-    // goals 树逐行带 goalId——挂阶段（create_goal parentId）/挂计划（create_plan goalId）都靠它（真实事故 2026-09-29：
-    // 摘要只写「title 0/0」，agent 拿不到 ID 只能瞎猜 parentId，方向挂阶段失败）
-    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    const dirReceipt = (by("create_goal").output!.render!({}, dir) as { text: string }[])[0]!.text;
-    expect(dirReceipt).toContain(dir.goalId); // 建方向回执当场给 ID，不用再查一遍
-    const phase = (await by("create_goal").execute({ level: "phase", title: "减脂期", parentId: dir.goalId, due: "2026-10-15" }, ctx)) as { goalId: string };
-    await by("create_plan").execute({ title: "首次 5km", scope: "deadline", due: "2026-10-15", goalId: phase.goalId }, ctx);
-    const goals = await by("query_ledger").execute({ what: "goals" }, ctx);
-    const goalsText = render(goals);
-    expect(goalsText).toContain("1 个方向、1 个阶段");
-    expect(goalsText).toContain(`健康(${dir.goalId})`);
-    expect(goalsText).toContain(`减脂期(${phase.goalId}`); // 阶段行也带 ID——create_plan 挂阶段下要用
-    expect(goalsText).toContain("截止 2026-10-15");
-    // today 视角的方向进度/阶段行同样带 goalId（内置简报/晚间汇报直接引用）
-    const today2 = await by("query_ledger").execute({ what: "today" }, ctx);
-    const todayText = render(today2);
-    expect(todayText).toContain(`健康(${dir.goalId})`);
-    expect(todayText).toContain(`减脂期(${phase.goalId}`);
-    expect(todayText).toContain("下一步：首次 5km");
-    for (const value of [today, plans, flows, goals, today2]) expect(render(value)).not.toContain('{"');
-  });
-
-  it("update_goal 用弃用的 nextStep 时回执当面提醒（评审 O5）", async () => {
-    const { by } = await freshTools();
-    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    await by("update_goal").execute({ goalId: dir.goalId, nextStep: "约教练" }, ctx);
-    const blocks = by("update_goal").output.render!({ goalId: dir.goalId, nextStep: "约教练" }, { goalId: dir.goalId, title: "健康", status: "active" });
-    expect((blocks[0] as { text: string }).text).toContain("已弃用");
-    const clean = by("update_goal").output.render!({ goalId: dir.goalId }, { goalId: dir.goalId, title: "健康", status: "active" });
-    expect((clean[0] as { text: string }).text).not.toContain("已弃用"); // 没用弃用参数不唠叨
-  });
-
-  it("delete_goal：真删作废全部快照留痕、有子不放行、未知 404 同义报错（评审 O6）", async () => {
-    const { by } = await freshTools();
-    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
-    const phase = (await by("create_goal").execute({ level: "phase", title: "8 周减脂", parentId: dir.goalId }, ctx)) as { goalId: string };
-    await expect(by("delete_goal").execute({ goalId: dir.goalId }, ctx)).rejects.toThrow("先删除它们");
-    const deleted = (await by("delete_goal").execute({ goalId: phase.goalId, reason: "建错了" }, ctx)) as { voided: number };
-    expect(deleted.voided).toBe(1);
-    const gone = (await by("delete_goal").execute({ goalId: dir.goalId }, ctx)) as { voided: number };
-    expect(gone.voided).toBe(1);
-    await expect(by("delete_goal").execute({ goalId: dir.goalId }, ctx)).rejects.toThrow("不存在");
-    const goals = (await by("query_ledger").execute({ what: "goals" }, ctx)) as { directions: unknown[] };
-    expect(goals.directions).toHaveLength(0);
-  });
-
-  it("update_goal 空串语义与弃用标注写入 schema；update_plan 进装配清单", async () => {
-    const { by } = await freshTools();
-    const schema = JSON.stringify(by("update_goal").parameters);
-    expect(schema).toContain("空串 = 解除父级");
-    expect(schema).toContain("已弃用");
-    expect(by("update_plan").name).toBe("update_plan");
-    expect(JSON.stringify(by("checkin_plan").parameters)).toContain("补卡日期");
+    for (const value of [today, plans, flows]) expect(render(value)).not.toContain('{"');
   });
 });
 

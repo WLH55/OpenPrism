@@ -22,7 +22,6 @@ const TOP_KIND_LABEL: Record<TopItemLoose["kind"], string> = {
   overdue: "逾期",
   dueToday: "今日截止",
   today: "今日",
-  nextStep: "下一步",
 };
 
 /** 计划行（2026-09-29 提取为组件以承载行内交互）：打卡/撤销 + 编辑（标题/due，planId 稳定）+ 周期补卡（date ≤ 今天） */
@@ -167,7 +166,6 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
       )}
       <span className="min-w-0 flex-1">
         <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
-        {plan.goalTitle !== undefined && <span className="block truncate text-xs text-ink3">属于：{plan.goalTitle}</span>}
       </span>
       {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
       <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
@@ -210,11 +208,11 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
 }
 
 /** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新 */
-function Top3Card({ items, onCheckin, onOpenPlans }: { items: TopItemLoose[]; onCheckin: () => void; onOpenPlans: () => void }) {
+function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: () => void }) {
   if (items.length === 0) {
     return (
       <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
-        今天没有必须推进的事——去<span className="text-accent transition hover:text-accent2 cursor-pointer" onClick={onOpenPlans}>计划页</span>看看方向的下一步
+        今天没有必须推进的事——跟助手说一句想做的事，或往下看看待办
       </div>
     );
   }
@@ -228,16 +226,14 @@ function Top3Card({ items, onCheckin, onOpenPlans }: { items: TopItemLoose[]; on
             className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60"
             onClick={() => {
               if (item.planId !== undefined) void api.checkin(item.planId).then(onCheckin);
-              else onOpenPlans();
             }}
-            title={item.planId !== undefined ? "点击打卡" : "去计划页推进"}
+            title="点击打卡"
           >
             <span className="num flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-surface2 text-[11px] font-semibold text-ink2">
               {index + 1}
             </span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[15px] text-ink">{item.title}</span>
-              {item.goalTitle !== undefined && <span className="block truncate text-xs text-ink3">属于：{item.goalTitle}</span>}
             </span>
             <span
               className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
@@ -253,71 +249,8 @@ function Top3Card({ items, onCheckin, onOpenPlans }: { items: TopItemLoose[]; on
   );
 }
 
-/** 计划卡（B3）：3 方向 + 3 阶段 + 软约束提示；点击进计划页 */
-function GoalCard({
-  goalCard,
-  onOpenPlans,
-}: {
-  goalCard: TodayView["goalCard"];
-  onOpenPlans: () => void;
-}) {
-  if (goalCard.directions.length === 0 && goalCard.phases.length === 0) {
-    return (
-      <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
-        还没有长期方向——
-        <span className="cursor-pointer text-accent transition hover:text-accent2" onClick={onOpenPlans}>
-          建立第一个方向
-        </span>
-        ，让今天的行动连上去
-      </div>
-    );
-  }
-  return (
-    <section className="mb-5 rounded-xl border border-line bg-surface p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-ink">计划与方向</h2>
-        <button className="text-xs text-ink3 transition hover:text-ink" onClick={onOpenPlans}>
-          查看 →
-        </button>
-      </div>
-      {goalCard.warning !== undefined && <p className="mb-2 text-xs text-warm">{goalCard.warning}</p>}
-      <div className="flex flex-wrap gap-2">
-        {goalCard.directions.map((d) => (
-          <button
-            key={d.goalId}
-            onClick={onOpenPlans}
-            className="flex items-center gap-2 rounded-full border border-line px-3 py-1.5 text-xs text-ink2 transition hover:border-accent hover:text-ink"
-            title={d.progress.total > 0 ? `里程碑 ${d.progress.done}/${d.progress.total}` : "进计划页看详情"}
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-            {d.title}
-            {d.progress.total > 0 && (
-              <span className="num text-ink3">
-                {d.progress.done}/{d.progress.total}
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
-      {goalCard.phases.length > 0 && (
-        <div className="mt-2.5 space-y-1.5">
-          {goalCard.phases.map((p) => (
-            <button key={p.goalId} onClick={onOpenPlans} className="flex w-full items-center gap-2 rounded-lg px-1 py-1 text-left transition hover:bg-surface2/60">
-              <span className="min-w-0 flex-1 truncate text-sm text-ink">
-                阶段「{p.title}」
-                {p.nextStep !== undefined && <span className="text-ink3"> · 下一步：{p.nextStep}</span>}
-              </span>
-              {p.due !== undefined && <span className="num shrink-0 text-xs text-ink3">{p.due}</span>}
-            </button>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-/** 今天页：Top3 + 计划卡 + 快速记录 + 三统计卡 + 计划四段范围切换（今天/本周/全部/已完成，B4 2026-09-29） */
-export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
+/** 今天页：Top3 + 快速记录 + 三统计卡 + 计划四段范围切换（今天/本周/全部/已完成；计划管理唯一入口，2026-09-30 目标层级下线） */
+export function Today() {
   const [view, setView] = useState<TodayView | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
   const [category, setCategory] = useState("");
@@ -465,9 +398,8 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
         </div>
       )}
 
-      {/* 今日必做 + 计划与方向（B3）：先看要做什么，再看记了什么 */}
-      <Top3Card items={view.top3 ?? []} onCheckin={reload} onOpenPlans={onOpenPlans} />
-      <GoalCard goalCard={view.goalCard ?? { directions: [], phases: [] }} onOpenPlans={onOpenPlans} />
+      {/* 今日必做：先看要做什么，再看记了什么 */}
+      <Top3Card items={view.top3 ?? []} onCheckin={reload} />
 
       {/* 三统计卡（窄屏两列，第三张跨满行） */}
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3">
@@ -507,12 +439,9 @@ export function Today({ onOpenPlans }: { onOpenPlans: () => void }) {
         </div>
         <div className="space-y-1.5">
           {tabPlans.length === 0 && planTab === "today" && (
-            <button
-              className="w-full rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-left text-sm text-accent transition hover:border-accent"
-              onClick={onOpenPlans}
-            >
-              今天还没有计划——去计划页给阶段加个里程碑，或直接跟助手说一句
-            </button>
+            <div className="rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
+              今天还没有计划——直接跟助手说一句（如"明天背单词""周五前交报告"），它会帮你建好
+            </div>
           )}
           {tabPlans.length === 0 && planTab !== "today" && (
             <div className="rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">

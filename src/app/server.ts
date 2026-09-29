@@ -25,10 +25,9 @@ import {
   type ModelConfig,
 } from "./secretbox";
 import type { Ledger } from "./ledger";
-import { categoryView, goalView, listCategories, progressView, todayView } from "./fold";
-import { latestGoalSnapshots, validateGoalParenting } from "./goals";
+import { categoryView, listCategories, progressView, todayView } from "./fold";
 import { mergePlanUpdate, parseAt } from "./plans";
-import type { GoalRecord, PlanRecord } from "./ledger";
+import type { PlanRecord } from "./ledger";
 import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
 import { parseAttachments } from "./attachments";
 import { faceOf, readUserTz, updateUserFace, updateUserTz, validateTzOffsetMinutes, type UserRecord } from "./auth";
@@ -996,8 +995,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const ledger = await deps.ledgerFor(uid);
     const target = ledger.readAll().find((r) => r.seq === seq);
     if (!target) return sendError(res, 404, "seq 不存在");
-    // goal 不走作废口（#B，2026-09-28）：修订=PUT 追加快照不消耗 void；真删整个目标=DELETE /api/goals/:goalId
-    if (target.kind === "goal") return sendError(res, 400, "goal 条目不走 /api/void：修订用 PUT，真删用 DELETE /api/goals/:goalId");
+    // 历史 goal 行不可作废（目标层级 2026-09-30 下线）：休眠数据保持原样，审计可见
+    if (target.kind === "goal") return sendError(res, 400, "goal 条目已下线（历史数据休眠保留），不可作废");
     await ledger.append({ kind: "void", source: "ui", targetSeq: seq });
     return sendJson(res, 200, { ok: true });
   }
@@ -1028,34 +1027,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { ok: true, ts: record.ts });
   }
 
-  // ── 目标层级（2026-09-28 B2，SDD 个人工作台业务借鉴）：UI 写入 = 追加快照，修订不消耗 void ──
-  if (method === "GET" && path === "/api/goals") {
-    const tz = Number(url.searchParams.get("tz") ?? "0") || 0;
-    const ledger = await deps.ledgerFor(uid);
-    const records = ledger.readAll();
-    const view = goalView(records, deps.env.now(), tz);
-    // 里程碑明细：deadline 型 plan（挂目标树）+ 曾有 done 打卡；树里只有聚合进度，打卡按钮需要逐条
-    // doneSeqs = 该 planId 名下所有存活 done 打卡的 seq（#A，2026-09-28）：里程碑撤销 = 作废这些记录，而非追加 done:false（doneEver 语义下无效）
-    const voidedSeqs = new Set(records.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
-    const doneSeqs = new Map<string, number[]>();
-    for (const r of records) {
-      if (r.kind !== "checkin" || !r.done || voidedSeqs.has(r.seq)) continue;
-      const planId = (r as { planId: string }).planId;
-      const list = doneSeqs.get(planId) ?? [];
-      list.push(r.seq);
-      doneSeqs.set(planId, list);
-    }
-    const milestones = records
-      .filter((r) => r.kind === "plan" && !voidedSeqs.has(r.seq))
-      .map((r) => r as { planId: string; title: string; due?: string; goalId?: string; scope: string })
-      .filter((r) => r.scope === "deadline" && r.goalId !== undefined)
-      .map(({ planId, title, due, goalId }) => ({ planId, title, due: due ?? "", goalId: goalId!, done: doneSeqs.has(planId), doneSeqs: doneSeqs.get(planId) ?? [] }))
-      .sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
-    return sendJson(res, 200, { ...view, milestones });
-  }
-
   if (method === "POST" && path === "/api/plans") {
     const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const title = String(body.title ?? "").trim();
     if (title === "") return sendError(res, 400, "title 必填");
     const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
@@ -1070,9 +1044,6 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
     if (scope === "ndays" && (typeof body.ndays !== "number" || body.ndays < 1)) return sendError(res, 400, "scope=ndays 需要 ndays ≥ 1");
     const ledger = await deps.ledgerFor(uid);
-    if (body.goalId !== undefined && !latestGoalSnapshots(ledger.readAll()).has(body.goalId)) {
-      return sendError(res, 400, `goalId "${body.goalId}" 不存在`); // 等价外键（与 create_plan 工具同规）
-    }
     const record = await ledger.append({
       kind: "plan",
       source: "ui",
@@ -1081,7 +1052,6 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       scope,
       ...(body.due !== undefined && body.due !== "" ? { due: body.due } : {}),
       ...(body.ndays !== undefined ? { ndays: body.ndays } : {}),
-      ...(body.goalId !== undefined && body.goalId !== "" ? { goalId: body.goalId } : {}),
     });
     return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
   }
@@ -1092,11 +1062,12 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (planMatch && method === "PUT") {
     const planId = decodeURIComponent(planMatch[1]!);
     const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const ledger = await deps.ledgerFor(uid);
     const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
     if (!hit) return sendError(res, 404, `planId "${planId}" 不存在`);
     try {
-      const merged = mergePlanUpdate(hit as PlanRecord, body, latestGoalSnapshots(ledger.readAll()));
+      const merged = mergePlanUpdate(hit as PlanRecord, body);
       await ledger.append({ ...merged, kind: "plan", source: "ui" });
       await ledger.append({ kind: "void", source: "ui", targetSeq: hit.seq, reason: "更新计划" });
       return sendJson(res, 200, { ok: true, planId, title: merged.title });
@@ -1105,108 +1076,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
   }
 
-  if (method === "POST" && path === "/api/goals") {
-    const body = (await readBody(req)) as Record<string, unknown>;
-    const title = typeof body.title === "string" ? body.title.trim() : "";
-    if (title === "") return sendError(res, 400, "title 必填");
-    if (title.length > 200) return sendError(res, 400, "title 过长（≤200 字）");
-    const levels = ["direction", "phase", "project"] as const;
-    const level = levels.find((l) => l === body.level);
-    if (!level) return sendError(res, 400, `level 必须是 ${levels.join(" | ")}`);
-    // 自由文本字段：字符串 + 长度上限（防认证后无界落库/全量回显放大）
-    const text = (value: unknown, max = 2000): string | undefined => {
-      if (value === undefined) return undefined;
-      if (typeof value !== "string" || value.length > max) throw new Error(`字段需为不超过 ${max} 字的字符串`);
-      return value;
-    };
-    const ledger = await deps.ledgerFor(uid);
-    const latest = latestGoalSnapshots(ledger.readAll());
-    try {
-      const fields = {
-        ...(text(body.parentId, 200) !== undefined ? { parentId: text(body.parentId, 200) } : {}),
-        ...(text(body.why) !== undefined ? { why: text(body.why) } : {}),
-        ...(text(body.outcome) !== undefined ? { outcome: text(body.outcome) } : {}),
-        ...(text(body.metric) !== undefined ? { metric: text(body.metric) } : {}),
-        ...(text(body.due, 200) !== undefined ? { due: text(body.due, 200) } : {}),
-        ...(text(body.nextStep) !== undefined ? { nextStep: text(body.nextStep) } : {}),
-      };
-      validateGoalParenting(level, "", fields.parentId, latest);
-      const record = await ledger.append({
-        kind: "goal",
-        source: "ui",
-        goalId: `goal-${randomUUID().slice(0, 8)}`,
-        level,
-        title,
-        status: "active",
-        ...fields,
-      });
-      return sendJson(res, 200, { goalId: (record as { goalId: string }).goalId, ts: record.ts });
-    } catch (error) {
-      return sendError(res, 400, String((error as Error).message));
-    }
-  }
+  // 目标层级（方向/阶段/项目/打卡点）2026-09-30 下线（SDD 2026-09-30_00-29）：/api/goals 全套路由移除，
+  // 历史 goal 行在账本休眠保留；计划管理入口 = 「今天」页四范围 tab。
 
-  const goalMatch = /^\/api\/goals\/([^/]+)$/.exec(path);
-  if (goalMatch && method === "PUT") {
-    const goalId = decodeURIComponent(goalMatch[1]!);
-    const body = (await readBody(req)) as Record<string, string>;
-    const ledger = await deps.ledgerFor(uid);
-    const latest = latestGoalSnapshots(ledger.readAll());
-    const cur = latest.get(goalId);
-    if (!cur) return sendError(res, 404, "goalId 不存在");
-    const statuses = ["active", "paused", "done", "archived"] as const;
-    if (body.status !== undefined && !statuses.some((s) => s === body.status)) {
-      return sendError(res, 400, `status 必须是 ${statuses.join(" | ")}`);
-    }
-    // 字段校验（类型 + 长度上限，与 POST 同规）；title 空白串视为未提供
-    const text = (value: unknown, max = 2000): string | undefined => {
-      if (value === undefined) return undefined;
-      if (typeof value !== "string" || value.length > max) throw new Error(`字段需为不超过 ${max} 字的字符串`);
-      return value;
-    };
-    try {
-      const newTitle = typeof body.title === "string" ? body.title.trim() : undefined;
-      const parentIdRaw = text(body.parentId, 200);
-      const merged = {
-        ...cur,
-        ...(newTitle !== undefined && newTitle !== "" ? { title: newTitle } : {}),
-        ...(body.status !== undefined ? { status: body.status as GoalRecord["status"] } : {}),
-        ...(body.parentId !== undefined ? { ...(parentIdRaw === "" ? {} : { parentId: parentIdRaw }) } : {}),
-        ...(text(body.why) !== undefined ? { why: text(body.why) } : {}),
-        ...(text(body.outcome) !== undefined ? { outcome: text(body.outcome) } : {}),
-        ...(text(body.metric) !== undefined ? { metric: text(body.metric) } : {}),
-        ...(text(body.due, 200) !== undefined ? { due: text(body.due, 200) } : {}),
-        ...(text(body.nextStep) !== undefined ? { nextStep: text(body.nextStep) } : {}),
-      };
-      // 修订快照剥离旧凭据：seq/ts 由 append 重分配，source/actor 以本次 UI 写入为准（审计归位）
-      const { seq: _seq, ts: _ts, source: _source, actor: _actor, ...snapshot } = merged;
-      validateGoalParenting(snapshot.level, snapshot.goalId, snapshot.parentId, latest);
-      await ledger.append({ ...snapshot, kind: "goal", source: "ui" });
-      return sendJson(res, 200, { ok: true, goalId: snapshot.goalId, title: snapshot.title, status: snapshot.status });
-    } catch (error) {
-      return sendError(res, 400, String((error as Error).message));
-    }
-  }
-
-  // #B（2026-09-28）：goal 真删唯一入口——作废该 goalId 全部存活快照（留痕，与 /api/void 限流配套）
-  if (goalMatch && method === "DELETE") {
-    const goalId = decodeURIComponent(goalMatch[1]!);
-    const ledger = await deps.ledgerFor(uid);
-    const records = ledger.readAll();
-    const latest = latestGoalSnapshots(records);
-    if (!latest.has(goalId)) return sendError(res, 404, "goalId 不存在");
-    // 有存活子目标不放行：静默提根会偷偷改树结构，先删子再删父
-    if ([...latest.values()].some((g) => g.parentId === goalId)) {
-      return sendError(res, 400, "其下还有阶段/项目——先删除它们，再删这个目标");
-    }
-    const voidedSeqs = new Set(records.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
-    const seqs = records
-      .filter((r) => r.kind === "goal" && (r as { goalId: string }).goalId === goalId && !voidedSeqs.has(r.seq))
-      .map((r) => r.seq);
-    for (const seq of seqs) await ledger.append({ kind: "void", source: "ui", targetSeq: seq });
-    return sendJson(res, 200, { ok: true, voided: seqs.length });
-  }
-
+  // ── 定时任务（D6） ─────────────────────────────────────
 
   // ── 定时任务（D6） ─────────────────────────────────────
   if (path === "/api/tasks" && (method === "GET" || method === "POST")) {

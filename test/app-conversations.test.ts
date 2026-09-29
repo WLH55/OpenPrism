@@ -186,7 +186,7 @@ describe("ConversationStore（批次1 回归）", () => {
 });
 
 describe("ConversationStore（批次2：伙伴与装配）", () => {
-  it("默认助手：system 含默认身份；无绑定 → 四工具 + save_preference + 任务四件套，无 load_skill", async () => {
+  it("默认助手：system 含默认身份；无绑定 → 四工具 + save_preference + 任务四件套，无 load_skill；goal 三件随目标层级下线（2026-09-30）", async () => {
     const db = testDb();
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(db, mock.adapter as LlmAdapter);
@@ -197,7 +197,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_goal", "create_plan", "create_task", "delete_goal", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_goal", "update_plan", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_plan", "update_task", "void_flow",
     ]);
   });
 

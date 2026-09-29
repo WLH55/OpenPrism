@@ -1,61 +1,9 @@
 import { useEffect, useState } from "react";
-import { api, api4, type GoalNodeLoose, type ProgressLoose } from "../api";
+import { api4, type ProgressLoose } from "../api";
 import { catColor } from "../catcolor";
 
-/** 目标进度区（B4）：方向 + 里程碑完成度，点击进计划页 */
-function GoalProgress({ onOpenPlans }: { onOpenPlans: () => void }) {
-  const [goals, setGoals] = useState<GoalNodeLoose[] | null>(null);
-  useEffect(() => {
-    void api
-      .goals()
-      .then((view) => setGoals(view.directions.filter((d) => d.status === "active" || d.progress.total > 0)))
-      .catch(() => undefined);
-  }, []);
-  if (goals === null) return null;
-  if (goals.length === 0) {
-    return (
-      <section className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
-        还没有长期方向——
-        <button className="text-accent transition hover:text-accent2" onClick={onOpenPlans}>
-          建立第一个方向
-        </button>
-        ，成长从这里开始有坐标
-      </section>
-    );
-  }
-  return (
-    <section className="mb-5 rounded-xl border border-line bg-surface p-4">
-      <div className="mb-2.5 flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-ink">目标进度</h2>
-        <button className="text-xs text-ink3 transition hover:text-ink" onClick={onOpenPlans}>
-          计划页 →
-        </button>
-      </div>
-      <div className="space-y-2.5">
-        {goals.map((g) => (
-          <button key={g.goalId} onClick={onOpenPlans} className="w-full text-left">
-            <div className="flex items-baseline justify-between gap-2">
-              <span className="min-w-0 truncate text-sm text-ink">{g.title}</span>
-              {g.progress.total > 0 && (
-                <span className="num shrink-0 text-xs text-ink3">
-                  里程碑 {g.progress.done}/{g.progress.total}
-                </span>
-              )}
-            </div>
-            {g.progress.total > 0 && (
-              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-surface2">
-                <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${Math.round(g.progress.rate * 100)}%` }} />
-              </div>
-            )}
-          </button>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-/** 成长页（B4 升级）：四指标带基准 + 行为模式 + 目标进度；小图降为 sparkline（结构照 prototype 页 5 骨架） */
-export function Progress({ onOpenPlans }: { onOpenPlans: () => void }) {
+/** 成长页（B4 升级）：指标带基准 + 行为模式（目标进度区随目标层级 2026-09-30 下线移除） */
+export function Progress() {
   const [view, setView] = useState<ProgressLoose | null>(null);
 
   useEffect(() => {
@@ -100,9 +48,6 @@ export function Progress({ onOpenPlans }: { onOpenPlans: () => void }) {
         )}
       </section>
 
-      {/* 目标进度（B4） */}
-      <GoalProgress onOpenPlans={onOpenPlans} />
-
       {/* 完成率（本期计划）+ 周均基准 */}
       <section className="mb-5 rounded-xl border border-line bg-surface p-4">
         <h2 className="text-sm font-semibold text-ink">本周计划完成率</h2>
@@ -117,13 +62,7 @@ export function Progress({ onOpenPlans }: { onOpenPlans: () => void }) {
           <span className="num text-sm font-semibold text-ink">{ratePct}%</span>
         </div>
         {view.completion.total === 0 && (
-          <p className="mt-2 text-xs text-ink3">
-            还没有计划——
-            <button className="text-accent transition hover:text-accent2" onClick={onOpenPlans}>
-              去计划页
-            </button>
-            给阶段加个里程碑，或跟助手说一句
-          </p>
+          <p className="mt-2 text-xs text-ink3">还没有计划——直接跟助手说一句，它会帮你建好</p>
         )}
       </section>
 
