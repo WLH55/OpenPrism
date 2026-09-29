@@ -124,20 +124,20 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   // 内置三件套模板（评审 2026-09-29 #13 单源）：服务端 BUILTIN_TASK_DEFS 投影，模板按钮唯一文案来源
   const [templates, setTemplates] = useState<{ builtin: string; title: string; instruction: string; trigger: TaskTriggerLoose; label: string }[] | null>(null);
   useEffect(() => {
-    void api.taskTemplates().then(setTemplates).catch(() => undefined);
+    void api3.taskTemplates().then(setTemplates).catch(() => undefined);
   }, []);
   const applyTemplate = (t: { title: string; instruction: string; trigger: TaskTriggerLoose }): void => {
     setTitle(t.title);
     setInstruction(t.instruction);
     if (t.trigger.kind === "daily") {
       setSchedKind("daily");
-      const [h, m] = t.trigger.time.split(":");
+      const [h, m] = (t.trigger.time ?? "08:30").split(":");
       setHour(Number(h));
       setMinuteOfHour(Number(m));
     } else if (t.trigger.kind === "weekly") {
       setSchedKind("weekly");
       setWeekdays(t.trigger.days ?? [1]);
-      const [h, m] = t.trigger.time.split(":");
+      const [h, m] = (t.trigger.time ?? "21:00").split(":");
       setHour(Number(h));
       setMinuteOfHour(Number(m));
     }
