@@ -350,7 +350,7 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
     expect(limited).toMatchObject({ total: 3, truncated: true });
   });
 
-  it("render 四种视角均为人话摘要而非 JSON 串；凭据保留——today/plans 摘要带 planId（评审 O8）", async () => {
+  it("render 四种视角均为人话摘要而非 JSON 串；凭据保留——today/plans 带 planId、goals/建方向带 goalId（评审 O8）", async () => {
     const { by } = await freshTools();
     await by("record_flow").execute({ category: "餐饮", value: 28 }, ctx);
     const created = (await by("create_plan").execute({ title: "读书", scope: "day" }, ctx)) as { planId: string };
@@ -365,9 +365,27 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
     const flows = await by("query_ledger").execute({ what: "flows" }, ctx);
     expect(render(flows)).toContain("1 笔流水");
     expect(render(flows)).toContain("餐饮×1");
+
+    // goals 树逐行带 goalId——挂阶段（create_goal parentId）/挂计划（create_plan goalId）都靠它（真实事故 2026-09-29：
+    // 摘要只写「title 0/0」，agent 拿不到 ID 只能瞎猜 parentId，方向挂阶段失败）
+    const dir = (await by("create_goal").execute({ level: "direction", title: "健康" }, ctx)) as { goalId: string };
+    const dirReceipt = (by("create_goal").output!.render!({}, dir) as { text: string }[])[0]!.text;
+    expect(dirReceipt).toContain(dir.goalId); // 建方向回执当场给 ID，不用再查一遍
+    const phase = (await by("create_goal").execute({ level: "phase", title: "减脂期", parentId: dir.goalId, due: "2026-10-15" }, ctx)) as { goalId: string };
+    await by("create_plan").execute({ title: "首次 5km", scope: "deadline", due: "2026-10-15", goalId: phase.goalId }, ctx);
     const goals = await by("query_ledger").execute({ what: "goals" }, ctx);
-    expect(render(goals)).toContain("0 个方向");
-    for (const value of [today, plans, flows, goals]) expect(render(value)).not.toContain('{"');
+    const goalsText = render(goals);
+    expect(goalsText).toContain("1 个方向、1 个阶段");
+    expect(goalsText).toContain(`健康(${dir.goalId})`);
+    expect(goalsText).toContain(`减脂期(${phase.goalId}`); // 阶段行也带 ID——create_plan 挂阶段下要用
+    expect(goalsText).toContain("截止 2026-10-15");
+    // today 视角的方向进度/阶段行同样带 goalId（内置简报/晚间汇报直接引用）
+    const today2 = await by("query_ledger").execute({ what: "today" }, ctx);
+    const todayText = render(today2);
+    expect(todayText).toContain(`健康(${dir.goalId})`);
+    expect(todayText).toContain(`减脂期(${phase.goalId}`);
+    expect(todayText).toContain("下一步：首次 5km");
+    for (const value of [today, plans, flows, goals, today2]) expect(render(value)).not.toContain('{"');
   });
 
   it("update_goal 用弃用的 nextStep 时回执当面提醒（评审 O5）", async () => {
