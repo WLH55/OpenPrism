@@ -233,11 +233,19 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
   };
 
   /** query_ledger 人话回执：按返回体形状判别视角（today 带 date、plans/flows 各带同名数组、goals 带 directions）。
-   *  凭据保留（评审 agent-native O8，2026-09-29）：摘要必须带 planId——取消/打卡/改计划全靠它调工具，
+   *  凭据保留（评审 agent-native O8，2026-09-29）：摘要必须带 planId/goalId——取消/打卡/改计划/挂阶段全靠它调工具，
    *  纯计数会让晚间汇报承诺的"帮用户取消"在用户答应那一刻失败；top3/goalCard 是内置简报指令点名要的数据 */
+  type GoalLine = {
+    goalId?: string;
+    title: string;
+    status?: string;
+    due?: string;
+    progress?: { done: number; total: number };
+    children?: GoalLine[];
+  };
   const renderQuery = (_args: unknown, value: unknown): ContentBlock[] => {
     const v = value as {
-      directions?: { title: string; progress: { done: number; total: number } }[];
+      directions?: GoalLine[];
       activeDirectionCount?: number;
       activePhaseCount?: number;
       date?: string;
@@ -245,13 +253,25 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       flows?: { category: string }[];
       plans?: { planId?: string; title: string; state?: string; due?: string }[];
       top3?: { kind: string; title: string; planId?: string; due?: string }[];
-      goalCard?: { directions: { title: string; progress: { done: number; total: number } }[] };
+      goalCard?: {
+        directions: GoalLine[];
+        phases?: { goalId?: string; title: string; due?: string; nextStep?: string }[];
+      };
       total?: number;
       truncated?: boolean;
     };
     if (v.directions !== undefined) {
-      const lines = v.directions.map((d) => `${d.title} ${d.progress.done}/${d.progress.total}`).join("；");
-      return [{ type: "text", text: `${v.activeDirectionCount} 个方向、${v.activePhaseCount} 个阶段：${lines}` }];
+      // 层级树逐行带 goalId（挂阶段/挂计划/改目标全用它）；非 active 状态标注避免往暂停方向下挂新工作
+      const lines: string[] = [];
+      const walk = (node: GoalLine, depth: number): void => {
+        const prog = node.progress !== undefined ? ` ${node.progress.done}/${node.progress.total}` : "";
+        const due = node.due !== undefined ? ` 截止 ${node.due}` : "";
+        const status = node.status !== undefined && node.status !== "active" ? `，${node.status}` : "";
+        lines.push(`${"  ".repeat(depth)}${node.title}(${node.goalId ?? "?"}${status})${prog}${due}`);
+        for (const child of node.children ?? []) walk(child, depth + 1);
+      };
+      for (const d of v.directions) walk(d, 0);
+      return [{ type: "text", text: [`${v.activeDirectionCount} 个方向、${v.activePhaseCount} 个阶段`, ...lines].join("\n") }];
     }
     if (v.date !== undefined) {
       const undone = (v.plans ?? []).filter((p) => p.state !== "done");
@@ -271,7 +291,16 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       }
       const dirs = v.goalCard?.directions ?? [];
       if (dirs.length > 0) {
-        lines.push(`方向进度：${dirs.map((d) => `${d.title} ${d.progress.done}/${d.progress.total}`).join("；")}`);
+        lines.push(`方向进度：${dirs.map((d) => `${d.title}(${d.goalId ?? "?"}) ${d.progress?.done ?? 0}/${d.progress?.total ?? 0}`).join("；")}`);
+      }
+      const phases = v.goalCard?.phases ?? [];
+      if (phases.length > 0) {
+        lines.push(
+          `阶段：${phases
+            .slice(0, 5)
+            .map((p) => `${p.title}(${p.goalId ?? "?"}${p.due !== undefined ? `，截止 ${p.due}` : ""})${p.nextStep !== undefined ? ` 下一步：${p.nextStep}` : ""}`)
+            .join("；")}${phases.length > 5 ? ` 等 ${phases.length} 个` : ""}`,
+        );
       }
       return [{ type: "text", text: lines.join("\n") }];
     }
@@ -439,8 +468,8 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         properties: { goalId: { type: "string" }, title: { type: "string" }, hint: { type: "string" } },
       },
       render: (_args, value) => {
-        const v = value as { title: string; hint?: string };
-        return [{ type: "text", text: v.hint ? `已建目标「${v.title}」——${v.hint}` : `已建目标「${v.title}」` }];
+        const v = value as { goalId: string; title: string; hint?: string };
+        return [{ type: "text", text: `已建目标「${v.title}」（${v.goalId}）${v.hint ? `——${v.hint}` : ""}` }];
       },
     },
     async execute(args) {
