@@ -118,6 +118,22 @@ describe("TaskStore", () => {
     expect(await store.runs("u1", task.id)).toHaveLength(0);
   });
 
+  it("lastRuns（2026-09-30 失败反馈）：每任务只取最新一条，未跑过的不进 Map", async () => {
+    let seq = 0;
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => `tid-lr${++seq}` });
+    const a = await store.create("u1", { title: "a", instruction: "x", trigger: { kind: "daily", time: "08:00" } });
+    const b = await store.create("u1", { title: "b", instruction: "y", trigger: { kind: "daily", time: "09:00" } });
+    expect(await store.lastRuns("u1")).toEqual(new Map()); // 都没跑过
+    await store.recordRun("u1", a.id, { ts: 1, status: "ran" });
+    await store.recordRun("u1", a.id, { ts: 2, status: "failed", detail: "boom" }); // a 的最新一条
+    await store.recordRun("u1", b.id, { ts: 3, status: "ran" });
+    const last = await store.lastRuns("u1");
+    expect(last.get(a.id)).toEqual({ ts: 2, status: "failed", detail: "boom" });
+    expect(last.get(b.id)).toEqual({ ts: 3, status: "ran" });
+    expect(last.size).toBe(2);
+    expect(await store.lastRuns("u2")).toEqual(new Map()); // 用户隔离
+  });
+
   it("内置三件套（2026-09-29）：种三件时刻/tz/渠道正确、幂等、删除不复活（种子一次性）、未知 uid 不种", async () => {
     const db = testDb();
     db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
