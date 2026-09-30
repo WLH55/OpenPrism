@@ -512,7 +512,7 @@ export function Today() {
                 title={flow.category}
               />
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[15px] text-ink">{flow.note ?? flow.category}</div>
+                <div className="whitespace-pre-wrap break-words text-[15px] text-ink">{flow.note ?? flow.category}</div>
                 <div className="text-xs text-ink3">
                   {flow.category} · {hhmm(flow.time)}
                 </div>
