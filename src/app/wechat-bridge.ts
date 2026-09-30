@@ -22,6 +22,9 @@ interface WechatBindRow {
   ilink_user_id: string;
   state: "active" | "expired";
   bound_ts: number;
+  /** 最近一条入站消息的 context_token（2026-09-30）：任务推送复用的上下文锚，NULL = 用户从未对话过 */
+  last_context_token?: string | null;
+  last_msg_ts?: number | null;
 }
 
 interface RuntimeState {
@@ -186,6 +189,10 @@ export class WechatBridge {
   /** 一条入站消息 → 会话回合 → 回复推回（串行：回合跑完才处理下一条/下一轮拉取，天然保序） */
   private async handle(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage): Promise<void> {
     if (msg.fromUserId !== bind.ilink_user_id) return; // 非绑定微信用户：忽略（AC5）
+    // 上下文锚（2026-09-30）：入站即存——任务推送要用它挂上下文，空串凭空推送会被 iLink 拒（ret=-2 实锤）
+    this.deps.db
+      .prepare("UPDATE wechat_binds SET last_context_token = ?, last_msg_ts = ? WHERE uid = ?")
+      .run(msg.contextToken, this.now(), uid);
     await this.ensureFeed(uid);
     const cid = WECHAT_FEED_CID(uid);
     const agent = await this.deps.conversations.agent(uid, cid);
@@ -249,12 +256,14 @@ export class WechatBridge {
 
   // ── 主动推送（任务通知） ────────────────────────────────
 
-  /** 推文本到绑定微信；未绑定/过期/失败 → false（调用方静默退站内） */
+  /** 推文本到绑定微信；未绑定/过期/失败 → false（调用方静默退站内）。
+   * 上下文 = 最近入站消息的 contextToken（2026-09-30）：iLink 主动推送必须挂在用户消息的上下文上，
+   * 空串只在服务端恰好还有新鲜会话时侥幸放行——从不依赖运气，没存过就空串试一次，失败退站内。 */
   async pushToWechat(uid: string, text: string): Promise<boolean> {
     const bind = this.readBind(uid);
     if (!bind || bind.state !== "active") return false;
     try {
-      await this.client.sendMessage(bind.botToken, bind.ilink_user_id, "", text.slice(0, 500));
+      await this.client.sendMessage(bind.botToken, bind.ilink_user_id, bind.last_context_token ?? "", text.slice(0, 500));
       return true;
     } catch (error) {
       console.error("[wechat] 任务通知推送失败（静默退站内）:", error instanceof Error ? error.message : error);

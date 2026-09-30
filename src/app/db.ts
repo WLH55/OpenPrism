@@ -524,6 +524,10 @@ export function openDb(dbPath: string): DatabaseSync {
   // 习惯化 + 任务编辑新列（2026-09-30）：必须在 ensureGoalKind 之后——重建会 DROP 原表，先加的列会被带走
   ensureColumn(db, "ledger_entries", "times_per_period", "INTEGER");
   ensureColumn(db, "tasks", "customized", "INTEGER NOT NULL DEFAULT 0");
+  // 任务微信推送上下文锚（2026-09-30）：空 contextToken 凭空推送 iLink 可拒（ret=-2 prepare failed 实锤），
+  // 存最近入站消息的 token 供主动推送复用
+  ensureColumn(db, "wechat_binds", "last_context_token", "TEXT");
+  ensureColumn(db, "wechat_binds", "last_msg_ts", "INTEGER");
   migrateTaskFeedCid(db); // 提醒会话 cid 补 uid（存量改名，幂等，2026-09-30）
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
