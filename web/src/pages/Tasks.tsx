@@ -556,6 +556,8 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [draftTrigger, setDraftTrigger] = useState<TaskTriggerLoose | null>(null);
   const [schedKey, setSchedKey] = useState(0);
   const [editingId, setEditingId] = useState<string | null>(null);
+  // 指令行展开（2026-09-30 用户验收）：长指令截断后点不动看不到全文——点击这行在截断/完整间切换
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [agentId, setAgentId] = useState("");
   // 通知渠道（2026-09-27）：站内（默认）| 微信机器人（站内记录 + 微信推送；未绑定时到点只发站内）
   const [notifyChannel, setNotifyChannel] = useState<"inapp" | "wechat">("inapp");
@@ -642,7 +644,11 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               </span>
             )}
           </div>
-          <div className="truncate text-xs text-ink3">
+          <div
+            className={`${expandedId === task.id ? "whitespace-pre-wrap break-words" : "truncate"} cursor-pointer text-xs text-ink3`}
+            title={expandedId === task.id ? "点击收起" : "点击展开完整指令"}
+            onClick={() => setExpandedId(expandedId === task.id ? null : task.id)}
+          >
             {task.instruction}
             {task.lastRunTs ? ` · 上次 ${new Date(task.lastRunTs).toLocaleString()}` : " · 未跑过"}
           </div>
