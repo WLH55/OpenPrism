@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
 import { Ledger, type FlowRecord } from "../src/app/ledger";
 import { ConversationStore, ModelNotConfiguredError, ModelNotMultimodalError } from "../src/app/conversations";
+import { migrateTaskFeedCid } from "../src/app/db";
 import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
@@ -462,7 +463,7 @@ describe("ConversationStore（会话管理：删除 / 自动命名 / 定时提�
     await store.create(UID, "普通会话");
 
     const feed1 = await store.ensureTaskFeed(UID, coach.id);
-    expect(feed1.id).toBe(`feed:${coach.id}`);
+    expect(feed1.id).toBe(`feed:${UID}:${coach.id}`);
     expect(feed1.pinned).toBe(true);
     expect(feed1.title).toBe("教练 的定时提醒");
     const feed2 = await store.ensureTaskFeed(UID, coach.id);
@@ -473,9 +474,47 @@ describe("ConversationStore（会话管理：删除 / 自动命名 / 定时提�
     expect(list[0]!.id).toBe(feed1.id); // 置顶在前
 
     const defaultFeed = await store.ensureTaskFeed(UID, undefined);
-    expect(defaultFeed.id).toBe("feed:default");
+    expect(defaultFeed.id).toBe(`feed:${UID}:default`);
     expect(defaultFeed.title).toBe("定时提醒");
     expect(defaultFeed.pinned).toBe(true);
+  });
+
+  it("ensureTaskFeed：cid 带用户名——多用户各自独立，第二个用户不再因主键冲突崩溃（2026-09-30 生产事故回归）", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const other = "u-2";
+
+    const mine = await store.ensureTaskFeed(UID, undefined);
+    // 旧实现 cid = feed:default 全表主键，第二个用户走到这里 INSERT 被静默忽略、回查 undefined 崩
+    const theirs = await store.ensureTaskFeed(other, undefined);
+    expect(theirs.id).toBe(`feed:${other}:default`);
+    expect(theirs.id).not.toBe(mine.id);
+    expect((await store.list(other)).map((c) => c.id)).toEqual([theirs.id]);
+    // 再来一次复用不炸、id 不变
+    expect((await store.ensureTaskFeed(other, undefined)).id).toBe(theirs.id);
+  });
+});
+
+describe("migrateTaskFeedCid（存量提醒会话改名）", () => {
+  it("feed:<agentId|default> → feed:<uid>:<agentId|default>：会话与事件一并搬移，幂等", () => {
+    const db = testDb();
+    // openDb 已对新库跑过一遍迁移（无旧格式行，幂等通过）；这里手工造存量旧格式数据
+    db.prepare("INSERT INTO conversations (cid, uid, title, agent_id, pinned, created_ts) VALUES ('feed:default', 'u-a', '定时提醒', NULL, 1, 100)").run();
+    db.prepare("INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES ('feed:default', 0, 'user/message', 100, 'user', '{}')").run();
+    db.prepare("INSERT INTO conversations (cid, uid, title, agent_id, pinned, created_ts) VALUES ('feed:coach-1', 'u-a', '教练 的定时提醒', 'coach-1', 1, 101)").run();
+    // 非任务会话不受影响
+    db.prepare("INSERT INTO conversations (cid, uid, title, created_ts) VALUES ('wechat:u-a', 'u-a', '微信对话', 102)").run();
+
+    migrateTaskFeedCid(db);
+
+    const convs = (db.prepare("SELECT cid FROM conversations ORDER BY cid").all() as unknown as { cid: string }[]).map((r) => r.cid);
+    expect(convs).toEqual(["feed:u-a:coach-1", "feed:u-a:default", "wechat:u-a"]);
+    const evts = db.prepare("SELECT cid FROM conversation_events").all() as unknown as { cid: string }[];
+    expect(evts.map((r) => r.cid)).toEqual(["feed:u-a:default"]);
+
+    migrateTaskFeedCid(db); // 再跑一遍：无匹配行，无变化不报错
+    expect((db.prepare("SELECT COUNT(*) AS n FROM conversations WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*'").get() as unknown as { n: number }).n).toBe(0);
   });
 });
 
