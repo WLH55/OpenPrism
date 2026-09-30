@@ -1120,7 +1120,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── 定时任务（D6） ─────────────────────────────────────
   if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
-    if (method === "GET") return sendJson(res, 200, await deps.tasks.list(uid));
+    if (method === "GET") {
+      // 列表附每任务最近一次运行（2026-09-30）：触发失败在任务行直接可见，不用点开历史
+      const [tasks, lastRuns] = await Promise.all([deps.tasks.list(uid), deps.tasks.lastRuns(uid)]);
+      return sendJson(res, 200, tasks.map((task) => ({ ...task, lastRun: lastRuns.get(task.id) ?? null })));
+    }
     const body = (await readBody(req)) as Record<string, unknown>;
     // id/builtin 是服务端专属（评审 2026-09-29 B3）：客户端提供的 id 会撞全局主键（内置确定性 id 可被抢占致种子永久卡死）、
     // builtin 可伪造「内置」徽标——HTTP 边界一律剥离，服务端自行分配
