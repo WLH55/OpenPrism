@@ -14,6 +14,7 @@ type RenderItem =
   | { kind: "user"; key: string; text: string; images: BlockLoose[]; files: string[] }
   | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean }
   | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
+  | { kind: "turn-error"; key: string }
   | { kind: "switch"; key: string; label: string };
 
 /** 等待队列条目（2026-09-27）：AI 输出期间发送的消息（文本 + 附件），排队在输入框上方 */
@@ -63,6 +64,9 @@ function foldEvents(
         pending.ok = !event.isError;
         pending.text = (event.content ?? []).map((b) => b.text ?? "").join("") || (event.isError ? "失败" : "完成");
       }
+    } else if (event.type === "turn/end" && event.reason === "error") {
+      // 失败回合持久标记：错误详情只在直播流里（不落日志），重载后至少留痕
+      items.push({ kind: "turn-error", key: `te${event.seq}` });
     }
   }
   return items;
@@ -342,17 +346,24 @@ export function Chat({
         setStream(null);
       } else if (event.type === "turn-end" || event.type === "error" || event.type === "budget-exhausted") {
         setStream(null);
-        if (event.type === "error" && event.error === "model_not_configured") {
-          setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
+        if (event.type === "error") {
+          setBanner(
+            event.error === "model_not_configured"
+              ? "还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型"
+              : `回复失败：${event.error ?? "未知错误"}`,
+          );
+        } else if (event.type === "turn-end" && event.reason === "error") {
+          // error 事件先到时已带详情；直播断线错过 error 的场景在这里兜底
+          setBanner((cur) => cur ?? "这一回合回复失败");
         } else {
           setBanner(null);
-          void loadEvents(activeConvId).catch(() => undefined);
-          // 首回合后自动命名（后端只对默认标题生效）；失败静默，标题回退为消息截断
-          void api
-            .autoTitle(activeConvId)
-            .then(() => reloadConversations())
-            .catch(() => undefined);
         }
+        void loadEvents(activeConvId).catch(() => undefined);
+        // 首回合后自动命名（后端只对默认标题生效）；失败静默，标题回退为消息截断
+        void api
+          .autoTitle(activeConvId)
+          .then(() => reloadConversations())
+          .catch(() => undefined);
         settleAndFlush();
       } else if (event.type === "tool-call") {
         setItems((prev) => [
@@ -629,6 +640,12 @@ export function Chat({
               <div key={item.key} className="flex items-center gap-3 text-xs text-ink3">
                 <span className="h-px flex-1 bg-line" />
                 {item.label}
+                <span className="h-px flex-1 bg-line" />
+              </div>
+            ) : item.kind === "turn-error" ? (
+              <div key={item.key} className="flex items-center gap-3 text-xs text-warm">
+                <span className="h-px flex-1 bg-line" />
+                ⚠️ 这一回合回复失败
                 <span className="h-px flex-1 bg-line" />
               </div>
             ) : item.kind === "user" ? (
