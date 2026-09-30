@@ -182,6 +182,57 @@ describe("TaskStore", () => {
     ).rejects.toThrow();
   });
 
+  it("任务编辑与 customized 标记（2026-09-30 任务编辑入口，AC5/AC6）：改文案不被启动同步覆盖，恢复默认一键还原", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-edit" });
+    await store.ensureBuiltins("u1");
+    const brief = (await store.list("u1")).find((t) => t.builtin === "daily-brief")!;
+
+    // 改指令（≠ DEFS 副本）→ customized 置位；ensureBuiltins 跳过该行（不再覆盖用户文案）
+    const edited = await store.update("u1", brief.id, { instruction: "我的自定义简报口径" });
+    expect(edited.customized).toBe(true);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect((await store.get("u1", brief.id))!.instruction).toBe("我的自定义简报口径");
+    expect((await store.get("u1", brief.id))!.customized).toBe(true);
+
+    // 未自定义的内置行照常同步：把 daily-report 改成旧口径 → 只有它被同步（brief 跳过）
+    db.prepare("UPDATE tasks SET instruction = '旧口径' WHERE uid = 'u1' AND builtin = 'daily-report'").run();
+    expect(await store.ensureBuiltins("u1")).toBe(1);
+    expect((await store.get("u1", brief.id))!.instruction).toBe("我的自定义简报口径"); // 用户的版本优先
+
+    // resetInstruction：还原 DEFS 副本并清除标记（恢复同步）
+    const restored = await store.update("u1", brief.id, { resetInstruction: true });
+    expect(restored.customized).toBeUndefined();
+    expect(restored.instruction).not.toBe("我的自定义简报口径");
+    expect(await store.ensureBuiltins("u1")).toBe(0); // 已是副本原文，幂等
+
+    // 把文案改回 DEFS 副本原文 = 自动恢复同步（customized 清除）
+    await store.update("u1", brief.id, { instruction: "再自定义一下" });
+    expect((await store.get("u1", brief.id))!.customized).toBe(true);
+    await store.update("u1", brief.id, { instruction: restored.instruction });
+    expect((await store.get("u1", brief.id))!.customized).toBeUndefined();
+
+    // 非内置任务 resetInstruction 明确报错；非内置改指令不置 customized
+    const custom = await store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "09:00" } });
+    await expect(store.update("u1", custom.id, { resetInstruction: true })).rejects.toThrow("只适用于内置任务");
+    expect((await store.update("u1", custom.id, { instruction: "z" })).customized).toBeUndefined();
+
+    // patch 白名单：HTTP 透传的多余键（id/builtin/customized）不注入任务
+    const hacked = (await store.update("u1", custom.id, {
+      title: "新标题",
+      ...({ id: "hack", builtin: "daily-brief", customized: true } as Record<string, unknown>),
+    } as never)) as typeof custom & { customized?: boolean };
+    expect(hacked.title).toBe("新标题");
+    expect(hacked.id).toBe(custom.id);
+    expect(hacked.builtin).toBeUndefined();
+    expect(hacked.customized).toBeUndefined();
+
+    // 空 title/空 instruction 拒绝（编辑入口收口）
+    await expect(store.update("u1", custom.id, { title: "  " })).rejects.toThrow("title");
+    await expect(store.update("u1", custom.id, { instruction: "" })).rejects.toThrow("instruction");
+  });
+
   it("updateLastRun 推进锚点并持久（同库新实例可见）", async () => {
     const db = testDb();
     const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-2" });

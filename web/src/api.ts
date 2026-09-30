@@ -55,6 +55,9 @@ export interface TodayPlanView {
   doneAt?: number;
   /** 今天完成的确定性标记（评审 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天（上周完成的里程碑 state=done 但 doneToday=false） */
   doneToday?: boolean;
+  /** 习惯计划（2026-09-30）：配额与当前周期进度，成对出现——day=今日打卡次数；week/month/year=本期不同本地日数 */
+  timesPerPeriod?: number;
+  periodCount?: number;
 }
 
 export interface TodayFlowView {
@@ -82,6 +85,8 @@ export interface TopItemLoose {
   title: string;
   planId?: string;
   due?: string;
+  /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
+  progress?: string;
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
@@ -371,6 +376,8 @@ export interface TaskLoose {
   notifyChannel?: "inapp" | "wechat";
   /** 内置任务标记（2026-09-29）：daily-brief | daily-report | weekly-review——UI 带「内置」徽标 */
   builtin?: string;
+  /** 内置任务指令已被用户改过（2026-09-30 任务编辑）：启动同步跳过；「恢复默认文案」可清除 */
+  customized?: boolean;
   lastRunTs?: number;
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
@@ -423,7 +430,7 @@ export interface NotificationLoose {
 export const api3 = {
   listTasks: () => request<TaskLoose[]>("/api/tasks"),
   createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string; notifyChannel?: "inapp" | "wechat" }) =>    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
-  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title" | "notifyChannel">> & { trigger?: TaskTriggerLoose }) =>
+  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title" | "notifyChannel">> & { trigger?: TaskTriggerLoose; resetInstruction?: boolean }) =>
     request<TaskLoose>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
   /** 内置三件套模板投影（评审 #13 单源）：与服务端 BUILTIN_TASK_DEFS 同源，提醒页模板按钮取此文案 */

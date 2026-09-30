@@ -309,9 +309,60 @@ describe("defaultAssistantPrompt", () => {
     expect(prompt).toContain("周四");
     expect(prompt).toContain("record_flow");
     expect(prompt).toContain("query_ledger");
+    expect(prompt).toContain("timesPerPeriod"); // 习惯化新口径（2026-09-30）：教学必须教配额
     expect(prompt).not.toContain("健身"); // 不举例任何默认分类
     expect(prompt).not.toContain("create_goal"); // goal 三件已下线，提示词不得再提（评审 2026-09-30 回归锚）
     expect(prompt).not.toContain("what=goals");
+  });
+});
+
+describe("习惯计划（2026-09-30 习惯化：timesPerPeriod）", () => {
+  const render = (tool: ToolDefinition, value: unknown): string => (tool.output!.render!({}, value) as { text: string }[])[0]!.text;
+
+  it("建习惯计划：账本行落 timesPerPeriod；回执带习惯口径；what=plans 投影与摘要可见配额（AC7）", async () => {
+    const { ledger, by } = await freshTools();
+    const created = (await by("create_plan").execute({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 }, ctx)) as { planId: string };
+    const row = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(row.timesPerPeriod).toBe(3);
+    expect(render(by("create_plan"), { ...created, scope: "week" })).toContain("习惯：每周 3 天");
+    const dayPlan = await by("create_plan").execute({ title: "每天喝两杯水", scope: "day", timesPerPeriod: 2 }, ctx);
+    expect(render(by("create_plan"), dayPlan)).toContain("习惯：每天 2 次");
+    const plans = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { title: string; timesPerPeriod?: number }[] };
+    expect(plans.plans.find((p) => p.title === "每周运动三天")!.timesPerPeriod).toBe(3);
+    expect(render(by("query_ledger"), plans)).toContain("习惯3");
+  });
+
+  it("today 回执：习惯计划显示「本周 n/N」进度替代 state 词；top3 行带进度（AC1/AC7）", async () => {
+    const { by } = await freshTools();
+    const habit = (await by("create_plan").execute({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 }, ctx)) as { planId: string };
+    await by("checkin_plan").execute({ planId: habit.planId, date: "2026-09-01" }, ctx); // 周二补卡 → 本周 1/3（NOW 是周四，同周）
+    const today = await by("query_ledger").execute({ what: "today" }, ctx);
+    const text = render(by("query_ledger"), today);
+    expect(text).toContain("本周 1/3");
+    expect(text).toContain("今日必做：每周运动三天 1/3");
+    expect(text).not.toContain("每周运动三天…doing"); // state 词被进度替代
+  });
+
+  it("校验（AC3）：timesPerPeriod 非正整数拒绝；deadline/ndays 是一次性计划，带配额明确报错", async () => {
+    const { by } = await freshTools();
+    await expect(by("create_plan").execute({ title: "x", scope: "deadline", due: "2026-09-10", timesPerPeriod: 3 }, ctx)).rejects.toThrow("timesPerPeriod 只支持");
+    await expect(by("create_plan").execute({ title: "x", scope: "ndays", ndays: 7, timesPerPeriod: 3 }, ctx)).rejects.toThrow("timesPerPeriod 只支持");
+    await expect(by("create_plan").execute({ title: "x", scope: "week", timesPerPeriod: 0 }, ctx)).rejects.toThrow("≥1");
+    await expect(by("create_plan").execute({ title: "x", scope: "week", timesPerPeriod: 1.5 }, ctx)).rejects.toThrow("≥1");
+  });
+
+  it("update_plan（AC7）：改配额生效；只改标题不掉习惯（timesPerPeriod 保留）；切 deadline 剥离配额且带配额报错", async () => {
+    const { ledger, by } = await freshTools();
+    const habit = (await by("create_plan").execute({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 }, ctx)) as { planId: string };
+    await by("update_plan").execute({ planId: habit.planId, timesPerPeriod: 4 }, ctx);
+    expect((ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord).timesPerPeriod).toBe(4);
+    await by("update_plan").execute({ planId: habit.planId, title: "每周运动四天" }, ctx); // 只改标题
+    expect((ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord).timesPerPeriod).toBe(4); // 习惯不丢
+    await by("update_plan").execute({ planId: habit.planId, scope: "deadline", due: "2026-09-10" }, ctx); // 切一次性
+    const switched = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(switched.scope).toBe("deadline");
+    expect(switched.timesPerPeriod).toBeUndefined(); // 配额随周期专属字段剥离
+    await expect(by("update_plan").execute({ planId: habit.planId, scope: "ndays", ndays: 5, timesPerPeriod: 2 }, ctx)).rejects.toThrow("timesPerPeriod 只支持");
   });
 });
 

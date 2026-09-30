@@ -24,6 +24,12 @@ const TOP_KIND_LABEL: Record<TopItemLoose["kind"], string> = {
   today: "今日",
 };
 
+/** 本地日期串（习惯打卡"今天是否已计入"的判断，2026-09-30 习惯化） */
+function localYmd(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 /** 计划行（2026-09-29 提取为组件以承载行内交互）：打卡/撤销 + 编辑（标题/due，planId 稳定）+ 周期补卡（date ≤ 今天） */
 function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate: string; onChanged: () => void }) {
   const state = plan.state ?? (plan.done ? "done" : "todo");
@@ -37,6 +43,9 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   const [backfillDate, setBackfillDate] = useState("");
   const [busy, setBusy] = useState(false);
   const canBackfill = plan.scope !== "deadline" && !plan.done;
+  // 习惯计划（2026-09-30 习惯化）：进度芯片 + 按天计数（week/month/year）的同日二击防护
+  const habit = plan.timesPerPeriod !== undefined;
+  const progressText = habit ? `${SCOPE_LABEL[plan.scope] ?? "本期"} ${plan.periodCount ?? 0}/${plan.timesPerPeriod}` : null;
 
   const stateLabel =
     state === "done"
@@ -145,8 +154,14 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
         if (plan.done && !undoable) return;
         try {
           if (plan.done) {
-            // 撤销 = 作废打卡（deadline=全部存活 done 打卡；周期=今日打卡），追加 done:false 对两者都无效
+            // 撤销 = 作废打卡（deadline=全部存活 done 打卡；周期/习惯=今日打卡），追加 done:false 对两者都无效
             for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
+          } else if (habit && plan.scope !== "day" && plan.checkinTs !== undefined) {
+            // 按天计数的习惯（每周/月/年 N 天）今天已计入：第二击 = 撤销今天的卡（不新增一天）
+            const seqs = (plan.checkins ?? []).filter((c) => localYmd(c.at) === viewDate).map((c) => c.seq);
+            if (seqs.length > 0 && window.confirm(`今天这一卡已经算进${progressText}了。撤销今天的打卡吗？`)) {
+              for (const seq of seqs) await api.voidRecord(seq);
+            }
           } else {
             await api.checkin(plan.planId, true);
           }
@@ -155,7 +170,15 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
         }
         onChanged();
       }}
-      title={plan.done ? (undoable ? "点击撤销打卡（作废该打卡记录，历史留痕）" : "已完成") : "点击打卡（逾期项 = 现在补做）"}
+      title={
+        plan.done
+          ? undoable
+            ? "点击撤销打卡（作废该打卡记录，历史留痕）"
+            : "已完成"
+          : habit && plan.scope !== "day" && plan.checkinTs !== undefined
+            ? `今天已计入 ${progressText}——点击可撤销今天的卡（按天计数）`
+            : "点击打卡（逾期项 = 现在补做）"
+      }
     >
       {plan.done ? (
         <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
@@ -168,7 +191,8 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
         <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
       </span>
       {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
-      <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>
+      {habit && <span className={`num shrink-0 text-xs ${plan.done ? "text-accent" : "text-ink3"}`}>{progressText}</span>}
+      {(!habit || plan.done) && <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>}
       {canBackfill && (
         <button
           className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-accent/10 hover:text-accent"
@@ -207,8 +231,8 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   );
 }
 
-/** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新 */
-function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: () => void }) {
+/** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新（习惯项带进度、按天计数做同日防护） */
+function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: (item: TopItemLoose) => void }) {
   if (items.length === 0) {
     return (
       <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
@@ -224,9 +248,7 @@ function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: () =
           <button
             key={`${item.kind}-${item.planId ?? item.title}-${index}`}
             className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60"
-            onClick={() => {
-              if (item.planId !== undefined) void api.checkin(item.planId).then(onCheckin);
-            }}
+            onClick={() => onCheckin(item)}
             title="点击打卡"
           >
             <span className="num flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-surface2 text-[11px] font-semibold text-ink2">
@@ -235,6 +257,9 @@ function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: () =
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[15px] text-ink">{item.title}</span>
             </span>
+            {item.progress !== undefined && (
+              <span className="num shrink-0 rounded bg-surface2 px-1.5 py-0.5 text-[10px] text-ink2">{item.progress}</span>
+            )}
             <span
               className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
                 item.kind === "overdue" ? "bg-warm/10 text-warm" : item.kind === "dueToday" ? "bg-accent3 text-accent" : "bg-surface2 text-ink3"
@@ -325,6 +350,16 @@ export function Today() {
       : view.plans.filter(TAB_PRED[planTab]);
   const todayPlans = view.plans.filter(TAB_PRED.today); // 统计卡口径 = 今天视图（全量收编后不宜直接用 view.plans）
   const doneCount = todayPlans.filter((p) => p.done).length;
+  // Top3 打卡（2026-09-30 习惯化）：按天计数的习惯今天已计入 → 不再记账（行内可撤销/明天再来）
+  const top3Checkin = (item: TopItemLoose) => {
+    if (item.planId === undefined) return;
+    const plan = view.plans.find((p) => p.planId === item.planId);
+    if (plan !== undefined && plan.timesPerPeriod !== undefined && plan.scope !== "day" && plan.checkinTs !== undefined) {
+      window.alert("今天这一卡已经算进进度了（按天计数）——明天再来，或在下面计划行里撤销今天的卡");
+      return;
+    }
+    void api.checkin(item.planId).then(reload);
+  };
   const PLAN_TABS = (
     [
       { key: "today", label: "今天" },
@@ -399,7 +434,7 @@ export function Today() {
       )}
 
       {/* 今日必做：先看要做什么，再看记了什么 */}
-      <Top3Card items={view.top3 ?? []} onCheckin={reload} />
+      <Top3Card items={view.top3 ?? []} onCheckin={top3Checkin} />
 
       {/* 三统计卡（窄屏两列，第三张跨满行） */}
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3">

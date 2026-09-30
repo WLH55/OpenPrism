@@ -1028,7 +1028,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   if (method === "POST" && path === "/api/plans") {
-    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
     if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const title = String(body.title ?? "").trim();
     if (title === "") return sendError(res, 400, "title 必填");
@@ -1043,6 +1043,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       }
     }
     if (scope === "ndays" && (typeof body.ndays !== "number" || body.ndays < 1)) return sendError(res, 400, "scope=ndays 需要 ndays ≥ 1");
+    // 习惯配额（2026-09-30 习惯化）：与 create_plan 工具同规
+    if (body.timesPerPeriod !== undefined && (!Number.isInteger(body.timesPerPeriod) || body.timesPerPeriod < 1)) {
+      return sendError(res, 400, "timesPerPeriod 需为 ≥1 的整数");
+    }
+    if (body.timesPerPeriod !== undefined && !(scope === "day" || scope === "week" || scope === "month" || scope === "year")) {
+      return sendError(res, 400, "timesPerPeriod 只支持 day | week | month | year（deadline/ndays 是一次性计划）");
+    }
     const ledger = await deps.ledgerFor(uid);
     const record = await ledger.append({
       kind: "plan",
@@ -1052,6 +1059,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       scope,
       ...(body.due !== undefined && body.due !== "" ? { due: body.due } : {}),
       ...(body.ndays !== undefined ? { ndays: body.ndays } : {}),
+      ...(body.timesPerPeriod !== undefined ? { timesPerPeriod: body.timesPerPeriod } : {}),
     });
     return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
   }
@@ -1061,7 +1069,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   const planMatch = /^\/api\/plans\/([^/]+)$/.exec(path);
   if (planMatch && method === "PUT") {
     const planId = decodeURIComponent(planMatch[1]!);
-    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
     if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const ledger = await deps.ledgerFor(uid);
     const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
