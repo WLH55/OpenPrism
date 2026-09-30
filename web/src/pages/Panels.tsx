@@ -358,7 +358,7 @@ export function Panels() {
             <div key={f.seq} className="flex items-center gap-3 px-4 py-3">
               <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: isAll ? catColor(f.category) : "var(--cat)" }} />
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[15px] text-ink">{f.note ?? f.category}</div>
+                <div className="whitespace-pre-wrap break-words text-[15px] text-ink">{f.note ?? f.category}</div>
                 <div className="text-xs text-ink3">
                   {isAll ? `${f.category} · ${hhmm(f.time)}` : hhmm(f.time)}
                 </div>
