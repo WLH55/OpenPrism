@@ -82,7 +82,8 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
     }
     setBusy(true);
     try {
-      await api.updatePlan(plan.planId, { title: titleDraft.trim(), ...(dueDraft !== "" ? { due: dueDraft } : {}) });
+      // due 只对 deadline 型生效（周期/习惯计划没有截止日概念，mergePlanUpdate 本就不收）——非 deadline 不带该键
+      await api.updatePlan(plan.planId, { title: titleDraft.trim(), ...(plan.scope === "deadline" && dueDraft !== "" ? { due: dueDraft } : {}) });
       setEditing(false);
     } catch (e) {
       window.alert(String((e as Error).message));
@@ -114,7 +115,9 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
     return (
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-surface px-4 py-3">
         <input className={`${field} flex-1`} value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)} placeholder="标题" />
-        <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="截止日（仅 deadline 型生效）" />
+        {plan.scope === "deadline" && (
+          <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="修改截止日" aria-label="截止日" />
+        )}
         <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
           保存
         </button>
