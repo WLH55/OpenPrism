@@ -103,8 +103,9 @@ export function buildExportMarkdown(input: ExportInput & { tzOffsetMinutes: numb
   // ── 生活记录（active 口径）：plan/checkin/event 各自的时刻归日 ──
   const voided = new Set(input.ledger.filter((r) => r.kind === "void").map((r) => (r as { targetSeq: number }).targetSeq));
   const active = input.ledger.filter((r) => r.kind !== "void" && !voided.has(r.seq));
+  // 打卡行引用的计划可能已被作废/修订——标题从全部历史计划里取（含旧版本），只作显示，不影响"建计划"行只出最新版
   const planTitle = new Map<string, string>();
-  for (const r of active) if (r.kind === "plan") planTitle.set(r.planId, r.title);
+  for (const r of input.ledger) if (r.kind === "plan") planTitle.set(r.planId, r.title);
 
   type Row = { ts: number; line: string };
   const byDay = new Map<string, Row[]>();
