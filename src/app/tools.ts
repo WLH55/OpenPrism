@@ -221,13 +221,15 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
 
   /** query_ledger 人话回执：按返回体形状判别视角（today 带 date、plans/flows 各带同名数组）。
    *  凭据保留（评审 agent-native O8，2026-09-29）：摘要必须带 planId——取消/打卡/改计划全靠它调工具，
-   *  纯计数会让晚间汇报承诺的"帮用户取消"在用户答应那一刻失败；top3 是内置简报指令点名要的数据 */
+   *  纯计数会让晚间汇报承诺的"帮用户取消"在用户答应那一刻失败；top3 是内置简报指令点名要的数据。
+   *  完成面数据（评审 2026-09-30 W1/O3）：今日完成行给晚间汇报、近 30 天完成存档行给每周复盘（doneAt 归类自然周）、
+   *  未完成行的打卡 seq 给撤历史卡——模型看不到原始载荷，回执不渲染就等于不存在 */
   const renderQuery = (_args: unknown, value: unknown): ContentBlock[] => {
     const v = value as {
       date?: string;
       streakDays?: number;
       flows?: { category: string }[];
-      plans?: { planId?: string; title: string; state?: string; due?: string }[];
+      plans?: { planId?: string; title: string; state?: string; due?: string; doneToday?: boolean; doneAt?: number; checkins?: { seq: number }[] }[];
       top3?: { kind: string; title: string; planId?: string; due?: string }[];
       total?: number;
       truncated?: boolean;
@@ -244,9 +246,24 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         lines.push(
           `未完成计划：${undone
             .slice(0, 10)
-            .map((p) => `${p.title}(${p.planId ?? "?"}, ${p.state ?? "?"}${p.due !== undefined ? `, 截止 ${p.due}` : ""})`)
+            .map((p) => {
+              const seqs = (p.checkins ?? []).slice(0, 2).map((c) => c.seq).join("/"); // 撤历史卡凭据（作废走 void_flow）
+              return `${p.title}(${p.planId ?? "?"}, ${p.state ?? "?"}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${seqs !== "" ? `, 打卡${seqs}` : ""})`;
+            })
             .join("、")}${undone.length > 10 ? ` 等 ${undone.length} 个` : ""}`,
         );
+      }
+      const doneTodayList = (v.plans ?? []).filter((p) => p.doneToday === true);
+      if (doneTodayList.length > 0) {
+        lines.push(`今日完成：${doneTodayList.slice(0, 10).map((p) => p.title).join("、")}${doneTodayList.length > 10 ? ` 等 ${doneTodayList.length} 个` : ""}`);
+      }
+      // 完成存档行（评审 2026-09-30 W1）：模型只看得见回执，每周复盘按 doneAt 归类自然周全靠这行（载荷窗口 30 天）
+      const archive = (v.plans ?? [])
+        .filter((p) => p.state === "done" && p.doneAt !== undefined)
+        .sort((a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0));
+      if (archive.length > 0) {
+        const shown = archive.slice(0, 20).map((p) => `${p.title}(${new Date(p.doneAt!).toISOString().slice(5, 10)})`).join("、");
+        lines.push(`近 30 天完成 ${archive.length} 条：${shown}${archive.length > 20 ? ` 等 ${archive.length} 条` : ""}`);
       }
       return [{ type: "text", text: lines.join("\n") }];
     }

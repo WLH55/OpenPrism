@@ -461,24 +461,37 @@ export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
     const row = this.deps.db.prepare("SELECT builtins_seeded FROM users WHERE uid = ?").get(uid) as
       | { builtins_seeded: number }
       | undefined;
-    if (!row || row.builtins_seeded === 1) return 0;
+    if (!row) return 0;
+    const seeded = row.builtins_seeded === 1;
+    let changed = 0;
     for (const def of BUILTIN_TASK_DEFS) {
       // 确定性 id（builtin-{kind}-{uid}）：不依赖注入方 uuid 的唯一性（测试夹具常给固定值），三连插不撞主键
       const id = `builtin-${def.builtin}-${uid}`;
-      // 部分种子自愈（评审 2026-09-29）：上次中途失败留下的行直接跳过，重入不撞主键；标记兜底在循环后
-      if ((await this.get(uid, id)) !== null) continue;
-      await this.create(uid, {
-        id,
-        title: def.title,
-        instruction: def.instruction,
-        trigger: def.trigger,
-        notifyChannel: "inapp",
-        builtin: def.builtin,
-        tzOffsetMinutes: 480,
-      });
+      const existing = await this.get(uid, id);
+      if (existing === null) {
+        // 部分种子自愈（评审 2026-09-29）：标记未置=上次中途失败，重入补齐；标记已置=用户删过，不复活
+        if (seeded) continue;
+        await this.create(uid, {
+          id,
+          title: def.title,
+          instruction: def.instruction,
+          trigger: def.trigger,
+          notifyChannel: "inapp",
+          builtin: def.builtin,
+          tzOffsetMinutes: 480,
+        });
+        changed += 1;
+        continue;
+      }
+      // 指令单源同步（评审 2026-09-30 种子楔子）：指令文案活在 DB 行里，DEFS 改版只影响新用户——
+      // 已种子用户会带着旧口径（如 what=goals）触发，模型撞已下线视角；就地更新维持 DEFS 为唯一文案来源
+      if (existing.instruction !== def.instruction) {
+        await this.update(uid, id, { instruction: def.instruction });
+        changed += 1;
+      }
     }
-    this.deps.db.prepare("UPDATE users SET builtins_seeded = 1 WHERE uid = ?").run(uid);
-    return BUILTIN_TASK_DEFS.length;
+    if (!seeded) this.deps.db.prepare("UPDATE users SET builtins_seeded = 1 WHERE uid = ?").run(uid);
+    return changed;
   }
 
   async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">>): Promise<TaskDef> {

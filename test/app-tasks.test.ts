@@ -151,10 +151,28 @@ describe("TaskStore", () => {
     db.prepare(
       "INSERT INTO tasks (id, uid, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel, builtin) VALUES ('builtin-daily-brief-u1', 'u1', 'x', 'y', ?, 1, 480, 1, NULL, NULL, 'daily-brief')",
     ).run(JSON.stringify({ kind: "daily", time: "08:30" }));
-    expect(await store.ensureBuiltins("u1")).toBe(3); // 跳过已存在、补齐另两件
+    expect(await store.ensureBuiltins("u1")).toBe(1); // 三行都在：不补建，仅 daily-brief 的占位指令被同步（返回=实际变更数，2026-09-30 语义）
     const completed = await store.list("u1");
     expect(completed).toHaveLength(3);
     expect(completed.map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+  });
+
+  it("指令单源同步（评审 2026-09-30 种子楔子）：已种子用户的旧口径指令被 DEFS 就地更新；新指令零 goal 残留", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-sync" });
+    await store.ensureBuiltins("u1");
+    // 模拟旧版本种下的口径（目标层级时代的 what=goals/goalCard 话术）
+    db.prepare("UPDATE tasks SET instruction = '旧口径：查 what=goals 与 goalCard' WHERE uid = 'u1'").run();
+    expect(await store.ensureBuiltins("u1")).toBe(3); // 三行指令都被同步
+    const synced = await store.list("u1");
+    expect(synced.every((t) => t.instruction !== "旧口径：查 what=goals 与 goalCard")).toBe(true);
+    expect(synced.every((t) => !/what=goals|goalCard/.test(t.instruction))).toBe(true); // 新口径回归锚
+    expect(await store.ensureBuiltins("u1")).toBe(0); // 幂等
+    // 删除不复活不受同步影响：删一件再跑，缺失行跳过、其余不变
+    await store.remove("u1", synced[0]!.id);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(2);
   });
 
   it("create 的 builtin 值受白名单校验", async () => {

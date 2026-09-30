@@ -99,6 +99,7 @@ describe("todayView 计划折叠", () => {
     expect(m1.state).toBe("upcoming");
     expect(m1).not.toHaveProperty("goalTitle"); // 「属于：xx」信号随目标层级一起下线
     expect(view.plans.every((p) => !("goalTitle" in p))).toBe(true);
+    expect("goalCard" in view).toBe(false); // 顶层 goalCard 键随目标层级消失（回归锚）
   });
 
   it("撤销口径与存档窗口（评审 2026-09-29）：周期型今日完成带今日打卡 seq（撤销=作废今日）；完成超 30 天的存档沉出载荷", () => {
