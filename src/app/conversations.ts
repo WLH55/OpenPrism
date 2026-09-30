@@ -3,8 +3,8 @@
 // systemPrompt 每步同步重读（人设/记忆/技能目录改动下一步生效，D4.2/4.1）；
 // 能力绑定（工具开关 + 技能 + MCP）在装配时生效；save_preference 恒可用（记忆全局唯一，D5）。
 
-import type { Agent, LlmAdapter, PlatformEnv, SessionLog, ToolDefinition } from "../harness/index";
-import { createAgent } from "../harness/index";
+import type { Agent, ContentBlock, LlmAdapter, PlatformEnv, SessionEvent, SessionLog, ToolDefinition, UserMessage } from "../harness/index";
+import { createAgent, flattenText, hasImageBlocks } from "../harness/index";
 import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
@@ -23,6 +23,14 @@ export class ModelNotConfiguredError extends Error {
   }
 }
 
+/** 图片发给了不支持图片识别的模型（多模态开关未勾选）：发送拦截、切换拦截、装配拦截共用 */
+export class ModelNotMultimodalError extends Error {
+  constructor(detail = "当前模型不支持图片识别") {
+    super(`${detail}——在「模型接入」里勾选该模型的「支持图片识别（多模态）」，或换一个支持图片的模型`);
+    this.name = "ModelNotMultimodalError";
+  }
+}
+
 export interface ConversationDeps {
   env: PlatformEnv;
   /** 会话日志缝：key = 聊天 cid 或 `task:<taskId>`；生产 = SqliteSessionLog，测试可注入内存实现 */
@@ -33,8 +41,8 @@ export interface ConversationDeps {
   /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行） */
   adapterFactory(uid: string, providerId: string | null, config: ModelConfig): LlmAdapter;
   now(): number;
-  /** 用户当地时区（分钟，UTC+local）；缺省按服务器本地时区 */
-  tzOffsetMinutes?(): number;
+  /** 用户档案时区（分钟，UTC+local；2026-09-29 起按会话 uid 读——浏览器上报/个人资料页可改）；缺省按服务器本地时区 */
+  tzOffsetMinutes?(uid: string): number;
   agents: AgentStore;
   skills: SkillStoreLike;
   mcps: McpRegistry;
@@ -109,7 +117,7 @@ export interface ConversationMeta {
   agentId?: string;
   /** 会话级模型绑定；缺省 = 跟随全局激活 */
   modelProviderId?: string;
-  switches: { ts: number; agentId: string }[];
+  switches: { ts: number; agentId: string | null }[];
 }
 
 interface ConversationRow {
@@ -177,6 +185,31 @@ export class ConversationStore {
     return entry;
   }
 
+  /** 会话归属（2026-09-23 越权修复）：conversation_events 不带 uid，归属在 conversations 表；查无此行 = undefined */
+  ownerOf(cid: string): string | undefined {
+    const row = this.db.prepare("SELECT uid FROM conversations WHERE cid = ?").get(cid) as unknown as { uid: string } | undefined;
+    return row?.uid;
+  }
+
+  /**
+   * 读会话事件（2026-09-23 分段加载）：不带参数 = 全量升序（桌面端与既有行为一致）；
+   * limit = 取最近 limit 条；before 与 limit 连用 = 取 seq < before 的最近 limit 条（向上翻页游标）。片段一律升序返回。
+   */
+  readEvents(cid: string, options?: { before?: number; limit?: number }): SessionEvent[] {
+    const parse = (rows: { event_json: string }[]) => rows.map((row) => JSON.parse(row.event_json) as SessionEvent);
+    if (options === undefined || (options.before === undefined && options.limit === undefined)) {
+      const rows = this.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq").all(cid) as unknown as { event_json: string }[];
+      return parse(rows);
+    }
+    const cap = options.limit ?? 50;
+    const rows = (
+      options.before === undefined
+        ? this.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq DESC LIMIT ?").all(cid, cap)
+        : this.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND seq < ? ORDER BY seq DESC LIMIT ?").all(cid, options.before, cap)
+    ) as unknown as { event_json: string }[];
+    return parse(rows.reverse());
+  }
+
   async metaFor(uid: string, cid: string): Promise<ConversationMeta> {
     const row = this.db
       .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
@@ -200,12 +233,23 @@ export class ConversationStore {
     };
   }
 
-  /** 切换伙伴（D4.2）：只换 system prompt 与装配，历史不丢；切换历史供 UI 画分割线 */
-  async switchAgent(uid: string, cid: string, agentId: string): Promise<void> {
+  /** 切换伙伴（D4.2）：只换 system prompt 与装配，历史不丢；切换历史供 UI 画分割线。
+   * agentId = null 切回默认助手（2026-09-28 微信桥增补：会话唯一固定的场景不能靠新建绕过）。 */
+  async switchAgent(uid: string, cid: string, agentId: string | null): Promise<void> {
     const agents = await this.deps.agents.list(uid);
-    if (!agents.some((a) => a.id === agentId)) throw new Error(`agent "${agentId}" 不存在`);
+    const target = agentId !== null ? agents.find((a) => a.id === agentId) : undefined;
+    if (agentId !== null && !target) throw new Error(`agent "${agentId}" 不存在`);
+    // 会话没绑模型时，伙伴默认模型决定实际模型：历史里有图而目标模型不支持图片 → 拦住切换
+    // （目标 = 默认助手时按全局激活模型判）
     const meta = await this.metaFor(uid, cid);
-    meta.agentId = agentId;
+    if (meta.modelProviderId === undefined && this.conversationHasImages(cid)) {
+      const effective = target?.identity.modelProviderId ?? null;
+      const config = await this.deps.modelConfigFor(uid, effective);
+      if (config && !config.multimodal) {
+        throw new ModelNotMultimodalError(`${target?.name ?? "默认助手"} 的默认模型不支持图片识别，这个会话里有图片`);
+      }
+    }
+    meta.agentId = agentId ?? undefined;
     meta.switches.push({ ts: this.deps.now(), agentId });
     this.db
       .prepare("UPDATE conversations SET agent_id = ?, switches_json = ? WHERE cid = ? AND uid = ?")
@@ -216,14 +260,55 @@ export class ConversationStore {
   async switchModel(uid: string, cid: string, providerId: string | null): Promise<void> {
     const exists = this.db.prepare("SELECT 1 AS ok FROM conversations WHERE cid = ? AND uid = ?").get(cid, uid);
     if (!exists) throw new Error(`conversation "${cid}" 不存在`);
+    // 历史里有图片时，切到不支持图片识别的模型会在此后的每回合失败：就地拦住并说明
+    if (this.conversationHasImages(cid)) {
+      const config = await this.deps.modelConfigFor(uid, providerId);
+      if (config && !config.multimodal) {
+        throw new ModelNotMultimodalError("这个会话里有图片，切过去的模型不支持图片识别");
+      }
+    }
     this.db.prepare("UPDATE conversations SET model_provider_id = ? WHERE cid = ? AND uid = ?").run(providerId, cid, uid);
     this.pool.delete(`${uid}:${cid}`);
+  }
+
+  /** 会话历史里是否出现过图片（切模型/切伙伴的前置检查；SQL 先粗筛再逐条确认） */
+  private conversationHasImages(cid: string): boolean {
+    const rows = this.db
+      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND type = 'user/message' AND event_json LIKE '%\"image\"%'")
+      .all(cid) as unknown as { event_json: string }[];
+    for (const row of rows) {
+      const event = JSON.parse(row.event_json) as { message?: UserMessage };
+      if (Array.isArray(event.message?.content) && hasImageBlocks(event.message)) return true;
+    }
+    return false;
   }
 
   /** 弃池某伙伴绑定的全部会话（改伙伴默认模型后热更用：下一回合按新模型重装配） */
   evictAgentConversations(uid: string, agentId: string): void {
     const rows = this.db.prepare("SELECT cid FROM conversations WHERE uid = ? AND agent_id = ?").all(uid, agentId) as unknown as { cid: string }[];
     for (const row of rows) this.pool.delete(`${uid}:${row.cid}`);
+  }
+
+  /**
+   * 弃池有效模型解析为该提供方的全部会话（改提供方设置——窗口/多模态开关——后下一回合重装配）。
+   * 有效模型三级链与会话装配一致：会话绑定 → 伙伴默认 → 全局激活。
+   */
+  evictProviderConversations(uid: string, providerId: string): void {
+    const rows = this.db
+      .prepare("SELECT cid, agent_id, model_provider_id FROM conversations WHERE uid = ?")
+      .all(uid) as unknown as { cid: string; agent_id: string | null; model_provider_id: string | null }[];
+    const agentRows = this.db.prepare("SELECT id, model_provider_id FROM agents WHERE uid = ?").all(uid) as unknown as {
+      id: string;
+      model_provider_id: string | null;
+    }[];
+    const agentProvider = new Map(agentRows.map((row) => [row.id, row.model_provider_id]));
+    const global = this.db.prepare("SELECT provider_id FROM model_active WHERE uid = ?").get(uid) as
+      | { provider_id: string }
+      | undefined;
+    for (const row of rows) {
+      const effective = row.model_provider_id ?? (row.agent_id ? (agentProvider.get(row.agent_id) ?? null) : null) ?? global?.provider_id ?? null;
+      if (effective === providerId) this.pool.delete(`${uid}:${row.cid}`);
+    }
   }
 
   /** 删除会话：行 + 九事件一并删（含任务无涉），弃池；不可恢复 */
@@ -249,8 +334,8 @@ export class ConversationStore {
     if (eventRows.length === 0) return null; // 还没有用户消息
     let userText = "";
     try {
-      const event = JSON.parse(eventRows[0]!.event_json) as { message?: { content?: { type: string; text?: string }[] } };
-      userText = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+      const event = JSON.parse(eventRows[0]!.event_json) as { message?: UserMessage };
+      userText = event.message ? flattenText(event.message) : "";
     } catch {
       return null;
     }
@@ -318,6 +403,12 @@ export class ConversationStore {
     return row ? this.rowToMeta(row) : { switches: [] };
   }
 
+  /** 模型绑定三级链：会话绑定 → 伙伴默认 → 全局激活（null = 跟随全局） */
+  private effectiveProviderId(uid: string, meta: ConversationMeta): string | null {
+    const agentProviderId = meta.agentId ? this.syncCurrentAgent(uid, meta).identity?.modelProviderId : undefined;
+    return meta.modelProviderId ?? agentProviderId ?? null;
+  }
+
   /** 当前伙伴的同步视图（systemPrompt 每步重取 & 账本 actor 都要同步拿） */
   private syncCurrentAgent(uid: string, meta: ConversationMeta): {
     agentId?: string;
@@ -342,8 +433,7 @@ export class ConversationStore {
     const { env, now } = this.deps;
     // 模型绑定三级链：会话绑定 → 伙伴默认 → 全局激活；providerId 同时交给
     // adapterFactory（每回合现读该供应商行，改 Key 即时生效）
-    const agentProviderId = metaOf().agentId ? this.syncCurrentAgent(uid, metaOf()).identity?.modelProviderId : undefined;
-    const providerId = metaOf().modelProviderId ?? agentProviderId ?? null;
+    const providerId = this.effectiveProviderId(uid, metaOf());
     const config = await this.deps.modelConfigFor(uid, providerId);
     if (!config) throw new ModelNotConfiguredError();
     const sessionLog = await this.deps.sessionLog(sessionKey);
@@ -360,6 +450,8 @@ export class ConversationStore {
     const ledgerTools = createLedgerTools({
       ledger,
       now,
+      // 工具层视图口径与 persona/任务同源（2026-09-29）：用户档案时区，缺省服务器本机
+      tzOffsetMinutes: () => this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
       actor: () => {
         const agentNow = this.syncCurrentAgent(uid, metaOf());
         return { conversationId, agentName: agentNow.name };
@@ -382,7 +474,15 @@ export class ConversationStore {
       }),
     );
     if (this.deps.tasks) {
-      tools.push(...createTaskTools({ store: this.deps.tasks as unknown as import("./tasks").TaskStore, uid, now }));
+      tools.push(
+        ...createTaskTools({
+          store: this.deps.tasks as unknown as import("./tasks").TaskStore,
+          uid,
+          now,
+          // 触发时刻按用户钟面解释（评审 2026-09-29 #17）
+          tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
+        }),
+      );
     }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));
@@ -399,6 +499,14 @@ export class ConversationStore {
         ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}),
       },
       systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf()),
+      // 兜底拦截：装配期这个模型不支持图片，而请求里带了图片（历史消息/切换伙伴默认模型后的重放）→
+      // 就地失败并说明原因，不把图片发给不认识的端点去猜
+      onRequest: (request) => {
+        if (!config.multimodal && request.messages.some((message) => hasImageBlocks(message))) {
+          throw new ModelNotMultimodalError();
+        }
+        return request;
+      },
       tools,
       maxStepsPerTurn: 24,
     });
@@ -411,8 +519,8 @@ export class ConversationStore {
       .get(cid) as { event_json: string } | undefined;
     if (!row) return "";
     try {
-      const event = JSON.parse(row.event_json) as { message?: { content?: { type: string; text?: string }[] } };
-      return (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").slice(0, 500);
+      const event = JSON.parse(row.event_json) as { message?: UserMessage };
+      return (event.message ? flattenText(event.message) : "").slice(0, 500);
     } catch {
       return "";
     }
@@ -434,21 +542,47 @@ export class ConversationStore {
       ...(merged !== "" ? { memoryBlock: merged } : {}),
       taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
       now: this.deps.now,
-      tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? -new Date().getTimezoneOffset(),
+      tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
     });
   }
 
-  async send(uid: string, cid: string, text: string): Promise<void> {
+  /**
+   * 发送一条用户消息（文本 + 附件块）：附件里的图片要求当前有效模型是多模态，否则就地拒绝（不消耗回合）。
+   * 归属校验（2026-09-27 越权补齐）：会话不属于该用户时按不存在拒绝，一个字节都不写。
+   * 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
+   * query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
+   */
+  async send(uid: string, cid: string, text: string, attachments: ContentBlock[] = []): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    if (attachments.some((block) => block.type === "image")) {
+      const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
+      if (!config) throw new ModelNotConfiguredError();
+      if (!config.multimodal) throw new ModelNotMultimodalError();
+    }
     const agent = await this.agent(uid, cid);
-    // 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
-    // query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
-    // null（未配置/超时/失败）→ 清掉旧命中，本回合退纯词法。
-    const hits = this.deps.memoryVector ? await this.deps.memoryVector.recallHits(uid, text, { scope: "situational" }) : null;
+    const content: ContentBlock[] = [...(text !== "" ? [{ type: "text" as const, text }] : []), ...attachments];
+    const query = flattenText({ role: "user", content });
+    // null（未配置/超时/失败/纯图片消息）→ 清掉旧命中，本回合退纯词法
+    const hits =
+      this.deps.memoryVector && query.trim() !== ""
+        ? await this.deps.memoryVector.recallHits(uid, query, { scope: "situational" })
+        : null;
     if (hits === null) this.turnVectorHits.delete(`${uid}:${cid}`);
     else this.turnVectorHits.set(`${uid}:${cid}`, hits);
-    agent.followup(text);
+    agent.followup(content);
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
+  }
+
+  /**
+   * 手动中止当前回合（2026-09-27 打断）：harness abort 语义——停止模型调用与工具执行，
+   * 已收到的部分输出以 interrupted 消息落日志，回合以 aborted 收尾；Inbox 一并清空
+   * （前端等待队列在客户端，服务端 Inbox 不承载用户排队语义）。
+   */
+  async stop(uid: string, cid: string): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    const agent = await this.agent(uid, cid);
+    agent.cancel();
   }
 
   /** 凝练原料：该用户全部会话的 user/assistant 文本（SQL 取代逐文件全扫） */
@@ -461,8 +595,8 @@ export class ConversationStore {
     const texts: { text: string; role: string }[] = [];
     for (const row of rows) {
       try {
-        const event = JSON.parse(row.event_json) as { type: string; message?: { role: string; content: { type: string; text?: string }[] } };
-        const text = (event.message?.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+        const event = JSON.parse(row.event_json) as { message?: UserMessage };
+        const text = event.message ? flattenText(event.message) : "";
         if (text.trim() !== "") texts.push({ text, role: event.message?.role ?? "user" });
       } catch {
         // 坏行

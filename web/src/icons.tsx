@@ -59,6 +59,7 @@ export const TaskIcon = (p: P) => (
     <path d="M12 6v6l4 2" />
   </svg>
 );
+/** 计划页（B3 目标层级）：靶心——方向 → 阶段 → 项目的对齐 */
 export const SkillsIcon = (p: P) => (
   <svg {...base(p.className)}>
     <path d="M14.5 6.5a3 3 0 0 0-2-2M14.5 17.5a3 3 0 0 0 2-2M6.5 14.5a3 3 0 0 0 2 2M6.5 6.5a3 3 0 0 0 2-2M10.5 4.5v3M10.5 16.5v3M4.5 10.5h3M16.5 10.5h3" />
@@ -81,6 +82,13 @@ export const NotifyIcon = (p: P) => (
   <svg {...base(p.className)}>
     <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
     <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+  </svg>
+);
+/** IM 通道（2026-09-27 微信桥）：双气泡 */
+export const ImIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M21 11.5a8.38 8.38 0 0 1-9 8.4 8.5 8.5 0 0 1-3.4-.7L3 21l1.9-5a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 17-.7z" />
+    <path d="M8 10h8M8 13.5h5" />
   </svg>
 );
 export const SunIcon = ({ className = "h-4 w-4" }: P) => (
@@ -128,6 +136,32 @@ export const CheckSolidIcon = ({ className = "h-4 w-4" }: P) => (
       d="M16.7 5.3a1 1 0 0 1 0 1.4l-8 8a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.4L8 12.6l7.3-7.3a1 1 0 0 1 1.4 0Z"
       clipRule="evenodd"
     />
+  </svg>
+);
+export const MenuIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M4 6h16M4 12h16M4 18h16" />
+  </svg>
+);
+export const StopIcon = ({ className = "h-4 w-4" }: P) => (
+  <svg className={className} viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+    <rect x="5" y="5" width="10" height="10" rx="1.5" />
+  </svg>
+);
+export const CloseIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M18 6 6 18M6 6l12 12" />
+  </svg>
+);
+export const CameraIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z" />
+    <circle cx="12" cy="13" r="3" />
+  </svg>
+);
+export const SlidersIcon = (p: P) => (
+  <svg {...base(p.className)}>
+    <path d="M3 4h7m4 0h7M14 2v4M3 12h5m4 0h9M8 10v4M3 20h9m4 0h5M16 18v4" />
   </svg>
 );
 export const InfoIcon = ({ className = "h-4 w-4" }: P) => (

@@ -2,9 +2,7 @@ import { useEffect, useState } from "react";
 import { api4, type ProgressLoose } from "../api";
 import { catColor } from "../catcolor";
 
-const WEEKDAY = ["日", "一", "二", "三", "四", "五", "六"];
-
-/** 成长页：连续火柴棍 + 完成率进度条 + 环比双条，结构照 prototype 页 5 */
+/** 成长页（B4 升级）：指标带基准 + 行为模式（目标进度区随目标层级 2026-09-30 下线移除） */
 export function Progress() {
   const [view, setView] = useState<ProgressLoose | null>(null);
 
@@ -21,53 +19,41 @@ export function Progress() {
   }
 
   const ratePct = Math.round(view.completion.rate * 100);
-  // 近 7 天火柴棍（末位 = 今天）
-  const week = view.trend14.slice(-7);
-  const maxWeek = Math.max(1, ...week.map((t) => t.count));
-  const barH = (count: number): string => `${Math.max(8, (count / maxWeek) * 100)}%`;
+  // 近 8 周打卡基准（本周完成率的参照）
+  const weekly = view.weeklyDone8w ?? [];
+  const doneThisWeek = weekly.at(-1)?.done ?? 0;
+  const priorAvg = weekly.length > 1 ? weekly.slice(0, -1).reduce((s, w) => s + w.done, 0) / (weekly.length - 1) : 0;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
       <header className="mb-5">
-        <div className="text-xs text-ink3">复利向前 · 四个可计算的指标</div>
+        <div className="text-xs text-ink3">复利向前 · 指标带基准，结论替你算好</div>
         <h1 className="text-2xl font-semibold tracking-tight text-ink">成长</h1>
       </header>
 
-      {/* 连续（streak） */}
+      {/* 行为模式（B4 元认知）：结论句优先于图表 */}
       <section className="mb-5 rounded-xl border border-line bg-surface p-4">
-        <div className="flex items-start justify-between">
-          <div>
-            <h2 className="text-sm font-semibold text-ink">连续打卡</h2>
-            <p className="mt-0.5 text-xs text-ink3">你保持记录的最长动力，断了就是"从零再来"</p>
-          </div>
-          <div className="text-right">
-            <div className="num text-3xl font-semibold text-warm">{view.streakDays}</div>
-            <div className="text-xs text-ink3">天</div>
-          </div>
-        </div>
-        {/* 7 天小火柴棍 */}
-        <div className="mt-4 flex items-end gap-2">
-          {week.map((t, i) => {
-            const isToday = i === week.length - 1;
-            const day = new Date(`${t.date}T00:00:00`);
-            return (
-              <div key={t.date} className="flex-1 text-center" title={`${t.date}：${t.count} 笔`}>
-                <div
-                  className={`mx-auto w-full max-w-8 rounded ${t.count === 0 ? "bg-surface2" : isToday ? "bg-warm" : "bg-accent"}`}
-                  style={{ height: barH(t.count) }}
-                />
-                <div className="mt-1 text-[10px] text-ink3">{isToday ? "今天" : WEEKDAY[day.getDay()]}</div>
-              </div>
-            );
-          })}
-        </div>
+        <h2 className="mb-2 text-sm font-semibold text-ink">AI 从你的记录里看到</h2>
+        {((view.insights ?? []).length === 0) ? (
+          <p className="text-sm text-ink3">多记几笔（≥5），这里会开始总结你的规律——时段、分类、坚持节奏</p>
+        ) : (
+          <ul className="space-y-1.5">
+            {(view.insights ?? []).map((text) => (
+              <li key={text} className="flex gap-2 text-sm leading-relaxed text-ink">
+                <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
+                {text}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
-      {/* 完成率（本期计划） */}
+      {/* 完成率（本期计划）+ 周均基准 */}
       <section className="mb-5 rounded-xl border border-line bg-surface p-4">
         <h2 className="text-sm font-semibold text-ink">本周计划完成率</h2>
         <p className="mt-0.5 text-xs text-ink3">
           本周期 {view.completion.total} 项，完成 {view.completion.done} 项
+          {priorAvg > 0 ? ` · 近 8 周周均打卡 ${priorAvg.toFixed(1)} 次（本周已 ${doneThisWeek} 次）` : ""}
         </p>
         <div className="mt-3 flex items-center gap-3">
           <div className="h-3 flex-1 overflow-hidden rounded-full bg-surface2">
@@ -76,7 +62,7 @@ export function Progress() {
           <span className="num text-sm font-semibold text-ink">{ratePct}%</span>
         </div>
         {view.completion.total === 0 && (
-          <p className="mt-2 text-xs text-ink3">还没有计划——跟助手说一句就能建</p>
+          <p className="mt-2 text-xs text-ink3">还没有计划——直接跟助手说一句，它会帮你建好</p>
         )}
       </section>
 
@@ -113,30 +99,6 @@ export function Progress() {
                   {w.deltaPct === null ? "新增" : `${w.deltaPct > 0 ? "+" : ""}${w.deltaPct}%`}
                 </span>
               </div>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* 近 14 天趋势（小柱） */}
-      <section className="rounded-xl border border-line bg-surface p-4">
-        <div className="mb-3 flex items-baseline justify-between">
-          <h2 className="text-sm font-semibold text-ink">近 14 天记录趋势</h2>
-          <span className="num text-xs text-ink3">单位：笔</span>
-        </div>
-        <div className="flex items-end gap-1.5" style={{ height: 72 }}>
-          {view.trend14.map((t) => {
-            const max = Math.max(1, ...view.trend14.map((x) => x.count));
-            return (
-              <div
-                key={t.date}
-                title={`${t.date}：${t.count} 笔`}
-                className="flex-1 rounded"
-                style={{
-                  height: `${Math.max(6, (t.count / max) * 100)}%`,
-                  background: t.count === 0 ? "var(--surface-2)" : "var(--accent)",
-                }}
-              />
             );
           })}
         </div>

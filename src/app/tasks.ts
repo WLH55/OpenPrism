@@ -24,10 +24,20 @@ export interface TaskDef {
   instruction: string;
   trigger: TaskTrigger;
   enabled: boolean;
+  /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送；缺省 = inapp */
+  notifyChannel?: "inapp" | "wechat";
+  /** 内置任务标记（2026-09-29）：每用户种子一次性（users.builtins_seeded），删了不复活；UI 带「内置」徽标 */
+  builtin?: BuiltinTaskKind;
+  /** 内置任务指令已被用户改过（2026-09-30 任务编辑）：ensureBuiltins 单源同步跳过；
+   *  resetInstruction 或把文案改回 DEFS 副本原文即自动清除（恢复同步）。非内置任务恒无此标记 */
+  customized?: boolean;
   tzOffsetMinutes: number;
   createdTs: number;
   lastRunTs?: number;
 }
+
+/** 内置三件套（2026-09-29 SDD 逾期处理与内置任务）：标记值即身份 */
+export type BuiltinTaskKind = "daily-brief" | "daily-report" | "weekly-review";
 
 export interface TaskRun {
   ts: number;
@@ -211,11 +221,12 @@ export function nextDue(trigger: TaskTrigger, fromTs: number, tz: number): numbe
 
 const WEEKDAY_NAMES = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"]; // 1=周一 … 7=周日
 
-/** 按任务时区显示时刻（用户看到的是自己钟面上的日期与钟点） */
+/** 按任务时区显示时刻（用户看到的是自己钟面上的日期与钟点）；秒非零时补 :ss（单次任务可指定到秒），整分保持 HH:mm */
 export function formatLocal(ts: number, tzOffsetMinutes: number): string {
   const shifted = new Date(ts + tzOffsetMinutes * 60000);
   const pad = (n: number): string => String(n).padStart(2, "0");
-  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  const base = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  return ts % 60000 === 0 ? base : `${base}:${pad(shifted.getUTCSeconds())}`;
 }
 
 /** 触发规则的人话描述（到点注入与记忆提取共用同一份口径） */
@@ -324,6 +335,9 @@ interface TaskRow {
   tz_offset_minutes: number;
   created_ts: number;
   last_run_ts: number | null;
+  notify_channel: string | null;
+  builtin: string | null;
+  customized: number;
 }
 
 function rowToTask(row: TaskRow): TaskDef {
@@ -335,14 +349,67 @@ function rowToTask(row: TaskRow): TaskDef {
     instruction: row.instruction,
     trigger: JSON.parse(row.trigger_json) as TaskTrigger,
     enabled: row.enabled === 1,
+    ...(row.notify_channel !== null ? { notifyChannel: row.notify_channel as "inapp" | "wechat" } : {}),
+    ...(row.builtin !== null ? { builtin: row.builtin as BuiltinTaskKind } : {}),
+    ...(row.customized === 1 ? { customized: true } : {}),
     tzOffsetMinutes: row.tz_offset_minutes,
     createdTs: row.created_ts,
     ...(row.last_run_ts !== null ? { lastRunTs: row.last_run_ts } : {}),
   };
 }
 
-export class TaskStore {
-  constructor(private deps: TaskStoreDeps) {}
+/**
+ * 内置三件套（2026-09-29 SDD 逾期处理与内置任务）：简报管"今天要干嘛"，晚间汇报管"今天干得怎样"，
+ * 周复盘管"这周值不值"。指令文案集中在此便于热改；到点助手可 query_ledger 读当日实况，不是死模板。
+ */
+const BUILTIN_TASK_DEFS: ReadonlyArray<{
+  builtin: BuiltinTaskKind;
+  title: string;
+  instruction: string;
+  trigger: TaskTrigger;
+}> = [
+  {
+    builtin: "daily-brief",
+    title: "每日简报",
+    instruction:
+      "生成今日简报：先用 query_ledger 查 what=today（含 top3），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 一个今日聚焦建议——从待做计划里挑最值得先动的一件。语气温和，最后提醒可以去 web 端「今天」页看完整视图。",
+    trigger: { kind: "daily", time: "08:30" },
+  },
+  {
+    builtin: "daily-report",
+    title: "每日晚间汇报",
+    instruction:
+      "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。",
+    trigger: { kind: "daily", time: "20:00" },
+  },
+  {
+    builtin: "weekly-review",
+    title: "每周复盘",
+    instruction:
+      "每周复盘时间。先用 query_ledger 查 what=today 与 what=plans。today 载荷的计划含近 30 天完成存档（每条带 doneAt 完成时刻），按 doneAt 归类自然周即可得到本周/上周完成数——数字只能来自载荷，数据不足就明说，不要编。给出：1) 本周完成 vs 上周（含仍在逾期与进行中的事项）；2) 一条本周行为观察（可参考本周流水规律）；3) 下周最值得聚焦的一件事及原因。最后问用户下周想重点推进什么——回复可顺势落成新计划。",
+    trigger: { kind: "weekly", days: [7], time: "21:00" },
+  },
+];
+
+/** 内置三件套的模板投影（GET /api/tasks/templates，评审 2026-09-29 #13）：提醒页模板按钮的唯一文案来源，
+ *  与 BUILTIN_TASK_DEFS 单源——改指令只改一处，模板按钮不再手抄漂移 */
+export function builtinTaskTemplates(): Array<{
+  builtin: BuiltinTaskKind;
+  title: string;
+  instruction: string;
+  trigger: TaskTrigger;
+  label: string;
+}> {
+  return BUILTIN_TASK_DEFS.map((def) => ({
+    builtin: def.builtin,
+    title: def.title,
+    instruction: def.instruction,
+    trigger: def.trigger,
+    label: describeTrigger(def.trigger, 480),
+  }));
+}
+
+export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
 
   async list(uid: string): Promise<TaskDef[]> {
     const rows = this.deps.db
@@ -359,37 +426,127 @@ export class TaskStore {
   async create(
     uid: string,
     input: Omit<TaskDef, "id" | "uid" | "createdTs" | "enabled" | "tzOffsetMinutes"> &
-      Partial<Pick<TaskDef, "enabled" | "tzOffsetMinutes">>,
+      Partial<Pick<TaskDef, "enabled" | "tzOffsetMinutes">> & { id?: string },
   ): Promise<TaskDef> {
     if (input.title.trim() === "" || input.instruction.trim() === "") throw new Error("title/instruction 必填");
     validateTrigger(input.trigger);
+    if (input.notifyChannel !== undefined && input.notifyChannel !== "inapp" && input.notifyChannel !== "wechat") {
+      throw new Error("notifyChannel 只支持 inapp | wechat");
+    }
+    if (input.builtin !== undefined && !BUILTIN_TASK_DEFS.some((d) => d.builtin === input.builtin)) {
+      throw new Error(`builtin 只支持 ${BUILTIN_TASK_DEFS.map((d) => d.builtin).join(" | ")}`);
+    }
     const task: TaskDef = {
-      id: this.deps.randomUUID(),
+      id: input.id ?? this.deps.randomUUID(),
       uid,
       agentId: input.agentId,
       title: input.title.trim(),
       instruction: input.instruction.trim(),
       trigger: input.trigger,
       enabled: input.enabled ?? true,
+      ...(input.notifyChannel !== undefined ? { notifyChannel: input.notifyChannel } : {}),
+      ...(input.builtin !== undefined ? { builtin: input.builtin } : {}),
       tzOffsetMinutes: input.tzOffsetMinutes ?? 0,
       createdTs: this.deps.now(),
     };
     this.deps.db
       .prepare(
-        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        "INSERT INTO tasks (id, uid, agent_id, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel, builtin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
       )
-      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs);
+      .run(task.id, uid, task.agentId ?? null, task.title, task.instruction, JSON.stringify(task.trigger), task.enabled ? 1 : 0, task.tzOffsetMinutes, task.createdTs, task.notifyChannel ?? null, task.builtin ?? null);
     return task;
   }
 
-  async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger">>): Promise<TaskDef> {
+  /**
+   * 内置三件套种子（2026-09-29）：种子一次性（users.builtins_seeded 标记）——
+   * 重复调用幂等；用户删除内置任务后重启不复活（标记已置），提醒页模板按钮可一键重建。
+   * 注册路径与进程启动补种共用；tz 默认东八区（单用户自部署，可改）。
+   */
+  async ensureBuiltins(uid: string): Promise<number> {
+    const row = this.deps.db.prepare("SELECT builtins_seeded FROM users WHERE uid = ?").get(uid) as
+      | { builtins_seeded: number }
+      | undefined;
+    if (!row) return 0;
+    const seeded = row.builtins_seeded === 1;
+    let changed = 0;
+    for (const def of BUILTIN_TASK_DEFS) {
+      // 确定性 id（builtin-{kind}-{uid}）：不依赖注入方 uuid 的唯一性（测试夹具常给固定值），三连插不撞主键
+      const id = `builtin-${def.builtin}-${uid}`;
+      const existing = await this.get(uid, id);
+      if (existing === null) {
+        // 部分种子自愈（评审 2026-09-29）：标记未置=上次中途失败，重入补齐；标记已置=用户删过，不复活
+        if (seeded) continue;
+        await this.create(uid, {
+          id,
+          title: def.title,
+          instruction: def.instruction,
+          trigger: def.trigger,
+          notifyChannel: "inapp",
+          builtin: def.builtin,
+          tzOffsetMinutes: 480,
+        });
+        changed += 1;
+        continue;
+      }
+      // 指令单源同步（评审 2026-09-30 种子楔子）：指令文案活在 DB 行里，DEFS 改版只影响新用户——
+      // 已种子用户会带着旧口径（如 what=goals）触发，模型撞已下线视角；就地更新维持 DEFS 为唯一文案来源。
+      // 例外（2026-09-30 任务编辑）：用户改过文案（customized）的行跳过——用户的版本优先于 DEFS
+      if (existing.customized === true) continue;
+      if (existing.instruction !== def.instruction) {
+        await this.update(uid, id, { instruction: def.instruction });
+        changed += 1;
+      }
+    }
+    if (!seeded) this.deps.db.prepare("UPDATE users SET builtins_seeded = 1 WHERE uid = ?").run(uid);
+    return changed;
+  }
+
+  /** 编辑任务（2026-09-30 任务编辑入口）：白名单收口——HTTP 边界透传 body，未知键（id/builtin/customized…）不注入；
+   *  内置任务 instruction 与 DEFS 副本不同 = 用户自定义（启动同步跳过），改回副本原文自动恢复同步；
+   *  resetInstruction 一键还原 DEFS 副本（仅内置任务） */
+  async update(
+    uid: string,
+    id: string,
+    patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">> & { resetInstruction?: boolean },
+  ): Promise<TaskDef> {
     const task = await this.get(uid, id);
     if (!task) throw new Error(`task "${id}" 不存在`);
-    if (patch.trigger) validateTrigger(patch.trigger);
-    const next: TaskDef = { ...task, ...patch };
+    const { enabled, instruction, title, trigger, notifyChannel, resetInstruction } = patch;
+    if (trigger !== undefined) validateTrigger(trigger);
+    if (notifyChannel !== undefined && notifyChannel !== "inapp" && notifyChannel !== "wechat") {
+      throw new Error("notifyChannel 只支持 inapp | wechat");
+    }
+    if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("enabled 需为布尔值");
+    if (title !== undefined && (typeof title !== "string" || title.trim() === "")) throw new Error("title 必填且不能为空白");
+    const builtinDef = task.builtin !== undefined ? BUILTIN_TASK_DEFS.find((d) => d.builtin === task.builtin) : undefined;
+
+    let instructionNext = task.instruction;
+    let customizedNext = task.customized === true;
+    if (resetInstruction === true) {
+      if (builtinDef === undefined) throw new Error("resetInstruction 只适用于内置任务");
+      instructionNext = builtinDef.instruction;
+      customizedNext = false;
+    } else if (typeof instruction === "string") {
+      const trimmed = instruction.trim();
+      if (trimmed === "") throw new Error("instruction 必填且不能为空白");
+      instructionNext = trimmed;
+      // 与 DEFS 副本比较决定同步去留：同步路径自身传的就是副本原文，天然不置位
+      if (builtinDef !== undefined) customizedNext = trimmed !== builtinDef.instruction;
+    }
+
+    const { customized: _prev, ...rest } = task;
+    const next: TaskDef = {
+      ...rest,
+      instruction: instructionNext,
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(title !== undefined ? { title: title.trim() } : {}),
+      ...(trigger !== undefined ? { trigger } : {}),
+      ...(notifyChannel !== undefined ? { notifyChannel } : {}),
+      ...(customizedNext ? { customized: true } : {}),
+    };
     this.deps.db
-      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ? WHERE id = ? AND uid = ?")
-      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, id, uid);
+      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ?, notify_channel = ?, customized = ? WHERE id = ? AND uid = ?")
+      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, next.notifyChannel ?? null, next.customized === true ? 1 : 0, id, uid);
     return next;
   }
 
@@ -435,6 +592,9 @@ const CATCHUP_WINDOW_MS = 24 * 3600 * 1000;
 
 export class Scheduler {
   private timer: ReturnType<typeof setInterval> | undefined;
+  /** 重入防护（评审 2026-09-29 pre-existing）：模型回合可超 tick 间隔（last_run_ts 要等 whenIdle 后才写），
+   *  上一轮未结束时跳过本轮——慢回合不再二次投递同任务（双通知/双 ran），其他到期任务顺延到下轮 */
+  private ticking = false;
 
   constructor(private deps: SchedulerDeps) {}
 
@@ -450,6 +610,16 @@ export class Scheduler {
 
   /** 触发到点/补跑；返回实际执行数（测试用）。锚点 = lastRunTs ?? createdTs。 */
   async tick(): Promise<number> {
+    if (this.ticking) return 0;
+    this.ticking = true;
+    try {
+      return await this.tickInner();
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async tickInner(): Promise<number> {
     const now = this.deps.now();
     let fired = 0;
     for (const uid of this.deps.uids()) {
@@ -498,6 +668,8 @@ export interface TaskToolsDeps {
   uid: string;
   /** nextDueAt 展示用（query_tasks）；缺省 0（once 任务原样回 at） */
   now(): number;
+  /** 用户本地时区偏置（评审 2026-09-29 #17）：agent 建任务的触发时刻按用户钟面解释，缺省取进程本地 */
+  tzOffsetMinutes?: number;
 }
 
 export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
@@ -510,9 +682,10 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       properties: {
         title: { type: "string" },
         instruction: { type: "string", description: "每次到点投给智能体的自然语言指令" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp 站内（默认）| wechat 微信机器人（需用户已在 IM 通道页绑定）" },
         trigger: {
           type: "object",
-          description: '如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
+          description: '时刻按用户当地钟面解释（如用户说"明早 8 点"就填 08:00，系统按用户时区调度）。如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
         },
       },
     },
@@ -521,11 +694,14 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       render: (_args, value) => [{ type: "text", text: `已建定时任务（${(value as { taskId: string }).taskId}）` }],
     },
     async execute(args) {
-      const input = (args ?? {}) as { title?: string; instruction?: string; trigger?: TaskTrigger };
+      const input = (args ?? {}) as { title?: string; instruction?: string; trigger?: TaskTrigger; notifyChannel?: string };
       const task = await deps.store.create(deps.uid, {
         title: String(input.title ?? ""),
         instruction: String(input.instruction ?? ""),
         trigger: input.trigger as TaskTrigger,
+        ...(input.notifyChannel === "wechat" || input.notifyChannel === "inapp" ? { notifyChannel: input.notifyChannel } : {}),
+        // 触发时刻按用户钟面解释（评审 #17）：会话注入 tz，不再落 UTC 缺省导致"明早 8 点"变 16:30
+        tzOffsetMinutes: deps.tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
       });
       return { taskId: task.id };
     },
@@ -544,8 +720,8 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     output: {
       schema: { type: "object", required: ["tasks"], properties: { tasks: { type: "array" } } },
       render: (_args, value) => {
-        const tasks = (value as { tasks: { title: string }[] }).tasks ?? [];
-        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => t.title).join("；")}`;
+        const tasks = (value as { tasks: { title: string; builtin?: string }[] }).tasks ?? [];
+        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => (t.builtin !== undefined ? `${t.title}（内置）` : t.title)).join("；")}`;
         return [{ type: "text", text }];
       },
     },
@@ -568,7 +744,9 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
             instruction: t.instruction,
             trigger: t.trigger,
             enabled: t.enabled,
+            ...(t.builtin !== undefined ? { builtin: t.builtin } : {}), // 内置标记（评审 O4）：模型可定位"把内置的简报挪到九点"
             ...(t.agentId !== undefined ? { agentId: t.agentId } : {}),
+            ...(t.notifyChannel !== undefined ? { notifyChannel: t.notifyChannel } : {}),
             ...(t.lastRunTs !== undefined ? { lastRunTs: t.lastRunTs } : {}),
             ...(nextDueAt !== undefined ? { nextDueAt } : {}),
           };
@@ -589,6 +767,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         enabled: { type: "boolean" },
         title: { type: "string" },
         instruction: { type: "string" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp（默认）| wechat" },
         trigger: { type: "object", description: "与 create_task 同格式，整包替换" },
       },
     },
@@ -600,14 +779,18 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { taskId?: string; enabled?: boolean; title?: string; instruction?: string; trigger?: TaskTrigger };
+      const input = (args ?? {}) as { taskId?: string; enabled?: boolean; title?: string; instruction?: string; trigger?: TaskTrigger; notifyChannel?: string };
       if (typeof input.taskId !== "string" || input.taskId === "") throw new Error("taskId 必填（query_tasks 拿）");
       const patch: Parameters<TaskStore["update"]>[2] = {};
       if (input.enabled !== undefined) patch.enabled = Boolean(input.enabled);
       if (input.title !== undefined) patch.title = String(input.title);
       if (input.instruction !== undefined) patch.instruction = String(input.instruction);
       if (input.trigger !== undefined) patch.trigger = input.trigger as TaskTrigger;
-      if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger");
+      if (input.notifyChannel !== undefined) {
+        if (input.notifyChannel !== "inapp" && input.notifyChannel !== "wechat") throw new Error("notifyChannel 只支持 inapp | wechat");
+        patch.notifyChannel = input.notifyChannel;
+      }
+      if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger / notifyChannel");
       const task = await deps.store.update(deps.uid, input.taskId, patch);
       return { id: task.id, title: task.title, enabled: task.enabled };
     },

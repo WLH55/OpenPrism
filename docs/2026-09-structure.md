@@ -62,7 +62,7 @@
 | `ledger.ts` | **账本**：每用户一份只追加 `life.jsonl`，四种记录（流水 event / 计划 plan / 打卡 checkin / 作废 void）；串行写队列；作废 = 追加 void 引用 targetSeq，不原地改 |
 | `fold.ts` | **确定性折叠**（零 token）：今天视图（流水+计划打卡态+streak）、分类页（30 天日序列）、进步页（完成率/周环比/14 天趋势）。全部是账本的纯函数 |
 | `tools.ts` | 账本录入工具六件：record_flow / create_plan / checkin_plan / query_ledger（只读）/ void_flow / cancel_plan——模型写账本的唯一通道 |
-| `persona.ts` | system prompt 合成：人设卡（H1 推名字）→ 日期 → 记忆块 → 行为纪律（"写入必须走工具"） |
+| `persona.ts` | system prompt 合成：人设卡（纯自由 markdown，名字走表单字段不推导）→ 日期 → 记忆块 → 行为纪律（"写入必须走工具"） |
 | `agents.ts` | 智能体配置：persona.md（自由 markdown）+ binding.json（工具开关/技能/MCP 绑定） |
 | `skills.ts` | 技能：标准 SKILL.md（frontmatter 解析）；渐进式加载——目录层常驻 prompt，正文经 load_skill 工具按需载入 |
 | `mcp.ts` | MCP 客户端：仅 remote URL 型，Streamable HTTP JSON-RPC 最小实现；安装时连接测试一次，绑定即授权 |

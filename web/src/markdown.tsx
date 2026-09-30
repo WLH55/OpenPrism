@@ -6,6 +6,23 @@ import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import { useLightbox } from "./lightbox";
+
+/** 正文里的图片：点击开查看层看大图（模型偶尔会在回答里放图片链接） */
+function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  const openImage = useLightbox();
+  if (!src) return null;
+  return (
+    <button
+      type="button"
+      title="点击看大图"
+      className="my-2 block cursor-zoom-in"
+      onClick={() => openImage({ src, name: alt ?? "图片" })}
+    >
+      <img src={src} alt={alt ?? ""} className="max-h-64 max-w-full rounded-lg transition hover:opacity-90" />
+    </button>
+  );
+}
 
 const components: Components = {
   p: ({ node: _node, ...props }) => <p className="my-2 first:mt-0 last:mb-0" {...props} />,
@@ -40,7 +57,7 @@ const components: Components = {
     />
   ),
   a: ({ node: _node, ...props }) => <a className="text-accent underline underline-offset-2" target="_blank" rel="noreferrer" {...props} />,
-  img: ({ node: _node, ...props }) => <img className="my-2 max-h-64 max-w-full rounded-lg" {...props} />,
+  img: ({ node: _node, src, alt }) => <MarkdownImage src={src} alt={alt} />,
   table: ({ node: _node, ...props }) => (
     <div className="my-2 overflow-x-auto">
       <table className="w-full border-collapse text-[14px]" {...props} />

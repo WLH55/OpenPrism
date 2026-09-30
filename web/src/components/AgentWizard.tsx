@@ -55,7 +55,7 @@ export function AgentWizard({ onDone, onCancel }: { onDone: (id: string) => void
     try {
       const created = await api2.createAgent({
         name: name.trim(),
-        persona: persona.trim() || "# " + name.trim() + "\n（向导创建，灵魂待补充）",
+        persona: persona.trim() || "（向导创建，灵魂待补充）",
         description: description.trim(),
         emoji: face.emoji,
         color: face.color,
@@ -135,7 +135,7 @@ export function AgentWizard({ onDone, onCancel }: { onDone: (id: string) => void
         <div className="space-y-4">
           <div>
             <h2 className="text-xl font-semibold text-ink">赋予它灵魂</h2>
-            <p className="mt-1 text-sm text-ink3">从模板起步，或直接自己写——这段文字就是它的灵魂（之后可随时改）。</p>
+            <p className="mt-1 text-sm text-ink3">从模板起步，或直接自己写——这段文字就是它的灵魂（只写性格与做事方式，名字等固定信息在第①步，之后可随时改）。</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <button type="button" className={chip(soulSource === "")} onClick={() => { setSoulSource(""); setPersona(""); }}>
@@ -158,7 +158,7 @@ export function AgentWizard({ onDone, onCancel }: { onDone: (id: string) => void
           <textarea
             rows={14}
             className={`${inputCls} resize-y font-mono text-sm leading-relaxed`}
-            placeholder={"# 名字\n\n## 语气\n…\n\n## 我怎么帮你\n…\n\n## 边界\n…"}
+            placeholder={"## 语气\n…\n\n## 我怎么帮你\n…\n\n## 边界\n…"}
             value={persona}
             onChange={(e) => setPersona(e.target.value)}
           />

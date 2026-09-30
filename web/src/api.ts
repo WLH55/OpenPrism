@@ -17,6 +17,15 @@ export interface ModelProvider {
   hasKey: boolean;
   /** 提供方用途：chat=对话/提取，embedding=记忆向量（2026-09-18） */
   kind: string;
+  /** 该模型是否支持图片识别（多模态）：对话里发图的前提 */
+  multimodal: boolean;
+}
+
+/** 用户形象（头像图片 data URL / emoji / 色盘） */
+export interface FaceLoose {
+  avatar: string;
+  emoji: string;
+  color: string;
 }
 
 export interface ConversationEntry {
@@ -34,6 +43,21 @@ export interface TodayPlanView {
   due?: string;
   done: boolean;
   checkinTs?: number;
+  /** 确定性状态：overdue/dueToday/doing/todo/upcoming/done（旧服务端无此字段 → 用 done 兜底） */
+  state?: "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
+  /** 当前可撤销的打卡 seq：deadline 型完成=全部存活 done 打卡；周期型今日 done=今日打卡——撤销=逐条作废（与计划页同规） */
+  doneSeqs?: number[];
+  /** 最近 10 条存活 done 打卡（倒序，含非今日）——撤历史卡凭据 */
+  checkins?: { seq: number; at: number }[];
+  /** 账本 seq：逾期「跳过」= 作废该 plan 记录 */
+  seq?: number;
+  /** 完成时刻（最新存活 done 打卡）——已完成视图按它倒序/过滤近 30 天 */
+  doneAt?: number;
+  /** 今天完成的确定性标记（评审 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天（上周完成的里程碑 state=done 但 doneToday=false） */
+  doneToday?: boolean;
+  /** 习惯计划（2026-09-30）：配额与当前周期进度，成对出现——day=今日打卡次数；week/month/year=本期不同本地日数 */
+  timesPerPeriod?: number;
+  periodCount?: number;
 }
 
 export interface TodayFlowView {
@@ -51,21 +75,42 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
+  /** 今日必做（确定性折叠：逾期 > 今日截止 > 覆盖今天的未完成；目标层级 2026-09-30 下线后无补位终端） */
+  top3: TopItemLoose[];
+}
+
+/** 今日必做条目（确定性折叠：逾期 > 今日截止 > 覆盖今天） */
+export interface TopItemLoose {
+  kind: "overdue" | "dueToday" | "today";
+  title: string;
+  planId?: string;
+  due?: string;
+  /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
+  progress?: string;
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
+/** 内容块宽松视图：文本 / 图片（base64）/ 文本附件 / 工具调用 */
+export interface BlockLoose {
+  type: string;
+  text?: string;
+  mediaType?: string;
+  data?: string;
+  name?: string;
+}
+
 export interface SessionEventLoose {
   type: string;
   seq?: number;
   ts?: number;
   channel?: string;
-  message?: { role: string; content: { type: string; text?: string }[]; reasoning?: string; interrupted?: boolean };
+  message?: { role: string; content: BlockLoose[]; reasoning?: string; interrupted?: boolean };
   id?: string;
   name?: string;
   args?: unknown;
   isError?: boolean;
   code?: string;
-  content?: { type: string; text?: string }[];
+  content?: BlockLoose[];
   reason?: string;
 }
 
@@ -78,7 +123,7 @@ export interface LiveEventLoose {
   id?: string;
   name?: string;
   isError?: boolean;
-  content?: { type: string; text?: string }[];
+  content?: BlockLoose[];
   code?: string;
   reason?: string;
   error?: string;
@@ -91,14 +136,35 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     let error = `HTTP ${res.status}`;
+    let code: string | undefined;
     try {
-      error = ((await res.json()) as { error?: string }).error ?? error;
+      const body = (await res.json()) as { error?: string; code?: string };
+      error = body.error ?? error;
+      code = body.code;
     } catch {
       /* 保持状态码文案 */
     }
-    throw Object.assign(new Error(error), { status: res.status });
+    throw Object.assign(new Error(error), { status: res.status, code });
   }
   return (await res.json()) as T;
+}
+
+export interface MeLoose {
+  username: string;
+  face: FaceLoose;
+  /** 用户档案时区（分钟；缺省 = 未上报，前端静默补报） */
+  tzOffsetMinutes?: number;
+}
+
+/** 一条待发附件（浏览器加工后的形态） */
+export interface AttachmentInput {
+  kind: "image" | "file";
+  name: string;
+  mediaType: string;
+  /** kind=image：base64 裸数据 */
+  dataBase64?: string;
+  /** kind=file：正文 */
+  text?: string;
 }
 
 export const api = {
@@ -107,13 +173,15 @@ export const api = {
   login: (username: string, password: string) =>
     request<{ uid: string; username: string }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  me: () => request<{ uid: string; username: string }>("/api/auth/me"),
+  me: () => request<MeLoose>("/api/auth/me"),
+  updateProfile: (patch: { avatar?: string; emoji?: string; color?: string; tzOffsetMinutes?: number }) =>
+    request<MeLoose>("/api/auth/profile", { method: "PUT", body: JSON.stringify(patch) }),
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
   getModels: () => request<{ activeId: string | null; providers: ModelProvider[] }>("/api/models"),
-  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string; kind?: string }) =>
+  addModel: (input: { baseURL: string; apiKey?: string; model: string; contextWindow?: number | null; platform?: string; kind?: string; multimodal?: boolean }) =>
     request<{ id: string }>("/api/models", { method: "POST", body: JSON.stringify(input) }),
-  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null; kind?: string }) =>
+  updateModel: (id: string, input: { baseURL?: string; apiKey?: string; model?: string; contextWindow?: number | null; kind?: string; multimodal?: boolean }) =>
     request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
   activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
@@ -124,16 +192,39 @@ export const api = {
     request<ConversationEntry>("/api/conversations", { method: "POST", body: JSON.stringify(title ? { title } : {}) }),
   deleteConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}`, { method: "DELETE" }),
   autoTitle: (cid: string) => request<{ ok: boolean; title?: string }>(`/api/conversations/${cid}/title`, { method: "POST" }),
-  conversationEvents: (cid: string) => request<SessionEventLoose[]>(`/api/conversations/${cid}/events`),
-  sendMessage: (cid: string, text: string) =>
-    request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, { method: "POST", body: JSON.stringify({ text }) }),
+  /** 分段加载（2026-09-23）：limit = 最近 N 条；before = seq 游标（取更早一段）；都不传 = 全量 */
+  conversationEvents: (cid: string, options?: { before?: number; limit?: number }): Promise<SessionEventLoose[]> => {
+    const params = new URLSearchParams();
+    if (options?.before !== undefined) params.set("before", String(options.before));
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const query = params.toString();
+    return request<SessionEventLoose[]>(`/api/conversations/${cid}/events${query ? `?${query}` : ""}`);
+  },
+  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = []) =>
+    request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, {
+      method: "POST",
+      body: JSON.stringify(attachments.length > 0 ? { text, attachments } : { text }),
+    }),
+  /** 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息 */
+  stopConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}/stop`, { method: "POST" }),
 
   today: () => request<TodayView>(`/api/today?tz=${-new Date().getTimezoneOffset()}`),
   quickFlow: (input: { category: string; note?: string; value?: number; unit?: string }) =>
     request<{ seq: number }>("/api/flows", { method: "POST", body: JSON.stringify(input) }),
   voidRecord: (seq: number) => request<{ ok: boolean }>("/api/void", { method: "POST", body: JSON.stringify({ seq }) }),
-  checkin: (planId: string, done = true) =>
-    request<{ ok: boolean }>("/api/checkin", { method: "POST", body: JSON.stringify({ planId, done }) }),
+  checkin: (planId: string, done = true, date?: string) =>
+    request<{ ok: boolean }>("/api/checkin", {
+      method: "POST",
+      body: JSON.stringify({ planId, done, ...(date !== undefined ? { date } : {}) }),
+    }),
+
+  // ── 计划（2026-09-30 目标层级下线）：UI 建计划入口随 Plans 页移除，创建走对话（agent 工具，同一账本） ──
+  /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定 */
+  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number }) =>
+    request<{ ok: boolean; planId: string; title: string }>(`/api/plans/${encodeURIComponent(planId)}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
 };
 
 export function openConversationStream(cid: string, onEvent: (event: LiveEventLoose) => void): () => void {
@@ -240,6 +331,8 @@ export const api2 = {
   consolidateMemory: () =>
     request<{ reviewed: number; expired: number; demoted: number; merged: number; skipped?: string }>("/api/memory/consolidate", { method: "POST" }),
   exportMemoryUrl: () => "/api/memory/export",
+  /** 数据导出（2026-09-30）：json = 全量备份（含历史与作废）；md = 按日时间线（人读） */
+  exportDataUrl: (format: "json" | "md") => `/api/export/data.${format}`,
 
   // ── 主题计数与向量召回（2026-09-18） ──────────────────
   listMemoryTopics: () =>
@@ -281,6 +374,12 @@ export interface TaskLoose {
   trigger: TaskTriggerLoose;
   enabled: boolean;
   agentId?: string;
+  /** 通知渠道（2026-09-27）：inapp 站内（默认）| wechat 站内记录+微信机器人推送 */
+  notifyChannel?: "inapp" | "wechat";
+  /** 内置任务标记（2026-09-29）：daily-brief | daily-report | weekly-review——UI 带「内置」徽标 */
+  builtin?: string;
+  /** 内置任务指令已被用户改过（2026-09-30 任务编辑）：启动同步跳过；「恢复默认文案」可清除 */
+  customized?: boolean;
   lastRunTs?: number;
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
@@ -332,11 +431,12 @@ export interface NotificationLoose {
 
 export const api3 = {
   listTasks: () => request<TaskLoose[]>("/api/tasks"),
-  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string }) =>
-    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
-  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title">> & { trigger?: TaskTriggerLoose }) =>
+  createTask: (input: { title: string; instruction: string; trigger: TaskTriggerLoose; tzOffsetMinutes?: number; agentId?: string; notifyChannel?: "inapp" | "wechat" }) =>    request<TaskLoose>("/api/tasks", { method: "POST", body: JSON.stringify({ tzOffsetMinutes: -new Date().getTimezoneOffset(), ...input }) }),
+  updateTask: (id: string, patch: Partial<Pick<TaskLoose, "enabled" | "instruction" | "title" | "notifyChannel">> & { trigger?: TaskTriggerLoose; resetInstruction?: boolean }) =>
     request<TaskLoose>(`/api/tasks/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
+  /** 内置三件套模板投影（评审 #13 单源）：与服务端 BUILTIN_TASK_DEFS 同源，提醒页模板按钮取此文案 */
+  taskTemplates: () => request<{ builtin: string; title: string; instruction: string; trigger: TaskTriggerLoose; label: string }[]>("/api/tasks/templates"),
   runTask: (id: string) => request<{ ok: boolean }>(`/api/tasks/${id}/run`, { method: "POST" }),
   taskRuns: (id: string) => request<TaskRunLoose[]>(`/api/tasks/${id}/runs`),
 
@@ -355,12 +455,21 @@ export interface CategoryPeriodLoose {
   total: number;
   daily: { date: string; count: number; total: number }[];
   flows: TodayFlowView[];
+  /** B4（2026-09-28）：上一同长周期对照（归因句数据源） */
+  lastPeriod: { count: number; total: number };
 }
 export interface ProgressLoose {
   streakDays: number;
   completion: { done: number; total: number; rate: number };
   weekOverWeek: { category: string; thisWeek: number; lastWeek: number; deltaPct: number | null }[];
   trend14: { date: string; count: number }[];
+  /** B4（2026-09-28）：基准锚点 + 行为模式 */
+  bestStreak: number;
+  weeklyDone8w: { weekStart: string; done: number }[];
+  hourBuckets: { morning: number; afternoon: number; evening: number; night: number };
+  topCategory: { category: string; count: number } | null;
+  voidedFlows: number;
+  insights: string[];
 }
 
 export const api4 = {
@@ -372,4 +481,25 @@ export const api4 = {
     request<{ moved: number }>("/api/panels/merge", { method: "POST", body: JSON.stringify({ from, to }) }),
   archiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/archive", { method: "POST", body: JSON.stringify({ name }) }),
   unarchiveCategory: (name: string) => request<{ archived: string[] }>("/api/panels/unarchive", { method: "POST", body: JSON.stringify({ name }) }),
+};
+
+// ── 微信桥（2026-09-27）：iLink 扫码绑定 ──────────────────
+export interface WechatBindState {
+  bound: boolean;
+  state: "active" | "expired";
+  ilinkBotId?: string;
+}
+
+export const apiIm = {
+  /** 申请登录二维码（content = 要编码成二维码图形的 URL——真机实证它本身不是图片，前端用 QR 组件渲染） */
+  bindQRCode: () => request<{ qrcode: string; content: string }>("/api/wechat/bind/qrcode", { method: "POST" }),
+  /** 扫码状态长轮询（~35s 一轮；confirmed 即完成绑定） */
+  bindStatus: (qrcode: string) => request<{ status: "wait" | "scaned" | "confirmed" | "expired" }>(`/api/wechat/bind/status?qrcode=${encodeURIComponent(qrcode)}`),
+  bindState: () => request<WechatBindState>("/api/wechat/bind"),
+  unbind: () => request<{ ok: boolean }>("/api/wechat/bind", { method: "DELETE" }),
+  /** 「微信对话」会话当前绑定的伙伴（2026-09-28 增补）：null = 默认助手 */
+  bindAgentState: () => request<{ agentId: string | null }>("/api/wechat/bind/agent"),
+  /** 切换伙伴（null = 默认助手）；web 与微信同一会话，同步生效 */
+  bindAgent: (agentId: string | null) =>
+    request<{ ok: boolean }>("/api/wechat/bind/agent", { method: "PUT", body: JSON.stringify({ agentId }) }),
 };

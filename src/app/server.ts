@@ -2,12 +2,15 @@
 // 路由见 spec §4.2；未登录一律 401 JSON；Key 永不回传（BYOK 铁律）。
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { gzipSync } from "node:zlib";
 import type { DatabaseSync } from "node:sqlite";
 import type { LlmAdapter, PlatformEnv } from "../harness/index";
 import { createOpenAICompatAdapter } from "../harness/index";
-import { appendUser, hashPassword, SessionStore, verifyPassword, type UserRecord } from "./auth";
+import { appendUser, hashPassword, SessionStore, verifyPassword } from "./auth";
+import { builtinTaskTemplates } from "./tasks";
 import {
   activeModelId,
   addModelProvider,
@@ -23,13 +26,19 @@ import {
 } from "./secretbox";
 import type { Ledger } from "./ledger";
 import { categoryView, listCategories, progressView, todayView } from "./fold";
-import { ModelNotConfiguredError, type ConversationStore } from "./conversations";
+import { mergePlanUpdate, parseAt } from "./plans";
+import type { PlanRecord } from "./ledger";
+import { buildExportJson, buildExportMarkdown, type ExportConversation } from "./export";
+import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
+import { parseAttachments } from "./attachments";
+import { faceOf, readUserTz, updateUserFace, updateUserTz, validateTzOffsetMinutes, type UserRecord } from "./auth";
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
 import type { McpRegistry } from "./mcp";
 import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
 import type { MemoryExtractor } from "./memory-extract";
 import { forgetTopic, listUnpromotedTopics, promoteTopicManually, restoreTopic } from "./memory-topics";
+import type { WechatBridge } from "./wechat-bridge";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -62,11 +71,15 @@ export interface ServerDeps {
   notifications: import("./notify").NotificationStore;
   /** 手动/调度共用的任务执行体（main 装配；测试注入 mock） */
   taskRunner(uid: string, task: import("./tasks").TaskDef, run: import("./tasks").TaskRunTrigger): Promise<void>;
+  /** 微信桥（2026-09-27）：IM 绑定路由用；缺省 = 未装配（相关路由 404）；测试注入 fake fetch 驱动的桥 */
+  wechat?: WechatBridge;
   staticDir?: string;
 }
 
 const COOKIE_NAME = "op_session";
 const BODY_LIMIT = 1024 * 1024;
+/** 发消息允许带附件（图片 base64），单独放宽；其余端点仍守 1MB */
+const MESSAGE_BODY_LIMIT = 24 * 1024 * 1024;
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, setCookie?: string): void {
@@ -77,16 +90,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown, setCookie?
   res.end(JSON.stringify(body));
 }
 
-function sendError(res: ServerResponse, status: number, error: string): void {
-  sendJson(res, status, { error });
+function sendError(res: ServerResponse, status: number, error: string, code?: string): void {
+  sendJson(res, status, code === undefined ? { error } : { error, code });
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
+async function readBody(req: IncomingMessage, limit: number = BODY_LIMIT): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > BODY_LIMIT) throw new Error("body too large");
+    if (size > limit) throw new Error("body too large");
     chunks.push(chunk as Buffer);
   }
   if (chunks.length === 0) return {};
@@ -131,9 +144,21 @@ const CONTENT_TYPES: Record<string, string> = {
   ".map": "application/json",
   ".woff2": "font/woff2",
   ".txt": "text/plain; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
 };
 
-async function serveStatic(deps: ServerDeps, res: ServerResponse, pathName: string): Promise<boolean> {
+/** 可 gzip 压缩的文本类扩展名（图片等二进制格式压缩无益） */
+const COMPRESSIBLE_EXTS = new Set([".html", ".js", ".css", ".json", ".svg", ".map", ".txt", ".webmanifest"]);
+
+/** 缓存策略（2026-09-23）：文件名带哈希的构建产物可长缓存；入口与清单不缓存；其余静态文件缓存 7 天 */
+function cacheControlFor(pathName: string, file: string): string {
+  if (pathName.startsWith("/assets/")) return "public, max-age=31536000, immutable";
+  const ext = file.slice(file.lastIndexOf("."));
+  if (ext === ".html" || ext === ".webmanifest") return "no-cache";
+  return "public, max-age=604800";
+}
+
+async function serveStatic(deps: ServerDeps, req: IncomingMessage, res: ServerResponse, pathName: string): Promise<boolean> {
   if (!deps.staticDir) return false;
   const rel = pathName === "/" ? "index.html" : pathName.slice(1);
   const file = resolve(deps.staticDir, rel);
@@ -143,8 +168,21 @@ async function serveStatic(deps: ServerDeps, res: ServerResponse, pathName: stri
     if (!info.isFile()) return false;
     const data = await readFile(file);
     const ext = file.slice(file.lastIndexOf("."));
-    res.writeHead(200, { "Content-Type": CONTENT_TYPES[ext] ?? "application/octet-stream" });
-    res.end(data);
+    const headers: Record<string, string> = {
+      "Content-Type": CONTENT_TYPES[ext] ?? "application/octet-stream",
+      "Cache-Control": cacheControlFor(pathName, file),
+    };
+    // 文本类资源按 Accept-Encoding 协商 gzip（构建产物 400KB+，手机流量与首屏都受益）
+    const compressible = COMPRESSIBLE_EXTS.has(ext);
+    if (compressible) headers["Vary"] = "Accept-Encoding";
+    if (compressible && /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""))) {
+      headers["Content-Encoding"] = "gzip";
+      res.writeHead(200, headers);
+      res.end(gzipSync(data));
+    } else {
+      res.writeHead(200, headers);
+      res.end(data);
+    }
     return true;
   } catch {
     return false;
@@ -208,7 +246,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   // 静态资源（web/dist）：登录页本身无需登录；认证门只管 /api/*
-  if (method === "GET" && !path.startsWith("/api") && (await serveStatic(deps, res, path))) return;
+  if (method === "GET" && !path.startsWith("/api") && (await serveStatic(deps, req, res, path))) return;
 
   // ── 认证（无需登录） ───────────────────────────────────
   if (method === "POST" && path === "/api/auth/register") {
@@ -229,6 +267,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     deps.users.set(username, user);
     deps.usersByUid?.set(uid, user);
     await deps.ledgerFor(uid); // 注册即开账本（空账本入缓存）
+    try {
+      await deps.tasks.ensureBuiltins(uid); // 内置三件套随号种入（尽力而为：失败不阻断建号，启动补种按确定性 id 自愈）
+    } catch (error) {
+      process.stdout.write(`[openprism] builtin seed on register failed: ${String((error as Error).message)}\n`);
+    }
     const token = deps.sessions.issue(uid);
     return sendJson(res, 200, { uid, username }, sessionCookie(token));
   }
@@ -259,7 +302,29 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (!uid || !user) return sendError(res, 401, "unauthorized");
 
   if (method === "GET" && path === "/api/auth/me") {
-    return sendJson(res, 200, { uid, username: user.username });
+    return sendJson(res, 200, { uid, username: user.username, face: faceOf(user), ...(user.tzOffsetMinutes !== undefined ? { tzOffsetMinutes: user.tzOffsetMinutes } : {}) });
+  }
+
+  // 个人资料：形象（头像图片 / emoji / 色盘）+ 档案时区读写；用户名与口令不改。
+  // tzOffsetMinutes 同时是浏览器静默上报通道（值相同幂等，前端打开网页时刷新——DST 靠下次打开覆盖）
+  if (path === "/api/auth/profile" && method === "PUT") {
+    const body = (await readBody(req)) as { avatar?: string; emoji?: string; color?: string; tzOffsetMinutes?: number };
+    const patch: { avatar?: string; emoji?: string; color?: string } = {};
+    for (const key of ["avatar", "emoji", "color"] as const) {
+      if (body[key] !== undefined) patch[key] = String(body[key]);
+    }
+    try {
+      if (body.tzOffsetMinutes !== undefined) {
+        user.tzOffsetMinutes = updateUserTz(deps.db, uid, body.tzOffsetMinutes); // 校验 ±840 整数，非法 400
+      }
+      const face = updateUserFace(deps.db, uid, patch);
+      user.avatar = face.avatar === "" ? undefined : face.avatar;
+      user.emoji = face.emoji;
+      user.color = face.color;
+      return sendJson(res, 200, { uid, username: user.username, face, ...(user.tzOffsetMinutes !== undefined ? { tzOffsetMinutes: user.tzOffsetMinutes } : {}) });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
   }
 
   // ── 模型接入（BYOK 多供应商） ──────────────────────────
@@ -273,6 +338,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       throw new Error(kind === "embedding" ? "contextWindow 需为正整数（tokens）" : "contextWindow 需为 ≥1000 的整数（tokens）");
     }
     return n;
+  };
+  /** 多模态开关归一：undefined=不改/缺省（false）；只收布尔与其字面量 */
+  const parseMultimodal = (input: unknown): boolean | undefined => {
+    if (input === undefined) return undefined;
+    if (typeof input === "boolean") return input;
+    if (input === "true" || input === "1" || input === 1) return true;
+    if (input === "false" || input === "0" || input === 0) return false;
+    throw new Error("multimodal 需要布尔值");
   };
   /** 提供方用途归一：undefined=不改/缺省（chat） */
   const parseProviderKind = (input: unknown): "chat" | "embedding" | undefined => {
@@ -290,7 +363,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { activeId: activeModelId(deps.db, uid), providers: listModelProviders(deps.db, uid) });
   }
   if (path === "/api/models" && method === "POST") {
-    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string; kind?: unknown };
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; platform?: string; kind?: unknown; multimodal?: unknown };
     const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
     const model = String(body.model ?? "").trim();
     try {
@@ -298,6 +371,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       if (model === "") throw new Error("model 必填");
       const kind = parseProviderKind(body.kind);
       const contextWindow = parseContextWindow(body.contextWindow, kind ?? "chat");
+      const multimodal = parseMultimodal(body.multimodal);
       const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
       const created = addModelProvider(deps.db, uid, {
         baseURL,
@@ -306,6 +380,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         ...(apiKey !== "" ? { keyEnc: seal(deps.masterKey, apiKey) } : {}),
         ...(typeof body.platform === "string" && body.platform.trim() !== "" ? { platform: body.platform.trim() } : {}),
         ...(kind !== undefined ? { kind } : {}),
+        // embedding 用途不接受图片，开关只对对话模型有意义
+        ...(multimodal !== undefined ? { multimodal: (kind ?? "chat") === "chat" ? multimodal : false } : {}),
       });
       return sendJson(res, 200, { id: created.id });
     } catch (error) {
@@ -318,8 +394,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const sub = modelsMatch[2] ?? "";
     try {
       if (sub === "" && method === "PUT") {
-        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; kind?: unknown };
-        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: "chat" | "embedding" } = {};
+        const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; contextWindow?: unknown; kind?: unknown; multimodal?: unknown };
+        const patch: { baseURL?: string; model?: string; contextWindow?: number | null; keyEnc?: string; kind?: "chat" | "embedding"; multimodal?: boolean } = {};
         if (body.baseURL !== undefined) {
           const baseURL = String(body.baseURL).trim().replace(/\/+$/, "");
           validateBaseURL(baseURL);
@@ -340,12 +416,17 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         }
         if (kind !== undefined) patch.kind = kind;
         if (contextWindow !== undefined) patch.contextWindow = contextWindow;
+        const multimodal = parseMultimodal(body.multimodal);
+        if (multimodal !== undefined) patch.multimodal = effectiveKind === "chat" ? multimodal : false;
         const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
         if (apiKey !== "") patch.keyEnc = seal(deps.masterKey, apiKey);
         updateModelProvider(deps.db, uid, providerId, patch);
+        // 该提供方的窗口/多模态开关变了：弃池受影响的会话，下一回合按新配置重装配
+        deps.conversations.evictProviderConversations(uid, providerId);
         return sendJson(res, 200, { ok: true });
       }
       if (sub === "" && method === "DELETE") {
+        deps.conversations.evictProviderConversations(uid, providerId); // 先弃池再删行（删后无从解析有效模型）
         removeModelProvider(deps.db, uid, providerId);
         return sendJson(res, 200, { ok: true });
       }
@@ -425,26 +506,49 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const sub = convMatch[2] ?? "";
 
     if (sub === "/events" && method === "GET") {
-      const rows = deps.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq").all(cid) as unknown as {
-        event_json: string;
-      }[];
-      return sendJson(res, 200, rows.map((row) => JSON.parse(row.event_json)));
+      // 归属校验（2026-09-23 越权修复）：会话不属于当前用户时按不存在处理，事件一个字节都不回
+      if (deps.conversations.ownerOf(cid) !== uid) return sendError(res, 404, "会话不存在");
+      // 分段参数（2026-09-23）：limit = 最近 N 条；before = 与 limit 连用的 seq 游标（取更早一段）
+      let before: number | undefined;
+      let limit: number | undefined;
+      if (url.searchParams.has("before")) {
+        const raw = Number(url.searchParams.get("before"));
+        if (!Number.isInteger(raw) || raw < 0) return sendError(res, 400, "before 需为非负整数");
+        before = raw;
+      }
+      if (url.searchParams.has("limit")) {
+        const raw = Number(url.searchParams.get("limit"));
+        if (!Number.isInteger(raw) || raw < 1 || raw > 200) return sendError(res, 400, "limit 需为 1-200 的整数");
+        limit = raw;
+      }
+      return sendJson(res, 200, deps.conversations.readEvents(cid, { before, limit }));
     }
 
     if (sub === "/messages" && method === "POST") {
-      const body = (await readBody(req)) as { text?: string };
+      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown };
       const text = String(body.text ?? "").trim();
-      if (text === "") return sendError(res, 400, "text 必填");
+      let attachments;
       try {
-        await deps.conversations.send(uid, cid, text);
+        attachments = parseAttachments(body.attachments).blocks;
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+      if (text === "" && attachments.length === 0) return sendError(res, 400, "text 或 attachments 必填");
+      try {
+        await deps.conversations.send(uid, cid, text, attachments);
         return sendJson(res, 202, { ok: true });
       } catch (error) {
-        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured");
+        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
+        // 归属不符（2026-09-27 越权补齐）按不存在处理，不泄露他人会话存在性
+        if (String((error as Error).message).includes("不存在")) return sendError(res, 404, "会话不存在");
         throw error;
       }
     }
 
     if (sub === "/stream" && method === "GET") {
+      // 归属校验（2026-09-27 越权补齐）：非本人会话不开直播流
+      if (deps.conversations.ownerOf(cid) !== uid) return sendError(res, 404, "会话不存在");
       let agent;
       try {
         agent = await deps.conversations.agent(uid, cid);
@@ -475,16 +579,28 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return;
     }
 
+    // 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息
+    if (sub === "/stop" && method === "POST") {
+      try {
+        await deps.conversations.stop(uid, cid);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
+        return sendError(res, 404, String((error as Error).message));
+      }
+    }
+
     // 会话伙伴绑定/切换（D4.2）
     if (sub === "/meta" && method === "GET") {
       return sendJson(res, 200, await deps.conversations.metaFor(uid, cid));
     }
     if (sub === "/agent" && method === "PUT") {
-      const body = (await readBody(req)) as { agentId?: string };
+      const body = (await readBody(req)) as { agentId?: string | null };
       try {
-        await deps.conversations.switchAgent(uid, cid, String(body.agentId ?? ""));
+        await deps.conversations.switchAgent(uid, cid, body.agentId ?? null);
         return sendJson(res, 200, { ok: true });
       } catch (error) {
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         return sendError(res, 404, String((error as Error).message));
       }
     }
@@ -499,8 +615,59 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         await deps.conversations.switchModel(uid, cid, providerId);
         return sendJson(res, 200, { ok: true });
       } catch (error) {
+        if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         return sendError(res, 404, String((error as Error).message));
       }
+    }
+  }
+
+  // ── 微信桥（2026-09-27）：iLink 扫码绑定四路由 ──────────
+  if (path === "/api/wechat/bind/qrcode" && method === "POST") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    try {
+      const qr = await deps.wechat.newQRCode(uid);
+      return sendJson(res, 200, qr);
+    } catch (error) {
+      return sendError(res, 502, `获取登录二维码失败：${String((error as Error).message).slice(0, 200)}`);
+    }
+  }
+  if (path === "/api/wechat/bind/status" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    const qrcode = url.searchParams.get("qrcode") ?? "";
+    if (qrcode === "") return sendError(res, 400, "qrcode 必填");
+    try {
+      const result = await deps.wechat.pollQRStatus(uid, qrcode);
+      if (!result) return sendError(res, 403, "二维码无效或不属于当前账号（重新获取）");
+      // confirmed：凭据落当前登录用户并启动轮询（申请二维码时已记归属，路由身份即绑定身份）
+      if (result.status === "confirmed" && result.creds) await deps.wechat.bind(uid, result.creds);
+      return sendJson(res, 200, { status: result.status });
+    } catch (error) {
+      return sendError(res, 502, `查询扫码状态失败：${String((error as Error).message).slice(0, 200)}`);
+    }
+  }
+  if (path === "/api/wechat/bind" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    return sendJson(res, 200, deps.wechat.status(uid));
+  }
+  if (path === "/api/wechat/bind" && method === "DELETE") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    await deps.wechat.unbind(uid);
+    return sendJson(res, 200, { ok: true });
+  }
+  // 「微信对话」会话的伙伴绑定（2026-09-28 增补）：null = 默认助手；切换对 web/微信同步生效
+  if (path === "/api/wechat/bind/agent" && method === "GET") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    return sendJson(res, 200, { agentId: await deps.wechat.currentAgent(uid) });
+  }
+  if (path === "/api/wechat/bind/agent" && method === "PUT") {
+    if (!deps.wechat) return sendError(res, 404, "wechat bridge not configured");
+    const body = (await readBody(req)) as { agentId?: string | null };
+    try {
+      await deps.wechat.switchAgent(uid, body.agentId ?? null);
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
+      return sendError(res, 404, String((error as Error).message));
     }
   }
 
@@ -763,6 +930,36 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return;
   }
 
+  // ── 数据导出（2026-09-30 SDD 数据导出）：随时带走——
+  // JSON = readAll 全量（含作废/休眠 goal 行，机器可读）；MD = active 口径时间线 + 对话文本轮次（人读） ──
+  const exportMatch = /^\/api\/export\/data\.(json|md)$/.exec(path);
+  if (exportMatch && method === "GET") {
+    const format = exportMatch[1]!;
+    const ledger = await deps.ledgerFor(uid);
+    const conversations: ExportConversation[] = (await deps.conversations.list(uid)).map((entry) => ({
+      cid: entry.id,
+      title: entry.title,
+      createdTs: entry.createdTs,
+      events: deps.conversations.readEvents(entry.id), // 不带 options = 全量升序
+    }));
+    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations };
+    const dateTag = new Date(input.exportedAt).toISOString().slice(0, 10).replace(/-/g, "");
+    if (format === "json") {
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="openprism-export-${dateTag}.json"`,
+      });
+      res.end(buildExportJson(input));
+    } else {
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition": `attachment; filename="openprism-export-${dateTag}.md"`,
+      });
+      res.end(buildExportMarkdown({ ...input, tzOffsetMinutes: readUserTz(deps.db, uid) ?? 0 }));
+    }
+    return;
+  }
+
   // ── 主题计数（2026-09-18）：未晋升主题列表 / 手动晋升 / 不再追踪 / 撤销追踪 ──
   if (path === "/api/memory/topics" && method === "GET") {
     const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? "100")) || 100);
@@ -827,39 +1024,117 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const seq = Number(body.seq);
     if (!Number.isInteger(seq)) return sendError(res, 400, "seq 必须是整数");
     const ledger = await deps.ledgerFor(uid);
-    if (!ledger.readAll().some((r) => r.seq === seq)) return sendError(res, 404, "seq 不存在");
+    const target = ledger.readAll().find((r) => r.seq === seq);
+    if (!target) return sendError(res, 404, "seq 不存在");
+    // 历史 goal 行不可作废（目标层级 2026-09-30 下线）：休眠数据保持原样，审计可见
+    if (target.kind === "goal") return sendError(res, 400, "goal 条目已下线（历史数据休眠保留），不可作废");
     await ledger.append({ kind: "void", source: "ui", targetSeq: seq });
     return sendJson(res, 200, { ok: true });
   }
 
   if (method === "POST" && path === "/api/checkin") {
-    const body = (await readBody(req)) as { planId?: string; done?: boolean };
+    const body = (await readBody(req)) as { planId?: string; done?: boolean; date?: string; time?: string };
     const planId = String(body.planId ?? "");
     if (planId === "") return sendError(res, 400, "planId 必填");
     const ledger = await deps.ledgerFor(uid);
     const exists = ledger.activeRecords().some((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
     if (!exists) return sendError(res, 404, "planId 不存在");
+    // 补历史卡（2026-09-29）：date/time 与工具侧 parseAt 同源；未来日期拒绝
+    let at = deps.env.now();
+    if (body.date !== undefined || body.time !== undefined) {
+      try {
+        at = parseAt(body.date, body.time, deps.env.now());
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+    }
     const record = await ledger.append({
       kind: "checkin",
       source: "ui",
       planId,
-      at: deps.env.now(),
+      at,
       done: body.done ?? true,
     });
     return sendJson(res, 200, { ok: true, ts: record.ts });
   }
 
+  if (method === "POST" && path === "/api/plans") {
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+    if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
+    const title = String(body.title ?? "").trim();
+    if (title === "") return sendError(res, 400, "title 必填");
+    const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
+    const scope = scopes.find((s) => s === body.scope);
+    if (!scope) return sendError(res, 400, `scope 必须是 ${scopes.join(" | ")}`);
+    if (scope === "deadline") {
+      if (typeof body.due !== "string") return sendError(res, 400, "scope=deadline 需要 due（YYYY-MM-DD）");
+      // due 是折叠层字典序比较的键（评审 2026-09-29 簇 C）：非 ISO 日期会让真逾期项永久卡在 upcoming——入口收紧
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(body.due) || Number.isNaN(Date.parse(`${body.due}T00:00:00Z`))) {
+        return sendError(res, 400, "due 需为合法日期 YYYY-MM-DD（如 2026-10-04）");
+      }
+    }
+    if (scope === "ndays" && (typeof body.ndays !== "number" || body.ndays < 1)) return sendError(res, 400, "scope=ndays 需要 ndays ≥ 1");
+    // 习惯配额（2026-09-30 习惯化）：与 create_plan 工具同规
+    if (body.timesPerPeriod !== undefined && (!Number.isInteger(body.timesPerPeriod) || body.timesPerPeriod < 1)) {
+      return sendError(res, 400, "timesPerPeriod 需为 ≥1 的整数");
+    }
+    if (body.timesPerPeriod !== undefined && !(scope === "day" || scope === "week" || scope === "month" || scope === "year")) {
+      return sendError(res, 400, "timesPerPeriod 只支持 day | week | month | year（deadline/ndays 是一次性计划）");
+    }
+    const ledger = await deps.ledgerFor(uid);
+    const record = await ledger.append({
+      kind: "plan",
+      source: "ui",
+      planId: `plan-${randomUUID().slice(0, 8)}`,
+      title,
+      scope,
+      ...(body.due !== undefined && body.due !== "" ? { due: body.due } : {}),
+      ...(body.ndays !== undefined ? { ndays: body.ndays } : {}),
+      ...(body.timesPerPeriod !== undefined ? { timesPerPeriod: body.timesPerPeriod } : {}),
+    });
+    return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
+  }
+
+  // 修订计划（2026-09-29 SDD 撤历史打卡与UI计划编辑补卡）：与 update_plan 工具同源（plans.ts mergePlanUpdate）——
+  // 追加新版本 + void 旧记录，planId 稳定、历史打卡引用不断；source=ui 区分写入方
+  const planMatch = /^\/api\/plans\/([^/]+)$/.exec(path);
+  if (planMatch && method === "PUT") {
+    const planId = decodeURIComponent(planMatch[1]!);
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+    if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
+    const ledger = await deps.ledgerFor(uid);
+    const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
+    if (!hit) return sendError(res, 404, `planId "${planId}" 不存在`);
+    try {
+      const merged = mergePlanUpdate(hit as PlanRecord, body);
+      await ledger.append({ ...merged, kind: "plan", source: "ui" });
+      await ledger.append({ kind: "void", source: "ui", targetSeq: hit.seq, reason: "更新计划" });
+      return sendJson(res, 200, { ok: true, planId, title: merged.title });
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+
+  // 目标层级（方向/阶段/项目/打卡点）2026-09-30 下线（SDD 2026-09-30_00-29）：/api/goals 全套路由移除，
+  // 历史 goal 行在账本休眠保留；计划管理入口 = 「今天」页四范围 tab。
 
   // ── 定时任务（D6） ─────────────────────────────────────
   if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
     if (method === "GET") return sendJson(res, 200, await deps.tasks.list(uid));
     const body = (await readBody(req)) as Record<string, unknown>;
+    // id/builtin 是服务端专属（评审 2026-09-29 B3）：客户端提供的 id 会撞全局主键（内置确定性 id 可被抢占致种子永久卡死）、
+    // builtin 可伪造「内置」徽标——HTTP 边界一律剥离，服务端自行分配
+    const { id: _id, builtin: _builtin, ...taskInput } = body;
     try {
-      const task = await deps.tasks.create(uid, body as never);
+      const task = await deps.tasks.create(uid, taskInput as never);
       return sendJson(res, 200, task);
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
     }
+  }
+  // 内置三件套模板投影（评审 2026-09-29 #13 单源）：提醒页模板按钮从这取文案；置于 taskMatch 前，避免被当作任务 id
+  if (method === "GET" && path === "/api/tasks/templates") {
+    return sendJson(res, 200, builtinTaskTemplates());
   }
   const taskMatch = /^\/api\/tasks\/([^/]+)(\/[^/]*)?$/.exec(path);
   if (taskMatch) {

@@ -32,7 +32,33 @@ export interface TodayPlanView {
   due?: string;
   done: boolean;
   checkinTs?: number;
+  /**
+   * 确定性状态（2026-09-28 用户验收：计划要能区分进行中/未开始/已过期/已完成）：
+   * deadline 型看 doneEver + due 与今天的关系；周期型看今日打卡 + 本周期内有无历史打卡。
+   */
+  state: PlanState;
+  /** 当前可撤销的打卡 seq（2026-09-29 语义统一，与产出逻辑对齐）：deadline 型完成 = 全部存活 done 打卡；
+   * 周期型今日 done = 今日存活打卡——作废即回退，追加 done:false 无效 */
+  doneSeqs?: number[];
+  /** 最近 10 条存活 done 打卡（倒序，含非今日，at 定位是哪天打的）——撤历史卡的凭据（2026-09-29） */
+  checkins?: { seq: number; at: number }[];
+  /** 账本 seq：逾期「跳过」= 作废该 plan 记录（2026-09-29） */
+  seq: number;
+  /** 完成时刻 = 最新存活 done 打卡的 at（2026-09-29）：已完成视图按它倒序/过滤近 30 天 */
+  doneAt?: number;
+  /** 今天完成的确定性标记（评审 2026-09-29 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天。
+   * 与 done 的区别：deadline 的 done=doneEver（上周完成的打卡点 done=true 但 doneToday=false），模型/前端按它归因"今天的完成度" */
+  doneToday: boolean;
+  /** 习惯计划（2026-09-30 习惯化）：配额与当前周期进度，成对出现。
+   * day=今日打卡次数；week/month/year=本期不同本地日数；done=进度 ≥ 配额（跨期自动清零重开） */
+  timesPerPeriod?: number;
+  periodCount?: number;
 }
+
+export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
+
+/** 今天页计划的展示顺序：逾期 > 今天截止 > 进行中/待做 > 未开始（未来） > 已完成 */
+const STATE_RANK: Record<PlanState, number> = { overdue: 0, dueToday: 1, doing: 2, todo: 3, upcoming: 4, done: 5 };
 
 export interface TodayFlowView {
   seq: number;
@@ -49,23 +75,76 @@ export interface TodayView {
   plans: TodayPlanView[];
   totalByCategory: { category: string; total: number; count: number }[];
   streakDays: number;
+  /** 今日必做（确定性折叠，无模型依赖）：逾期 > 今日截止 > 覆盖今天的未完成（2026-09-30 目标层级下线，去掉里程碑补位终端） */
+  top3: TopItem[];
 }
 
-/** 计划是否覆盖"今天"：scope 决定周期（创建 ts = 周期锚点） */
+/** 本地周键：该周周一的 dayKey（当地周一为一周之始） */
+function weekKey(ts: number, tzOffsetMinutes: number): number {
+  return dayKey(ts, tzOffsetMinutes) - ((localParts(ts, tzOffsetMinutes).weekday + 6) % 7);
+}
+
+/** at 是否落在 scope 的「当前周期」（习惯计划的计数窗口，2026-09-30 习惯化）：
+ *  day=同本地日；week=同周一键；month/year=同年月 */
+function inCurrentPeriod(scope: "day" | "week" | "month" | "year", at: number, now: number, tzOffsetMinutes: number): boolean {
+  switch (scope) {
+    case "day":
+      return dayKey(at, tzOffsetMinutes) === dayKey(now, tzOffsetMinutes);
+    case "week":
+      return weekKey(at, tzOffsetMinutes) === weekKey(now, tzOffsetMinutes);
+    case "month": {
+      const a = localParts(at, tzOffsetMinutes);
+      const b = localParts(now, tzOffsetMinutes);
+      return a.year === b.year && a.month === b.month;
+    }
+    case "year":
+      return localParts(at, tzOffsetMinutes).year === localParts(now, tzOffsetMinutes).year;
+  }
+}
+
+/** 习惯计划判定：带配额且周期可续（deadline/ndays 是一次性设计，入口拒绝配额；此处防御性排除）——
+ *  类型谓词：命中即 scope ∈ day/week/month/year 且 timesPerPeriod 存在 */
+export function isHabitPlan(plan: PlanRecord): plan is PlanRecord & { timesPerPeriod: number; scope: "day" | "week" | "month" | "year" } {
+  return (
+    plan.timesPerPeriod !== undefined &&
+    (plan.scope === "day" || plan.scope === "week" || plan.scope === "month" || plan.scope === "year")
+  );
+}
+
+/** 习惯计划当前周期进度：day=今日存活 done 打卡次数（"每天 8 杯水"按次）；
+ *  week/month/year=本期有存活 done 打卡的不同本地日数（"每周运动三天"按天） */
+export function habitPeriodCount(
+  plan: PlanRecord,
+  live: Array<FlowRecord | PlanRecord | CheckinRecord>,
+  now: number,
+  tzOffsetMinutes: number,
+): number {
+  if (!isHabitPlan(plan)) return 0; // 防御：非习惯计划无"本期进度"概念
+  if (plan.scope === "day") {
+    return live.filter(
+      (r): r is CheckinRecord =>
+        r.kind === "checkin" && r.done && r.planId === plan.planId && dayKey(r.at, tzOffsetMinutes) === dayKey(now, tzOffsetMinutes),
+    ).length;
+  }
+  const days = new Set<number>();
+  for (const r of live) {
+    if (r.kind !== "checkin" || !r.done || r.planId !== plan.planId) continue;
+    if (inCurrentPeriod(plan.scope, r.at, now, tzOffsetMinutes)) days.add(dayKey(r.at, tzOffsetMinutes));
+  }
+  return days.size;
+}
+
+/** 计划是否覆盖"今天"：scope 决定周期（创建 ts = 周期锚点）；
+ *  习惯计划（timesPerPeriod）跨周期续期，永远覆盖今天（2026-09-30 习惯化） */
 export function planScopeCoversToday(plan: PlanRecord, now: number, tzOffsetMinutes: number): boolean {
+  if (isHabitPlan(plan)) return true;
   const todayKey = dayKey(now, tzOffsetMinutes);
   const createdKey = dayKey(plan.ts, tzOffsetMinutes);
   switch (plan.scope) {
     case "day":
       return createdKey === todayKey;
-    case "week": {
-      // 当地周一为一周之始：周键 = 该周周一的 dayKey
-      const weekStartKey = (key: number, weekday: number) => key - ((weekday + 6) % 7);
-      return (
-        weekStartKey(createdKey, localParts(plan.ts, tzOffsetMinutes).weekday) ===
-        weekStartKey(todayKey, localParts(now, tzOffsetMinutes).weekday)
-      );
-    }
+    case "week":
+      return weekKey(plan.ts, tzOffsetMinutes) === weekKey(now, tzOffsetMinutes);
     case "month": {
       const a = localParts(plan.ts, tzOffsetMinutes);
       const b = localParts(now, tzOffsetMinutes);
@@ -96,20 +175,87 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     .map(({ seq, time, category, note, value, unit }) => ({ seq, time, category, ...(note !== undefined ? { note } : {}), ...(value !== undefined ? { value } : {}), ...(unit !== undefined ? { unit } : {}) }));
 
   const checkinsToday = live.filter((r): r is CheckinRecord => r.kind === "checkin" && r.done && isToday(r.at));
+  // doneEver（打过一次就算）+ 存活 done 打卡 seq + 最新完成时刻 + 最近打卡凭据：deadline 型的完成判定/撤销/完成视图排序同源
+  const doneEver = new Set<string>();
+  const doneSeqsByPlan = new Map<string, number[]>();
+  const lastDoneAt = new Map<string, number>();
+  const checkinsByPlan = new Map<string, { seq: number; at: number }[]>();
+  for (const r of live) {
+    if (r.kind !== "checkin" || !r.done) continue;
+    doneEver.add(r.planId);
+    const list = doneSeqsByPlan.get(r.planId) ?? [];
+    list.push(r.seq);
+    doneSeqsByPlan.set(r.planId, list);
+    const pairs = checkinsByPlan.get(r.planId) ?? [];
+    pairs.push({ seq: r.seq, at: r.at });
+    checkinsByPlan.set(r.planId, pairs);
+    lastDoneAt.set(r.planId, Math.max(lastDoneAt.get(r.planId) ?? 0, r.at));
+  }
+  const todayStr = dateString(localParts(now, tzOffsetMinutes));
+  // 周期计划"本周期内"是否已有打卡（不含今天）——区分 待做 / 进行中
+  const periodHasCheckin = (plan: PlanRecord): boolean =>
+    live.some((r) => r.kind === "checkin" && r.done && r.planId === plan.planId && planScopeCoversToday(plan, r.at, tzOffsetMinutes) && !isToday(r.at));
+  const stateOf = (plan: PlanRecord, doneToday: boolean): PlanState => {
+    if (plan.scope === "deadline") {
+      if (doneEver.has(plan.planId)) return "done";
+      if (plan.due !== undefined && plan.due < todayStr) return "overdue";
+      if (plan.due === todayStr) return "dueToday";
+      return "upcoming";
+    }
+    if (doneToday) return "done";
+    return periodHasCheckin(plan) ? "doing" : "todo";
+  };
+  // 列表成员（2026-09-29 B4 全量收编）：覆盖今天的周期计划 + 全部 deadline（含已完成且 due 已过的——
+  // 「已完成」视图要看存档；默认视图的防刷屏改由前端按范围切换过滤，数据一次载荷）
   const plans = live
-    .filter((r): r is PlanRecord => r.kind === "plan" && planScopeCoversToday(r, now, tzOffsetMinutes))
-    .sort((a, b) => a.seq - b.seq)
+    .filter((r): r is PlanRecord => r.kind === "plan" && (r.scope === "deadline" || planScopeCoversToday(r, now, tzOffsetMinutes)))
     .map((plan) => {
-      const done = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
+      const habit = isHabitPlan(plan);
+      const todayCheckins = checkinsToday.filter((c) => c.planId === plan.planId);
+      const periodCount = habit ? habitPeriodCount(plan, live, now, tzOffsetMinutes) : undefined;
+      const quotaMet = habit && (periodCount ?? 0) >= (plan.timesPerPeriod ?? 1);
+      const doneToday = habit ? quotaMet : plan.scope === "deadline" ? doneEver.has(plan.planId) : todayCheckins.length > 0;
+      const last = todayCheckins.sort((a, b) => b.at - a.at)[0];
+      const state = habit ? (quotaMet ? "done" : (periodCount ?? 0) > 0 ? "doing" : "todo") : stateOf(plan, doneToday);
+      const lastDone = lastDoneAt.get(plan.planId);
+      // "今天完成"的确定性口径：习惯=今天有贡献卡；周期型=state done（即今日有卡）；deadline 型=最新完成打卡落在今天
+      const doneTodayFlag = habit ? todayCheckins.length > 0 : plan.scope === "deadline" ? lastDone !== undefined && dayKey(lastDone, tzOffsetMinutes) === todayK : doneToday;
       return {
         planId: plan.planId,
         title: plan.title,
         scope: plan.scope,
         ...(plan.due !== undefined ? { due: plan.due } : {}),
-        done: Boolean(done),
-        ...(done ? { checkinTs: done.at } : {}),
+        done: doneToday,
+        ...(last !== undefined ? { checkinTs: last.at } : {}),
+        state,
+        ...(habit ? { timesPerPeriod: plan.timesPerPeriod, periodCount } : {}),
+        // 撤销口径（评审 2026-09-29 簇 A）：done 项都给可作废的打卡 seq——deadline 型=全部存活 done 打卡（doneEver），
+        // 周期型=今日存活 done 打卡（撤销只退今天，不动历史）；追加 done:false 对两者都无效（CONTEXT.md 语义）
+        ...(state === "done"
+          ? {
+              doneSeqs:
+                plan.scope === "deadline"
+                  ? (doneSeqsByPlan.get(plan.planId) ?? [])
+                  : checkinsToday.filter((c) => c.planId === plan.planId).map((c) => c.seq),
+            }
+          : {}),
+        // 撤历史卡凭据：最近 10 条存活 done 打卡倒序（含非今日；at 相同按后打的在前）
+        ...((checkinsByPlan.get(plan.planId) ?? []).length > 0
+          ? {
+              checkins: [...(checkinsByPlan.get(plan.planId) ?? [])]
+                .sort((a, b) => b.at - a.at || b.seq - a.seq)
+                .slice(0, 10),
+            }
+          : {}),
+        seq: plan.seq,
+        ...(state === "done" ? { doneAt: lastDone } : {}),
+        doneToday: doneTodayFlag,
       };
-    });
+    })
+    // 已完成存档的 30 天窗口（评审 2026-09-29：载荷/模型上下文无界增长）——「已完成」视图本就按 30 天过滤，
+    // 折叠层同口径截断后 UI 无感、agent 面（query_ledger what=today）不再全量灌历史
+    .filter((p) => p.state !== "done" || (p.doneAt ?? 0) >= now - 30 * 86400000)
+    .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.planId.localeCompare(b.planId));
 
   const totals = new Map<string, { total: number; count: number }>();
   for (const flow of live) {
@@ -135,7 +281,80 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
     cursor -= 1;
   }
 
-  return { date: dateString(localParts(now, tzOffsetMinutes)), flows, plans, totalByCategory, streakDays };
+  // Top3（确定性，0 模型；2026-09-30 目标层级下线——goalCard/goalView 整体移除，只剩计划终端）
+  const topItems = top3(records, now, tzOffsetMinutes);
+
+  return { date: dateString(localParts(now, tzOffsetMinutes)), flows, plans, totalByCategory, streakDays, top3: topItems };
+}
+
+// ── 计划/打卡折叠共用（2026-09-30 目标层级下线：goal 树折叠整体移除，历史 goal 行在投影层不可见） ──
+
+/** 剔除 void 记录本身（top3 共用；与 todayView 同语义） */
+function liveRecords(records: LedgerRecord[]): Array<FlowRecord | PlanRecord | CheckinRecord> {
+  const voided = new Set(
+    records.filter((r): r is Extract<LedgerRecord, { kind: "void" }> => r.kind === "void").map((r) => r.targetSeq),
+  );
+  return records.filter((r) => r.kind !== "void" && !voided.has(r.seq)) as Array<FlowRecord | PlanRecord | CheckinRecord>;
+}
+
+/** 存活 done 打卡的 planId 集合（doneEver 语义：打过一次就算）——top3 共用 */
+function liveDoneEver(live: LedgerRecord[]): Set<string> {
+  const set = new Set<string>();
+  for (const r of live) {
+    if (r.kind === "checkin" && r.done) set.add(r.planId);
+  }
+  return set;
+}
+
+export interface TopItem {
+  kind: "overdue" | "dueToday" | "today";
+  title: string;
+  planId?: string;
+  due?: string;
+  /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
+  progress?: string;
+}
+
+/** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成 */
+export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: number): TopItem[] {
+  const live = liveRecords(records);
+  const todayStr = dateString(localParts(now, tzOffsetMinutes));
+  const todayK = dayKey(now, tzOffsetMinutes);
+  const doneEver = liveDoneEver(live);
+  const doneToday = new Set<string>();
+  for (const r of live) {
+    if (r.kind !== "checkin" || !r.done) continue;
+    if (dayKey(r.at, tzOffsetMinutes) === todayK) doneToday.add(r.planId);
+  }
+
+  const itemFor = (plan: PlanRecord, kind: TopItem["kind"]): TopItem => ({
+    kind,
+    title: plan.title,
+    planId: plan.planId,
+    ...(plan.due !== undefined ? { due: plan.due } : {}),
+  });
+
+  const overdue: TopItem[] = [];
+  const dueToday: TopItem[] = [];
+  const todayItems: TopItem[] = [];
+  for (const r of live) {
+    if (r.kind !== "plan") continue;
+    if (r.scope === "deadline") {
+      if (doneEver.has(r.planId) || r.due === undefined) continue; // 已完成/无 due 不进
+      if (r.due < todayStr) overdue.push(itemFor(r, "overdue"));
+      else if (r.due === todayStr && !doneToday.has(r.planId)) dueToday.push(itemFor(r, "dueToday"));
+      continue;
+    }
+    // 习惯计划：本期配额未达 → 进"今天"桶并带进度；已达 → 不进（2026-09-30 习惯化）
+    if (isHabitPlan(r)) {
+      const count = habitPeriodCount(r, live, now, tzOffsetMinutes);
+      if (count < (r.timesPerPeriod ?? 1)) todayItems.push({ ...itemFor(r, "today"), progress: `${count}/${r.timesPerPeriod}` });
+      continue;
+    }
+    if (planScopeCoversToday(r, now, tzOffsetMinutes) && !doneToday.has(r.planId)) todayItems.push(itemFor(r, "today"));
+  }
+
+  return [...overdue, ...dueToday, ...todayItems].slice(0, 3);
 }
 
 // ── 批次 4：分类页与进步页（D7.2 / D11.3，全部确定性折叠） ──────────────
@@ -188,6 +407,8 @@ export interface CategoryPeriodView {
   daily: { date: string; count: number; total: number }[];
   /** 周期内明细（时间倒序，封顶 200） */
   flows: TodayFlowView[];
+  /** B4（2026-09-28）：上一同长周期对照（归因句与基准的数据源） */
+  lastPeriod: { count: number; total: number };
 }
 
 export function categoryView(
@@ -230,7 +451,23 @@ export function categoryView(
       ...(unit !== undefined ? { unit } : {}),
     }));
 
-  return { period, category, count, total, daily, flows };
+  // B4：上一同长周期对照（today=昨天、week=上周、month=上月、year=去年）
+  const lastStart = (() => {
+    if (period === "week") return weekStart(now - 7 * DAY_MS, tz);
+    if (period === "month") {
+      const p = localParts(now, tz);
+      return p.month === 0 ? Date.UTC(p.year - 1, 11, 1) - tz * 60000 : Date.UTC(p.year, p.month - 1, 1) - tz * 60000;
+    }
+    if (period === "year") {
+      const p = localParts(now, tz);
+      return Date.UTC(p.year - 1, 0, 1) - tz * 60000;
+    }
+    return start - DAY_MS; // today → 昨天
+  })();
+  const lastPeriodFlows = activeFlows(records).filter((f) => f.category === category && f.time >= lastStart && f.time < start);
+  const lastPeriod = { count: lastPeriodFlows.length, total: lastPeriodFlows.reduce((sum, f) => sum + (f.value ?? 0), 0) };
+
+  return { period, category, count, total, daily, flows, lastPeriod };
 }
 
 export interface ProgressView {
@@ -241,6 +478,20 @@ export interface ProgressView {
   weekOverWeek: { category: string; thisWeek: number; lastWeek: number; deltaPct: number | null }[];
   /** 近 14 天（本地日）全分类流水笔数 */
   trend14: { date: string; count: number }[];
+  /** B4（2026-09-28）：基准锚点——图表有用判据②参照系 */
+  /** 历史最长连续记录天数（streakDays 配它才有"追平纪录"的参照） */
+  bestStreak: number;
+  /** 近 8 周 done 打卡数（周均基准；weekStart = 该周周一 YYYY-MM-DD） */
+  weeklyDone8w: { weekStart: string; done: number }[];
+  /** B4：行为模式原料（元认知；结论句见 insights） */
+  /** 记录时段分布：morning 05-11 / afternoon 11-17 / evening 17-23 / night 23-05（本地时） */
+  hourBuckets: { morning: number; afternoon: number; evening: number; night: number };
+  /** 记录最多的分类 */
+  topCategory: { category: string; count: number } | null;
+  /** 作废（更正）过的流水笔数 */
+  voidedFlows: number;
+  /** 行为模式结论句（有信号才生成；空数组 = 数据还太少） */
+  insights: string[];
 }
 
 export function progressView(records: LedgerRecord[], now: number, tzOffsetMinutes: number): ProgressView {
@@ -248,13 +499,21 @@ export function progressView(records: LedgerRecord[], now: number, tzOffsetMinut
   const flows = activeFlows(records);
   const todayK = dayKey(now, tz);
 
-  // 连续（同 todayView 语义）
+  // 连续（同 todayView 语义）+ 历史最长（B4 基准锚点）
   const daysWithFlow = new Set(flows.map((f) => dayKey(f.time, tz)));
   let streakDays = 0;
   let cursor = daysWithFlow.has(todayK) ? todayK : todayK - 1;
   while (daysWithFlow.has(cursor)) {
     streakDays += 1;
     cursor -= 1;
+  }
+  let bestStreak = 0;
+  let run = 0;
+  let prevK: number | null = null;
+  for (const k of [...daysWithFlow].sort((a, b) => a - b)) {
+    run = prevK !== null && k === prevK + 1 ? run + 1 : 1;
+    bestStreak = Math.max(bestStreak, run);
+    prevK = k;
   }
 
   // 完成率：覆盖今天的活跃计划 + 今天 done 打卡
@@ -287,5 +546,64 @@ export function progressView(records: LedgerRecord[], now: number, tzOffsetMinut
     });
   }
 
-  return { streakDays, completion, weekOverWeek, trend14 };
+  // ── B4：基准量与行为模式（确定性折叠，0 模型） ──
+  // 近 8 周 done 打卡数
+  const allDoneCheckins = live.filter((r): r is CheckinRecord => r.kind === "checkin" && r.done);
+  const weeklyDone8w: { weekStart: string; done: number }[] = [];
+  for (let back = 7; back >= 0; back -= 1) {
+    const ws = weekStartTs - back * 7 * DAY_MS;
+    const we = ws + 7 * DAY_MS;
+    weeklyDone8w.push({
+      weekStart: dateString(localParts(ws, tz)),
+      done: allDoneCheckins.filter((c) => c.at >= ws && c.at < we).length,
+    });
+  }
+
+  // 时段分布 / 最活跃分类 / 更正频率
+  const hourBuckets = { morning: 0, afternoon: 0, evening: 0, night: 0 };
+  for (const f of flows) {
+    const hour = new Date(localShift(f.time, tz)).getUTCHours(); // localShift 后按 UTC 读 = 本地时
+    if (hour >= 5 && hour < 11) hourBuckets.morning += 1;
+    else if (hour >= 11 && hour < 17) hourBuckets.afternoon += 1;
+    else if (hour >= 17 && hour < 23) hourBuckets.evening += 1;
+    else hourBuckets.night += 1;
+  }
+  const categoryCount = new Map<string, number>();
+  for (const f of flows) categoryCount.set(f.category, (categoryCount.get(f.category) ?? 0) + 1);
+  let topCategory: ProgressView["topCategory"] = null;
+  for (const [category, count] of categoryCount) {
+    if (topCategory === null || count > topCategory.count) topCategory = { category, count };
+  }
+  const eventSeqs = new Set(records.filter((r) => r.kind === "event").map((r) => r.seq));
+  const voidedFlows = records.filter((r) => r.kind === "void" && eventSeqs.has(r.targetSeq)).length;
+
+  // 结论句：有信号才生成（数据太少不出声）
+  const insights: string[] = [];
+  const bucketTotal = hourBuckets.morning + hourBuckets.afternoon + hourBuckets.evening + hourBuckets.night;
+  if (bucketTotal >= 10) {
+    const entries = [
+      ["morning", "早上 5—11 点", hourBuckets.morning],
+      ["afternoon", "白天 11—17 点", hourBuckets.afternoon],
+      ["evening", "傍晚 17—23 点", hourBuckets.evening],
+      ["night", "深夜 23—5 点", hourBuckets.night],
+    ] as const;
+    const top = entries.reduce((a, b) => (b[2] > a[2] ? b : a));
+    if (top[2] / bucketTotal >= 0.5) insights.push(`你的记录 ${Math.round((top[2] / bucketTotal) * 100)}% 发生在${top[1]}——留意这个时段是不是你的黄金时间`);
+  }
+  if (topCategory !== null && topCategory.count >= 5) insights.push(`「${topCategory.category}」是你记录最多的分类（${topCategory.count} 笔）`);
+  if (voidedFlows >= 5) insights.push(`你更正过 ${voidedFlows} 笔记录——犯错正常，账本都留了痕`);
+  if (bestStreak > streakDays && streakDays >= 1) insights.push(`当前连续 ${streakDays} 天，历史最长 ${bestStreak} 天——再坚持 ${bestStreak - streakDays} 天追平纪录`);
+  else if (bestStreak > 0 && streakDays === bestStreak && streakDays >= 2) insights.push(`当前连续 ${streakDays} 天，已追平历史最长纪录`);
+  // 周均对照只比完整周：[7] 是进行中的本周（前半周必然偏低），[6] 才是上一个完整周
+  const lastWeek = weeklyDone8w[6]!.done;
+  const prior = weeklyDone8w.slice(0, 6);
+  const priorDone = prior.reduce((sum, w) => sum + w.done, 0);
+  if (priorDone > 0) {
+    const priorAvg = priorDone / prior.length;
+    const deltaPct = Math.round(((lastWeek - priorAvg) / priorAvg) * 100);
+    if (deltaPct >= 20) insights.push(`上周完成打卡 ${lastWeek} 次，比前 6 周均值高 ${deltaPct}%——节奏在变好`);
+    else if (deltaPct <= -20) insights.push(`上周完成打卡 ${lastWeek} 次，比前 6 周均值低 ${Math.abs(deltaPct)}%——承诺可能超过精力了`);
+  }
+
+  return { streakDays, completion, weekOverWeek, trend14, bestStreak, weeklyDone8w, hourBuckets, topCategory, voidedFlows, insights };
 }

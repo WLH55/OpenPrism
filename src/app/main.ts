@@ -9,7 +9,7 @@ import { nodeEnv } from "./env";
 import { appPaths } from "./store";
 import { openDb } from "./db";
 import { migrateLegacy, migrateLegacyModelConfig } from "./migrate";
-import { loadUsers, SessionStore } from "./auth";
+import { loadUsers, readUserTz, SessionStore } from "./auth";
 import { loadOrCreateMasterKey, open, readModelConfig, readModelProviderConfig, type ModelConfig } from "./secretbox";
 import { Ledger } from "./ledger";
 import { ConversationStore } from "./conversations";
@@ -22,6 +22,7 @@ import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extra
 import { createMemoryVector } from "./memory-vector";
 import { Scheduler, TaskStore, taskTriggerMessage, type TaskDef, type TaskRunTrigger } from "./tasks";
 import { NotificationStore } from "./notify";
+import { WechatBridge } from "./wechat-bridge";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 
@@ -106,6 +107,8 @@ async function main(): Promise<void> {
       modelConfigFor,
       adapterFactory,
       now: () => Date.now(),
+      // 用户档案时区（2026-09-29）：网页/微信/定时任务统一口径；未上报退服务器本机
+      tzOffsetMinutes: (uid) => readUserTz(db, uid) ?? -new Date().getTimezoneOffset(),
       agents,
       skills,
       mcps,
@@ -117,10 +120,16 @@ async function main(): Promise<void> {
     db,
   );
 
+  // 微信桥（2026-09-27）：iLink 长轮询 + 任务通知推送；先于 taskRunner 装配（通知加推用），
+  // 启动即恢复已绑定用户的轮询（expired 绑定不启，等重新扫码）
+  const wechat = new WechatBridge({ env: nodeEnv, db, masterKey, conversations, notifications });
+  wechat.startAll();
+
   // 任务执行体（调度/手动共用）：跑进该伙伴的固定提醒会话（不存在即创建、置顶显示），
   // 助手回复直接落在会话里；同时落一条站内通知兜底（提醒页徽标）。
   // 投给模型的是触发上下文（自动触发说明 + 任务内容 + 重复规则 + 计划/触发时刻），不是光秃秃一句指令——
   // 否则模型把到点指令当成用户刚说的话，回头反问"每天还是今天一次、几点提醒"。
+  // 任务级通知渠道（2026-09-27）：选微信机器人 = 站内记录之上加推；未绑定/过期/失败静默退站内，任务不失败。
   const taskRunner = async (uidRun: string, task: TaskDef, run: TaskRunTrigger): Promise<void> => {
     const feed = await conversations.ensureTaskFeed(uidRun, task.agentId);
     const agent = await conversations.agent(uidRun, feed.id);
@@ -133,6 +142,9 @@ async function main(): Promise<void> {
         ? last.message.content.filter((b) => b.type === "text").map((b) => (b as { text?: string }).text ?? "").join("")
         : "（任务已执行，无文本输出）";
     await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: text.slice(0, 500) });
+    if (task.notifyChannel === "wechat") {
+      await wechat.pushToWechat(uidRun, `【${task.title}】${text}`.slice(0, 500));
+    }
   };
 
   // 记忆提取 adapter：现读用户 BYOK 配置
@@ -190,6 +202,7 @@ async function main(): Promise<void> {
     tasks,
     notifications,
     taskRunner,
+    wechat, // 微信桥（2026-09-27）：IM 绑定路由
     ...(existsSync(staticDir) ? { staticDir } : {}),
   });
 
@@ -234,6 +247,16 @@ async function main(): Promise<void> {
 
   // 启动补跑：距上次整理超 20h 且有条目 → 后台跑一次 consolidate（不限钟点，作白天补跑）
   void runConsolidateForAll("startup");
+
+  // 内置三件套补种（2026-09-29）：存量用户一次性种子（幂等；删除过内置任务的不复活——标记已置）
+  for (const user of users.values()) {
+    try {
+      const seeded = await tasks.ensureBuiltins(user.uid);
+      if (seeded > 0) process.stdout.write(`[openprism] builtin tasks seeded: ${user.username} +${seeded}\n`);
+    } catch (error) {
+      process.stdout.write(`[openprism] builtin tasks seed ${user.username} failed: ${String((error as Error).message)}\n`);
+    }
+  }
 
   async function runConsolidateForAll(reason: "startup" | "nightly"): Promise<void> {
     for (const user of users.values()) {

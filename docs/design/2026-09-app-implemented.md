@@ -67,7 +67,7 @@ OpenPrism 现在是**自托管的生活记录助理应用**，叠加在纯 TS ag
 
 | 功能 | 原理 | 代码 | 实现要点 |
 |---|---|---|---|
-| 多智能体三段配置 | 人设卡 + 能力绑定（工具开关/技能/MCP） | `agents.ts`、`persona.ts` | persona = 纯自由 markdown，名字从首个 `# H1` 推导（`extractAgentName`）；索引行走 JSONL、正文原样落盘 |
+| 多智能体三段配置 | 人设卡 + 能力绑定（工具开关/技能/MCP） | `agents.ts`、`persona.ts` | persona = 纯自由 markdown，名字只在表单/`agents.name`（2026-09-28 起不从 `# H1` 推导）；索引行走 JSONL、正文原样落盘 |
 | system prompt 热更 | `systemPrompt()` **每步同步重取** | `conversations.ts:282-293`（`composePromptWithMeta`） | 人设/记忆/技能目录改动下一步对话即生效，无需重建 agent；合成顺序：人设 → 日期 → 记忆块 → 纪律 |
 | 会话切换伙伴 | `meta.json` 记 agentId + 切换史 | `conversations.ts:132-143` | 只换 prompt 与装配，历史不丢；切换史供前端画分割线 |
 | 技能 | 标准 Agent Skill，**渐进式加载** | `skills.ts` | 目录层（description ≤1024 硬约束）常驻 system prompt 只耗轻 token；正文经 `load_skill` 工具按需载入 = 一条工具事件落日志，「模型可见即日志可重建」天然满足 |

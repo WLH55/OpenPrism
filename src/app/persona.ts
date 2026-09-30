@@ -1,5 +1,6 @@
 // 人设与 system prompt 合成（批次 2：D4 三段配置——人设卡 + 记忆注入 + 纪律）。
-// 人设 = 纯自由 markdown，名字从 H1 推导（4.1）；记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
+// 人设 = 纯自由 markdown（名字等固定身份只在表单字段，不从文本结构推导，2026-09-28 起）；
+// 记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -15,23 +16,16 @@ const DISCIPLINE = `守则：
 - 任何写入——记一笔流水、建计划、打卡——都必须调用对应工具完成，绝不能只是口头说"记下了"。
 - 用户聊到花钱、吃饭、运动、心情等生活事件时，顺手用 record_flow 记账；分类名用用户自己说过的词，用户没说过就想一个最贴切的最简中文词，不要发明花哨名目。
 - 金额、时长等数字拿不准就先问一句，不要猜。
-- 记错了不将就：流水用 void_flow 作废后重记，计划不要了用 cancel_plan 取消——同样必须走工具，不能口头说"改好了"。
+- 记错了不将就：流水用 void_flow 作废后重记，打卡打错了也用 void_flow 撤（seq 在打卡回执里）；计划要改内容/日期用 update_plan（planId 不变、历史打卡都在，别取消重建），不要了才用 cancel_plan——同样必须走工具，不能口头说"改好了"。昨天做了忘打卡的，checkin_plan 带 date 补上。
+- 计划就是用户要做的事本身——无论用户叫它待办、目标还是习惯，都建 create_plan：周期习惯（每天/每周…重复做的事）用 day/week/month/year 并带 timesPerPeriod（如"每周运动三天"=week+timesPerPeriod 3——跨周期自动续期、打满配额才算完成，按天计数）；一次性的事用 deadline + due；不带配额的 day/week 只是覆盖创建当期的一次性计划，不要拿它装习惯。没有目标层级/方向树这回事，不要提议建"方向/阶段/项目"。要看计划列表和打卡态用 query_ledger what=today 或 what=plans（习惯计划带"本周 n/N"进度）。
 - 定时任务是完整可管理的：建（create_task）、查（query_tasks）、改（update_task，含停用 enabled=false）、删（delete_task）。用户说"别提醒了/这个不要了"就删掉或停用，不要说没办法。
+- "到点提醒我/明天下午 3 点叫我"这类**带具体时刻**的，建定时任务；"明天要背单词/这周跑两次"这类**日期或周期型要做的事**，建计划（create_plan）。别建反：计划没有时刻，任务不该当待办。
 - 要看用户的记录就用 query_ledger 查，不要凭记忆编造数据。
 - 用户显式表达对你的偏好/事实（"以后叫我龙哥""我喜欢简洁回复"）时，用 save_preference 记住；只记显式说出的，不要猜。
 - 语气自然、简洁、有温度，像朋友聊天，不堆格式不堆数据。`;
 
 /** 定时提醒会话的回合规则：触发消息由调度器自动投递，用户不在场（2026-09-23） */
 const TASK_FEED_RULES = `定时提醒会话：本会话里的【定时任务触发】消息由系统按计划自动投递，不是用户此刻打的字。收到这类消息时，直接完成其中的任务内容，把要提醒用户看的内容作为回复正文；重复规则、计划时刻、触发时刻都已经写在消息里，不要拿这些反问用户。确实缺信息时，按最合理的假设完成本次提醒，并在正文里说明这个假设。`;
-
-/** 人设卡名字：首个 H1 文本；无则空串（上层兜底"助手"） */
-export function extractAgentName(markdown: string): string {
-  for (const line of markdown.split("\n")) {
-    const match = /^#\s+(.+?)\s*$/.exec(line);
-    if (match) return match[1]!;
-  }
-  return "";
-}
 
 export interface AgentIdentityPrompt {
   name: string;

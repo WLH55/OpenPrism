@@ -61,3 +61,10 @@ Thumbs.db
 .zcode/
 plugins/
 e2e-data/
+
+# 本地草稿/演示数据（历史会话产物，不入库：含会话 cookie 与演示 DB WAL）
+demo/
+data-demo/
+# 截图目录：PNG 是 README 素材放行，其余产物仍忽略
+docs/screenshots/*
+!docs/screenshots/*.png

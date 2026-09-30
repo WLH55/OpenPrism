@@ -115,6 +115,56 @@ describe("非流式", () => {
     expect(sentBody!.max_tokens).toBe(512);
   });
 
+  it("用户消息带图片 → content 部件数组（data URL）；文本附件正文并入文本", async () => {
+    let sentBody: Record<string, unknown> | undefined;
+    const adapter = createOpenAICompatAdapter(
+      envWith(async (_url, init) => {
+        sentBody = JSON.parse(init!.body as string);
+        return jsonResponse({ choices: [{ message: { content: "看到了" }, finish_reason: "stop" }] });
+      }),
+      { baseURL: "https://api.example.com/v1", apiKey: "k", stream: false },
+    );
+    await adapter.complete({
+      ...baseRequest,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "这是什么" },
+            { type: "image", mediaType: "image/webp", data: "QUJD" },
+            { type: "file", name: "note.txt", mediaType: "text/plain", text: "附件正文" },
+          ],
+        },
+      ],
+    });
+    const messages = sentBody!.messages as { role: string; content: unknown }[];
+    expect(messages[0]).toEqual({ role: "system", content: "SYS" });
+    expect(messages[1]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "这是什么\n【附件 note.txt】\n附件正文" },
+        { type: "image_url", image_url: { url: "data:image/webp;base64,QUJD" } },
+      ],
+    });
+  });
+
+  it("纯图片消息（无文字）→ content 只有图片部件，不塞空文本", async () => {
+    let sentBody: Record<string, unknown> | undefined;
+    const adapter = createOpenAICompatAdapter(
+      envWith(async (_url, init) => {
+        sentBody = JSON.parse(init!.body as string);
+        return jsonResponse({ choices: [{ message: { content: "嗯" }, finish_reason: "stop" }] });
+      }),
+      { baseURL: "https://api.example.com/v1", apiKey: "k", stream: false },
+    );
+    await adapter.complete({
+      ...baseRequest,
+      messages: [{ role: "user", content: [{ type: "image", mediaType: "image/png", data: "QUJD" }] }],
+    });
+    const messages = sentBody!.messages as { role: string; content: unknown }[];
+    expect(messages[1]).toEqual({ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } }] });
+  });
+
   it("空完成 → EMPTY_RESPONSE", async () => {
     const adapter = createOpenAICompatAdapter(
       envWith(async () => jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] })),

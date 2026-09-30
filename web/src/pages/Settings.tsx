@@ -74,9 +74,10 @@ interface FormState {
   windowChoice: string; // "default" | "32768" | "65536" | "131072" | "200000" | "custom"
   customWindow: string;
   kind: string; // "chat" | "embedding"（提供方用途，2026-09-18）
+  multimodal: boolean; // 该模型是否支持图片识别（对话里发图的前提）
 }
 
-const EMPTY_FORM: FormState = { open: false, editingId: null, presetId: null, baseURL: "", model: "", apiKey: "", windowChoice: "default", customWindow: "", kind: "chat" };
+const EMPTY_FORM: FormState = { open: false, editingId: null, presetId: null, baseURL: "", model: "", apiKey: "", windowChoice: "default", customWindow: "", kind: "chat", multimodal: false };
 
 /** 模型接入页：BYOK 横幅 + 多供应商平级列表（测试/编辑/删除）+ 预置新增表单；用哪个模型在会话里选 */
 export function Settings() {
@@ -116,6 +117,7 @@ export function Settings() {
       model: provider.model,
       apiKey: "",
       kind,
+      multimodal: provider.multimodal,
       windowChoice: window === "" ? "default" : fromChoice ? window : "custom",
       customWindow: window === "" || fromChoice ? "" : window,
     });
@@ -147,6 +149,7 @@ export function Settings() {
           : form.windowChoice === "custom"
             ? Number(form.customWindow)
             : Number(form.windowChoice);
+    const multimodal = form.kind === "chat" ? form.multimodal : false;
     try {
       if (form.editingId !== null) {
         await api.updateModel(form.editingId, {
@@ -154,6 +157,7 @@ export function Settings() {
           model: form.model.trim(),
           contextWindow,
           kind: form.kind,
+          multimodal,
           ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
         });
         setMessage({ ok: true, text: "已更新（Key 加密存储在你自己的设备上）" });
@@ -163,6 +167,7 @@ export function Settings() {
           model: form.model.trim(),
           contextWindow,
           kind: form.kind,
+          multimodal,
           ...(form.apiKey.trim() !== "" ? { apiKey: form.apiKey.trim() } : {}),
         });
         setMessage({ ok: true, text: "已新增（首个供应商自动启用；Key 加密存储在你自己的设备上）" });
@@ -244,6 +249,7 @@ export function Settings() {
               <div className="truncate text-sm font-semibold text-ink">
                 {providerLine(p)}
                 {p.kind === "embedding" && <span className="ml-2 rounded-full bg-accent3 px-1.5 py-0.5 text-[11px] font-normal text-accent">向量</span>}
+                {p.kind === "chat" && p.multimodal && <span className="ml-2 rounded-full bg-accent3 px-1.5 py-0.5 text-[11px] font-normal text-accent">图片</span>}
               </div>
               <div className="mt-0.5 truncate font-mono text-xs text-ink3">
                 {p.baseURL} ·{" "}
@@ -381,6 +387,24 @@ export function Settings() {
             </select>
             <p className="mt-1.5 text-xs text-ink3">embedding 用途用于记忆的语义召回，不参与对话上下文压缩。</p>
           </div>
+          {form.kind === "chat" && (
+            <div className="rounded-xl border border-line bg-surface2 px-3.5 py-3">
+              <label className="flex cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent2)]"
+                  checked={form.multimodal}
+                  onChange={(e) => setForm({ ...form, multimodal: e.target.checked })}
+                />
+                <span>
+                  <span className="block text-sm font-medium text-ink">支持图片识别（多模态）</span>
+                  <span className="mt-0.5 block text-xs leading-relaxed text-ink3">
+                    勾选后可以在对话里发图片。按这个模型的真实能力填：模型说明里写了支持视觉输入才勾。
+                  </span>
+                </span>
+              </label>
+            </div>
+          )}
           <div>
             <label className="mb-1.5 block text-sm font-medium text-ink" htmlFor="context-window">
               {form.kind === "embedding" ? "单次输入上限（tokens）" : "上下文窗口（tokens）"}
@@ -498,6 +522,38 @@ export function Settings() {
             />
             <span className="mt-1.5 block text-xs text-ink3">同一主题被谈起这么多次后，自动记为长期兴趣。</span>
           </label>
+        </div>
+      </div>
+
+      {/* 数据导出（2026-09-30 SDD 数据导出）：透明，而且带得走 */}
+      <div className="mt-6 rounded-xl border border-line bg-surface p-4">
+        <div className="text-sm font-semibold text-ink">数据导出</div>
+        <p className="mt-1 text-xs leading-relaxed text-ink3">
+          你的流水、计划（含打卡）与全部对话随时可以导出带走：JSON 是全量备份（含历史与作废记录，机器可读），
+          Markdown 是按日期整理的时间线（可直接当日记翻，对话含你与助手的往来发言）。不绑架、不锁定。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <a
+            className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
+            href={api2.exportDataUrl("json")}
+            download
+          >
+            导出 JSON 全量备份
+          </a>
+          <a
+            className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-ink2 transition hover:border-accent hover:text-ink"
+            href={api2.exportDataUrl("md")}
+            download
+          >
+            导出 Markdown 时间线
+          </a>
+          <a
+            className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-ink2 transition hover:border-accent hover:text-ink"
+            href={api2.exportMemoryUrl()}
+            download
+          >
+            导出长期记忆
+          </a>
         </div>
       </div>
 

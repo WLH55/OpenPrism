@@ -30,7 +30,7 @@ export interface FlowRecord extends LedgerEventBase {
   attrs?: Record<string, string | number>;
 }
 
-/** 计划：今日/本周/本月/今年/最近 N 天/带截止日 */
+/** 计划：今日/本周/本月/今年/最近 N 天/带截止日；timesPerPeriod 存在 = 习惯计划（跨周期续期 + 每期配额，2026-09-30 习惯化） */
 export interface PlanRecord extends LedgerEventBase {
   kind: "plan";
   planId: string;
@@ -38,6 +38,8 @@ export interface PlanRecord extends LedgerEventBase {
   scope: "day" | "week" | "month" | "year" | "ndays" | "deadline";
   due?: string; // YYYY-MM-DD（scope=deadline 必填）
   ndays?: number; // scope=ndays 必填
+  timesPerPeriod?: number; // ≥1；day=每日打卡次数，week/month/year=每期不同本地日数
+  goalId?: string;
 }
 
 /** 打卡：认证"计划做了没"（引用 planId，不与流水混同） */
@@ -55,14 +57,32 @@ export interface VoidRecord extends LedgerEventBase {
   reason?: string;
 }
 
-export type LedgerRecord = FlowRecord | PlanRecord | CheckinRecord | VoidRecord;
+/** 目标：方向/阶段/项目层级一等公民（2026-09-28 B1，SDD 个人工作台业务借鉴）——
+ * 修订 = 追加新快照（同 goalId 最新胜出，历史全保留）；void 仅真删，不承载目标演化。
+ * 里程碑不设新原语：挂阶段的 deadline 型 plan + checkin 即里程碑打卡。 */
+export interface GoalRecord extends LedgerEventBase {
+  kind: "goal";
+  goalId: string;
+  level: "direction" | "phase" | "project";
+  parentId?: string; // phase→direction；project→phase 或 direction
+  title: string;
+  why?: string; // 方向：为什么重要
+  outcome?: string; // 方向/阶段：预期结果（可验收）
+  metric?: string; // 方向：衡量指标
+  due?: string; // YYYY-MM-DD（阶段截止日常用）
+  nextStep?: string; // 阶段：唯一下一步
+  status: "active" | "paused" | "done" | "archived";
+}
+
+export type LedgerRecord = FlowRecord | PlanRecord | CheckinRecord | VoidRecord | GoalRecord;
 
 /** appender 视角（seq/ts 由账本分配）；联合逐成员 Omit，保留各自判别字段 */
 export type LedgerAppend =
   | Omit<FlowRecord, "seq" | "ts">
   | Omit<PlanRecord, "seq" | "ts">
   | Omit<CheckinRecord, "seq" | "ts">
-  | Omit<VoidRecord, "seq" | "ts">;
+  | Omit<VoidRecord, "seq" | "ts">
+  | Omit<GoalRecord, "seq" | "ts">;
 
 /** 单条落库（迁移器复用）：kind 判别列 → 各自专有列 */
 export function insertLedgerRecord(db: DatabaseSync, uid: string, record: LedgerRecord): void {
@@ -91,7 +111,7 @@ export function insertLedgerRecord(db: DatabaseSync, uid: string, record: Ledger
       break;
     case "plan":
       db.prepare(
-        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, plan_id, title, scope, due, ndays) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, plan_id, title, scope, due, ndays, times_per_period, plan_goal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).run(
         uid,
         record.seq,
@@ -105,6 +125,8 @@ export function insertLedgerRecord(db: DatabaseSync, uid: string, record: Ledger
         record.scope,
         record.due ?? null,
         record.ndays ?? null,
+        record.timesPerPeriod ?? null,
+        record.goalId ?? null,
       );
       break;
     case "checkin":
@@ -128,6 +150,29 @@ export function insertLedgerRecord(db: DatabaseSync, uid: string, record: Ledger
         "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, target_seq, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).run(uid, record.seq, record.kind, record.ts, record.source, actorConv, actorAgent, record.targetSeq, record.reason ?? null);
       break;
+    case "goal":
+      db.prepare(
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, goal_id, title, level, parent_id, due, g_why, g_outcome, g_metric, g_next_step, g_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        uid,
+        record.seq,
+        record.kind,
+        record.ts,
+        record.source,
+        actorConv,
+        actorAgent,
+        record.goalId,
+        record.title,
+        record.level,
+        record.parentId ?? null,
+        record.due ?? null,
+        record.why ?? null,
+        record.outcome ?? null,
+        record.metric ?? null,
+        record.nextStep ?? null,
+        record.status,
+      );
+      break;
   }
 }
 
@@ -149,11 +194,21 @@ type LedgerRow = {
   scope: string | null;
   due: string | null;
   ndays: number | null;
+  times_per_period: number | null;
   checkin_plan_id: string | null;
   at: number | null;
   done: number | null;
   target_seq: number | null;
   reason: string | null;
+  goal_id: string | null;
+  level: string | null;
+  parent_id: string | null;
+  g_why: string | null;
+  g_outcome: string | null;
+  g_metric: string | null;
+  g_next_step: string | null;
+  g_status: string | null;
+  plan_goal_id: string | null;
 };
 
 /** 行 → 记录：与旧 JSON 透传同构（缺省键不出现，fold 层零感知） */
@@ -192,6 +247,23 @@ function rowToRecord(row: LedgerRow): LedgerRecord | null {
         scope: (row.scope ?? "day") as PlanRecord["scope"],
         ...(row.due !== null ? { due: row.due } : {}),
         ...(row.ndays !== null ? { ndays: row.ndays } : {}),
+        ...(row.times_per_period !== null ? { timesPerPeriod: row.times_per_period } : {}),
+        ...(row.plan_goal_id !== null ? { goalId: row.plan_goal_id } : {}),
+      };
+    case "goal":
+      return {
+        ...base,
+        kind: "goal",
+        goalId: row.goal_id ?? "",
+        level: (row.level ?? "direction") as GoalRecord["level"],
+        title: row.title ?? "",
+        status: (row.g_status ?? "active") as GoalRecord["status"],
+        ...(row.parent_id !== null ? { parentId: row.parent_id } : {}),
+        ...(row.due !== null ? { due: row.due } : {}),
+        ...(row.g_why !== null ? { why: row.g_why } : {}),
+        ...(row.g_outcome !== null ? { outcome: row.g_outcome } : {}),
+        ...(row.g_metric !== null ? { metric: row.g_metric } : {}),
+        ...(row.g_next_step !== null ? { nextStep: row.g_next_step } : {}),
       };
     case "checkin":
       return {
@@ -239,8 +311,8 @@ export class Ledger {
   append(record: LedgerAppend, ts: number = Date.now()): Promise<LedgerRecord> {
     const run = async (): Promise<LedgerRecord> => {
       const full = { ...record, seq: this.nextSeq++, ts } as LedgerRecord;
+      insertLedgerRecord(this.db, this.uid, full); // 先落库后入内存：绑定抛错不留幻影记录（视图与库不分叉）
       this.records.push(full);
-      insertLedgerRecord(this.db, this.uid, full);
       return full;
     };
     const appended = this.queue.then(run, run); // 前序失败也继续（队列不因单条失败卡死）

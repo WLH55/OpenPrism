@@ -1,17 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, api2, openConversationStream, type AgentLoose, type ConversationEntry, type ConversationMetaLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
-import { CheckSolidIcon, ChevronDownIcon, SwitchPartnerIcon } from "../icons";
+import { api, api2, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
+import { CheckSolidIcon, ChevronDownIcon, CloseIcon, SlidersIcon, StopIcon, SwitchPartnerIcon } from "../icons";
 import { FaceAvatar } from "../components/FaceEditor";
+import { AttachmentTray, toAttachmentInputs, type PendingAttachment } from "../components/Attachments";
 import { Markdown } from "../markdown";
+import { useLightbox } from "../lightbox";
+
+/** 历史分段加载的每页条数（2026-09-23）：首屏取最近一段，触顶续取更早一段 */
+const EVENTS_PAGE_SIZE = 50;
 
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
-  | { kind: "user"; key: string; text: string }
-  | { kind: "assistant"; key: string; text: string; reasoning: string }
+  | { kind: "user"; key: string; text: string; images: BlockLoose[]; files: string[] }
+  | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean }
   | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
   | { kind: "switch"; key: string; label: string };
 
-function foldEvents(events: SessionEventLoose[], switches: { ts: number; agentId: string }[] = [], agentName: (id: string) => string): RenderItem[] {
+/** 等待队列条目（2026-09-27）：AI 输出期间发送的消息（文本 + 附件），排队在输入框上方 */
+type QueuedMessage = { key: string; text: string; attachments: PendingAttachment[] };
+
+function foldEvents(
+  events: SessionEventLoose[],
+  switches: { ts: number; agentId: string }[] = [],
+  agentName: (id: string) => string,
+  agentIdAt: (ts: number | undefined) => string | undefined,
+): RenderItem[] {
   const items: RenderItem[] = [];
   for (const event of events) {
     // 切换分割线：插到第一条晚于切换时刻的事件前（D4.2 消息归属可视）
@@ -21,8 +34,14 @@ function foldEvents(events: SessionEventLoose[], switches: { ts: number; agentId
       }
     }
     if (event.type === "user/message") {
-      const text = (event.message?.content ?? []).map((b) => b.text ?? "").join("");
-      items.push({ kind: "user", key: `u${event.seq}`, text });
+      const blocks = event.message?.content ?? [];
+      items.push({
+        kind: "user",
+        key: `u${event.seq}`,
+        text: blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join(""),
+        images: blocks.filter((b) => b.type === "image"),
+        files: blocks.filter((b) => b.type === "file").map((b) => b.name ?? "附件"),
+      });
     } else if (event.type === "assistant/message") {
       const text = (event.message?.content ?? [])
         .filter((b) => b.type === "text")
@@ -33,6 +52,8 @@ function foldEvents(events: SessionEventLoose[], switches: { ts: number; agentId
         key: `a${event.seq}`,
         text: text || "…",
         reasoning: event.message?.reasoning ?? "",
+        agentId: agentIdAt(event.ts),
+        interrupted: event.message?.interrupted === true,
       });
     } else if (event.type === "tool/call") {
       items.push({ kind: "receipt", key: `t${event.id}`, name: event.name ?? "?", ok: true, text: "执行中…" });
@@ -52,11 +73,15 @@ export function Chat({
   reloadConversations,
   activeConvId,
   setActiveConvId,
+  username,
+  userFace,
 }: {
   conversations: ConversationEntry[];
   reloadConversations: () => Promise<ConversationEntry[]>;
   activeConvId: string | null;
   setActiveConvId: (id: string | null) => void;
+  username: string;
+  userFace: FaceLoose;
 }) {
   const [agents, setAgents] = useState<AgentLoose[]>([]);
   const [currentAgentId, setCurrentAgentId] = useState<string | undefined>(undefined);
@@ -68,13 +93,26 @@ export function Chat({
   // 流式中的增量（turn 结束后以日志为准清空）
   const [stream, setStream] = useState<{ reasoning: string; text: string } | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [composerError, setComposerError] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // AI 正在输出（2026-09-27 打断与排队）：SSE status/turn-end 事件驱动，发送按钮据此变形
+  const [generating, setGenerating] = useState(false);
+  // 等待队列：AI 输出期间发送的消息暂存于此，回复完成后按入队顺序自动发出
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const openImage = useLightbox();
   const [showReasoning, setShowReasoning] = useState(true);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // 窄屏「会话设置」面板（模型 / 思维链 / 切换伙伴收进来；桌面这三件在头部一行摆开）
+  const [sessionPanel, setSessionPanel] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeConvId;
+  // SSE 回调要读最新值的镜像（activeIdRef 同款模式）：队列、自动出队的在途标记、发送管线
+  const queueRef = useRef<QueuedMessage[]>([]);
+  const flushInFlightRef = useRef(false);
+  const deliverRef = useRef<(text: string, attachments: PendingAttachment[]) => Promise<boolean>>(async () => false);
 
   const agentName = useCallback(
     (id: string): string => agents.find((a) => a.id === id)?.name ?? "新伙伴",
@@ -82,12 +120,83 @@ export function Chat({
   );
   const currentAgent = agents.find((a) => a.id === currentAgentId);
 
+  // 分段加载的载入态（2026-09-23）：loadedRef = 已载事件（升序）；historyEnd = 更早的历史已全部载入
+  const loadedRef = useRef<SessionEventLoose[]>([]);
+  const loadedCidRef = useRef<string | null>(null);
+  const switchesRef = useRef<{ ts: number; agentId: string }[]>([]);
+  const agentIdAtRef = useRef<(ts: number | undefined) => string | undefined>(() => undefined);
+  const historyEndRef = useRef(true);
+  const loadingOlderRef = useRef(false);
+  const keepScrollRef = useRef(false);
+  const pendingHeightRef = useRef(0);
+  const [historyEnd, setHistoryEnd] = useState(true);
+
   const loadEvents = useCallback(
     async (cid: string) => {
-      const [events, meta] = await Promise.all([api.conversationEvents(cid), api2.convMeta(cid).catch(() => ({ switches: [] as { ts: number; agentId: string }[] }) as ConversationMetaLoose)]);
-      setItems(foldEvents(events, meta.switches, agentName));
+      const [tail, meta] = await Promise.all([
+        api.conversationEvents(cid, { limit: EVENTS_PAGE_SIZE }),
+        api2.convMeta(cid).catch(() => ({ switches: [] as { ts: number; agentId: string }[] }) as ConversationMetaLoose),
+      ]);
+      if (loadedCidRef.current !== cid) {
+        loadedRef.current = []; // 换会话：丢弃上一会话已载的事件
+        loadedCidRef.current = cid;
+      }
+      // 已向上翻出的更早事件保留（回合结束重放日志时 tail 会刷新，老段不能丢）
+      const firstSeq = tail.length > 0 ? (tail[0]!.seq ?? 0) : 0;
+      const older = loadedRef.current.filter((e) => (e.seq ?? 0) < firstSeq);
+      const merged = older.concat(tail);
+      loadedRef.current = merged;
+      switchesRef.current = meta.switches;
+      const agentIdAt = (ts: number | undefined) => {
+        // 消息归属：按切换时刻取最近一次加入的伙伴；没有切换记录时以会话当前伙伴为准
+        if (meta.switches.length === 0) return meta.agentId;
+        if (ts === undefined) return meta.switches[meta.switches.length - 1]!.agentId;
+        let hit: string | undefined;
+        for (const sw of meta.switches) if (sw.ts <= ts) hit = sw.agentId;
+        return hit;
+      };
+      agentIdAtRef.current = agentIdAt;
+      // tail 不足一页或已顶到 seq 0 = 更早的历史全部载入
+      const end = tail.length < EVENTS_PAGE_SIZE || firstSeq <= 0;
+      historyEndRef.current = end;
+      setHistoryEnd(end);
+      setItems(foldEvents(merged, meta.switches, agentName, agentIdAt));
       setCurrentAgentId(meta.agentId);
       setModelProviderId(meta.modelProviderId);
+    },
+    [agentName],
+  );
+
+  /** 触顶续取更早一段：合并后按滚动高度差回补位置，阅读处不跳 */
+  const loadOlder = useCallback(
+    async (cid: string) => {
+      if (loadingOlderRef.current || historyEndRef.current || loadedCidRef.current !== cid) return;
+      const loaded = loadedRef.current;
+      const before = loaded.length > 0 ? (loaded[0]!.seq ?? 0) : 0;
+      if (before <= 0) {
+        historyEndRef.current = true;
+        setHistoryEnd(true);
+        return;
+      }
+      loadingOlderRef.current = true;
+      try {
+        const older = await api.conversationEvents(cid, { before, limit: EVENTS_PAGE_SIZE });
+        if (older.length === 0) {
+          historyEndRef.current = true;
+          setHistoryEnd(true);
+          return;
+        }
+        if (scrollRef.current) pendingHeightRef.current = scrollRef.current.scrollHeight;
+        keepScrollRef.current = true;
+        loadedRef.current = older.concat(loaded);
+        setItems(foldEvents(loadedRef.current, switchesRef.current, agentName, agentIdAtRef.current));
+        if (older.length < EVENTS_PAGE_SIZE) {
+          historyEndRef.current = true;
+          setHistoryEnd(true);
+        }
+      } finally {
+        loadingOlderRef.current = false;
+      }
     },
     [agentName],
   );
@@ -109,13 +218,122 @@ export function Chat({
       .catch(() => undefined);
   }, []);
 
+  /** 实际发送一条消息（2026-09-27 从 send 抽出，队列出队复用）：乐观插本地气泡；失败撤泡 + 提示，内容回退由调用方决定 */
+  const deliver = async (text: string, outgoing: PendingAttachment[]): Promise<boolean> => {
+    if (!activeConvId) return false;
+    const localKey = `local-${Date.now()}`;
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user",
+        key: localKey,
+        text,
+        images: outgoing.filter((item) => item.kind === "image").map((item) => ({ type: "image", mediaType: item.mediaType, data: item.dataBase64 })),
+        files: outgoing.filter((item) => item.kind === "file").map((item) => item.name),
+      },
+    ]);
+    try {
+      await api.sendMessage(activeConvId, text, toAttachmentInputs(outgoing));
+      return true;
+    } catch (e) {
+      const error = e as Error & { status?: number; code?: string };
+      setItems((prev) => prev.filter((item) => item.key !== localKey));
+      if (error.code === "model_not_configured") setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
+      else if (error.code === "model_not_multimodal") setComposerError(error.message);
+      else setBanner(`发送失败：${error.message}`);
+      return false;
+    }
+  };
+  deliverRef.current = deliver;
+
+  /**
+   * 回合收尾（turn-end / status idle / error / budget-exhausted）：置闲 + 幂等出队队首。
+   * 在途标记保证同一收尾事件只发一条（turn-end 与 status idle 常背靠背到达）；
+   * 发送失败退回队首——此时无回合在跑，不会再触发自动发送，等用户处理。
+   */
+  const settleAndFlush = () => {
+    setGenerating(false);
+    if (flushInFlightRef.current) return;
+    const next = queueRef.current[0];
+    if (!next) return;
+    flushInFlightRef.current = true;
+    queueRef.current = queueRef.current.slice(1);
+    setQueue(queueRef.current);
+    void deliverRef.current(next.text, next.attachments).then((ok) => {
+      flushInFlightRef.current = false;
+      if (!ok) {
+        queueRef.current = [next, ...queueRef.current];
+        setQueue(queueRef.current);
+      }
+    });
+  };
+
+  /** 点击发送：空闲直接发；AI 输出中入等待队列（回复完成后自动发出，可立即发送/删除） */
+  const send = () => {
+    const text = input.trim();
+    if ((text === "" && attachments.length === 0) || !activeConvId) return;
+    setInput("");
+    setAttachments([]);
+    setComposerError(null);
+    if (generating) {
+      queueRef.current = [...queueRef.current, { key: `q-${Date.now()}`, text, attachments }];
+      setQueue(queueRef.current);
+      return;
+    }
+    void deliver(text, attachments).then((ok) => {
+      // 发送失败：把内容还给输入区，用户改完模型就能直接重发
+      if (!ok) {
+        setInput(text);
+        setAttachments(attachments);
+      }
+    });
+  };
+
+  /** 停止 AI 输出：中止当前回合（已生成的部分保留并标「已中止」） */
+  const stopGenerating = async () => {
+    if (!activeConvId) return;
+    try {
+      await api.stopConversation(activeConvId);
+    } catch {
+      /* 停止失败静默：以 SSE 事件为准，回合结束会自行收尾 */
+    }
+  };
+
+  /** 队列条目「立即发送」：先中止当前输出，随后立即发出；失败退回队列 */
+  const sendQueuedNow = async (item: QueuedMessage) => {
+    queueRef.current = queueRef.current.filter((q) => q.key !== item.key);
+    setQueue(queueRef.current);
+    if (generating) await stopGenerating();
+    const ok = await deliver(item.text, item.attachments);
+    if (!ok) {
+      queueRef.current = [item, ...queueRef.current.filter((q) => q.key !== item.key)];
+      setQueue(queueRef.current);
+    }
+  };
+
+  /** 队列条目「删除」：取消这段待发内容 */
+  const removeQueued = (key: string) => {
+    queueRef.current = queueRef.current.filter((q) => q.key !== key);
+    setQueue(queueRef.current);
+  };
+
   // 会话的确保与选中在壳子完成；此处只订阅当前会话
   useEffect(() => {
+    // 换会话/删光会话（activeConvId 变 null 而 Chat 仍挂载）：清流式残留与等待队列——
+    // 队列是原会话的待发内容，不能带去新会话，也不能挂在无会话的空界面上
+    setStream(null);
+    setGenerating(false);
+    queueRef.current = [];
+    setQueue([]);
     if (!activeConvId) return;
     void loadEvents(activeConvId).catch(() => undefined);
     const close = openConversationStream(activeConvId, (event: LiveEventLoose) => {
       if (activeIdRef.current !== activeConvId) return;
-      if (event.type === "reasoning-delta") {
+      if (event.type === "status") {
+        // 连接时服务端先推当前状态；断线重连也会重推（此处出队幂等，不会重发）
+        if (event.status === "running") setGenerating(true);
+        else settleAndFlush();
+      } else if (event.type === "reasoning-delta") {
         setStream((s) => ({ reasoning: (s?.reasoning ?? "") + (event.text ?? ""), text: s?.text ?? "" }));
       } else if (event.type === "text-delta") {
         setStream((s) => ({ reasoning: (s?.reasoning ?? ""), text: (s?.text ?? "") + (event.text ?? "") }));
@@ -135,6 +353,7 @@ export function Chat({
             .then(() => reloadConversations())
             .catch(() => undefined);
         }
+        settleAndFlush();
       } else if (event.type === "tool-call") {
         setItems((prev) => [
           ...prev,
@@ -158,7 +377,15 @@ export function Chat({
   }, [activeConvId, loadEvents]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    const el = scrollRef.current;
+    if (!el) return;
+    if (keepScrollRef.current) {
+      // 续取了更早一段：回补 prepend 增加的高度，视口停在原阅读处
+      keepScrollRef.current = false;
+      el.scrollTop = el.scrollHeight - pendingHeightRef.current;
+      return;
+    }
+    el.scrollTo({ top: el.scrollHeight });
   }, [items, stream]);
 
   // 点外部收起伙伴/模型下拉
@@ -167,25 +394,12 @@ export function Chat({
       if (!headerRef.current?.contains(event.target as Node)) {
         setPickerOpen(false);
         setModelPickerOpen(false);
+        setSessionPanel(false);
       }
     };
     document.addEventListener("click", onDoc);
     return () => document.removeEventListener("click", onDoc);
   }, []);
-
-  const send = async () => {
-    const text = input.trim();
-    if (!text || !activeConvId) return;
-    setInput("");
-    setItems((prev) => [...prev, { kind: "user", key: `local-${Date.now()}`, text }]);
-    try {
-      await api.sendMessage(activeConvId, text);
-    } catch (e) {
-      const status = (e as { status?: number }).status;
-      if (status === 409) setBanner("还没有配置模型——去左下角菜单「模型接入」填 baseURL / API Key / 模型");
-      else setBanner(`发送失败：${(e as Error).message}`);
-    }
-  };
 
   const pickPartner = async (id: string) => {
     setPickerOpen(false);
@@ -228,6 +442,11 @@ export function Chat({
   const effectiveProvider = boundProvider ?? agentDefaultProvider ?? globalProvider;
   const modelShortLabel = effectiveProvider ? `${effectiveProvider.platform || "自定义"} · ${effectiveProvider.model}` : "未配置模型";
   const windowLabel = (p: ModelProvider): string => (p.contextWindow === null ? "默认 64K" : `${Math.round(p.contextWindow / 1000)}K`);
+  // 图片能不能发，取决于当前生效的模型（会话绑定 → 伙伴默认 → 全局）
+  const modelSupportsImages = effectiveProvider?.multimodal === true;
+  const imageBlockedHint = effectiveProvider
+    ? `当前模型 ${effectiveProvider.model} 不支持图片识别`
+    : "还没有配置模型";
 
   return (
     <div className="flex h-full min-h-0 flex-1 overflow-hidden bg-surface">
@@ -250,7 +469,7 @@ export function Chat({
           </button>
           <div className="flex items-center gap-2">
             <button
-              className="hidden max-w-52 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2 sm:flex"
+              className="hidden max-w-52 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2 md:flex"
               onClick={(e) => { e.stopPropagation(); setPickerOpen(false); setModelPickerOpen(!modelPickerOpen); }}
             >
               <span className="truncate">{modelShortLabel}</span>
@@ -259,7 +478,7 @@ export function Chat({
               </span>
               <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-ink3" />
             </button>
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-ink2">
+            <label className="hidden cursor-pointer items-center gap-2 text-xs text-ink2 md:flex">
               <span>思维链</span>
               <span className="relative inline-block h-5 w-9">
                 <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
@@ -268,11 +487,19 @@ export function Chat({
               </span>
             </label>
             <button
-              className="flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2"
+              className="hidden items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition hover:bg-surface2 md:flex"
               onClick={(e) => { e.stopPropagation(); setModelPickerOpen(false); setPickerOpen(!pickerOpen); }}
             >
               <SwitchPartnerIcon className="h-4 w-4 text-ink2" />
               切换伙伴
+            </button>
+            {/* 窄屏：模型 / 思维链 / 切换伙伴收进这块可展开面板 */}
+            <button
+              className="flex items-center rounded-lg border border-line bg-surface px-2.5 py-2 text-ink2 transition hover:bg-surface2 md:hidden"
+              onClick={(e) => { e.stopPropagation(); setPickerOpen(false); setModelPickerOpen(false); setSessionPanel(!sessionPanel); }}
+              title="会话设置"
+            >
+              <SlidersIcon className="h-4 w-4" />
             </button>
           </div>
 
@@ -333,7 +560,10 @@ export function Chat({
                   onClick={() => void pickModel(p.id)}
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[14px] font-medium text-ink">{p.platform || "自定义"}</span>
+                    <span className="flex items-center gap-1.5 text-[14px] font-medium text-ink">
+                      <span className="truncate">{p.platform || "自定义"}</span>
+                      {p.multimodal && <span className="shrink-0 rounded bg-accent3 px-1 py-0.5 text-[10px] font-normal text-accent">图片</span>}
+                    </span>
                     <span className="block truncate text-xs text-ink3">
                       {p.model} · 窗口 {windowLabel(p)}
                       {p.hasKey ? "" : " · 未配 Key"}
@@ -347,6 +577,37 @@ export function Chat({
               )}
             </div>
           )}
+
+          {/* 窄屏会话设置面板（2026-09-23）：桌面摆在头部一行，窄屏收进这块 */}
+          {sessionPanel && (
+            <div className="absolute inset-x-0 top-full z-10 space-y-2 border-b border-line bg-surface px-4 py-3 shadow-sm md:hidden">
+              <button
+                className="flex w-full items-center justify-between gap-2 rounded-lg border border-line bg-surface px-3 py-2 text-sm font-medium text-ink"
+                onClick={(e) => { e.stopPropagation(); setPickerOpen(false); setModelPickerOpen(!modelPickerOpen); }}
+              >
+                <span className="truncate">{modelShortLabel}</span>
+                <span className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-normal ${boundProvider ? "bg-accent3 text-accent" : "bg-surface2 text-ink3"}`}>
+                  {boundProvider ? "本会话" : agentDefaultProvider ? "伙伴默认" : "全局"}
+                </span>
+                <ChevronDownIcon className="h-3.5 w-3.5 shrink-0 text-ink3" />
+              </button>
+              <label className="flex cursor-pointer items-center justify-between text-sm text-ink2">
+                <span>思维链</span>
+                <span className="relative inline-block h-5 w-9">
+                  <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
+                  <span className="absolute inset-0 rounded-full bg-ink3/40 transition peer-checked:bg-accent2" />
+                  <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-surface shadow transition peer-checked:translate-x-4" />
+                </span>
+              </label>
+              <button
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-2 text-sm font-medium text-ink transition hover:bg-surface2"
+                onClick={(e) => { e.stopPropagation(); setModelPickerOpen(false); setPickerOpen(!pickerOpen); }}
+              >
+                <SwitchPartnerIcon className="h-4 w-4 text-ink2" />
+                切换伙伴
+              </button>
+            </div>
+          )}
         </header>
 
         {banner && (
@@ -354,7 +615,15 @@ export function Chat({
         )}
 
         {/* 消息流 */}
-        <div className="flex-1 space-y-5 overflow-y-auto px-4 py-5" ref={scrollRef}>
+        <div
+          className="flex-1 space-y-5 overflow-y-auto overscroll-contain px-4 py-5"
+          ref={scrollRef}
+          onScroll={() => {
+            const el = scrollRef.current;
+            if (el && el.scrollTop < 80 && activeConvId) void loadOlder(activeConvId);
+          }}
+        >
+          {!historyEnd && <div className="py-1 text-center text-xs text-ink3">上滑加载更早的消息…</div>}
           {items.map((item) =>
             item.kind === "switch" ? (
               <div key={item.key} className="flex items-center gap-3 text-xs text-ink3">
@@ -363,23 +632,64 @@ export function Chat({
                 <span className="h-px flex-1 bg-line" />
               </div>
             ) : item.kind === "user" ? (
-              <div key={item.key} className="flex justify-end">
-                <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-accent2 px-4 py-3 text-[15px] leading-relaxed text-white">
-                  {item.text}
+              <div key={item.key} className="flex justify-end gap-2.5">
+                <div className="flex max-w-[85%] flex-col items-end gap-1.5">
+                  {item.images.length > 0 && (
+                    <div className="flex flex-wrap justify-end gap-1.5">
+                      {item.images.map((image, index) => {
+                        const src = `data:${image.mediaType ?? "image/webp"};base64,${image.data ?? ""}`;
+                        return (
+                          <button
+                            key={index}
+                            type="button"
+                            title="点击看大图"
+                            className="cursor-zoom-in transition hover:opacity-90"
+                            onClick={() => openImage({ src, name: `发送的图片 ${index + 1}` })}
+                          >
+                            <img src={src} alt="发送的图片" className="max-h-52 rounded-xl border border-line object-cover" />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {item.files.length > 0 && (
+                    <div className="flex flex-wrap justify-end gap-1.5">
+                      {item.files.map((name, index) => (
+                        <span key={index} className="rounded-lg border border-line bg-surface2 px-2.5 py-1.5 text-xs text-ink2">
+                          📄 {name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {item.text !== "" && (
+                    <div className="whitespace-pre-wrap rounded-2xl rounded-tr-md bg-accent2 px-4 py-3 text-[15px] leading-relaxed text-white">
+                      {item.text}
+                    </div>
+                  )}
                 </div>
+                <FaceAvatar name={username} face={userFace} size={32} />
               </div>
             ) : item.kind === "assistant" ? (
-              <div key={item.key} className="flex max-w-[85%] flex-col gap-1.5">
-                {showReasoning && item.reasoning !== "" && (
-                  <details className="group">
-                    <summary className="cursor-pointer list-none text-xs text-ink3 transition hover:text-ink">思考过程 · 点击展开</summary>
-                    <div className="mt-1.5 rounded-lg border-l-2 border-accent bg-accent3/60 px-3 py-2 text-xs leading-relaxed text-ink2">
-                      {item.reasoning}
-                    </div>
-                  </details>
-                )}
-                <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
-                  <Markdown text={item.text} />
+              <div key={item.key} className="flex max-w-[85%] gap-2.5">
+                {(() => {
+                  const speaker = agents.find((a) => a.id === item.agentId);
+                  return speaker ? <FaceAvatar name={speaker.name} face={speaker.identity} size={32} /> : partnerAvatar("助");
+                })()}
+                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                  {showReasoning && item.reasoning !== "" && (
+                    <details className="group">
+                      <summary className="cursor-pointer list-none text-xs text-ink3 transition hover:text-ink">思考过程 · 点击展开</summary>
+                      <div className="mt-1.5 rounded-lg border-l-2 border-accent bg-accent3/60 px-3 py-2 text-xs leading-relaxed text-ink2">
+                        {item.reasoning}
+                      </div>
+                    </details>
+                  )}
+                  <div className="rounded-2xl rounded-tl-md bg-surface2 px-4 py-3 text-[15px] leading-relaxed text-ink">
+                    <Markdown text={item.text} />
+                  </div>
+                  {item.interrupted && (
+                    <span className="w-fit rounded-md bg-warm2 px-2 py-0.5 text-[11px] text-warm">已中止</span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -416,26 +726,73 @@ export function Chat({
 
         {/* 输入区 */}
         <footer className="border-t border-line px-4 py-3">
+          <AttachmentTray
+            items={attachments}
+            onChange={setAttachments}
+            allowImages={modelSupportsImages}
+            imageHint={`${imageBlockedHint}——图片发不出去，文字文件仍可上传`}
+            onError={setComposerError}
+          />
+          {composerError && (
+            <p className="mb-2 rounded-lg border border-warm/40 bg-warm2/50 px-3 py-2 text-xs leading-relaxed text-warm">{composerError}</p>
+          )}
+          {/* 等待队列（2026-09-27）：AI 输出期间发送的消息排队于此，回复完成后自动发出；可立即发送或删除 */}
+          {queue.map((item) => (
+            <div key={item.key} className="mb-1.5 flex items-center gap-2 rounded-xl border border-line bg-surface2 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm text-ink">{item.text !== "" ? item.text : `（${item.attachments.length} 个附件）`}</p>
+                <p className="text-xs text-ink3">
+                  AI 回复完成后自动发送{item.attachments.length > 0 ? ` · ${item.attachments.length} 个附件` : ""}
+                </p>
+              </div>
+              <button
+                className="shrink-0 rounded-lg bg-accent2 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => void sendQueuedNow(item)}
+              >
+                立即发送
+              </button>
+              <button
+                className="shrink-0 rounded-lg border border-line bg-surface p-1.5 text-ink3 transition hover:bg-surface2 hover:text-ink"
+                onClick={() => removeQueued(item.key)}
+                title="删除这段待发内容"
+              >
+                <CloseIcon className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
           <div className="flex items-end gap-2">
             <textarea
               rows={1}
-              placeholder="说点什么，或随手记一笔…"
+              placeholder="说点什么，或随手记一笔…（📎 可上传图片与文本文件）"
               className="max-h-32 flex-1 resize-none rounded-xl border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                // isComposing：中文输入法组词时的 Enter 是确认候选词，不是发送
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  void send();
+                  send();
                 }
               }}
             />
-            <button
-              className="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
-              onClick={() => void send()}
-            >
-              发送
-            </button>
+            {/* AI 输出中：输入区为空 → 停止键（中止当前回合）；有内容 → 发送（入等待队列） */}
+            {generating && input.trim() === "" && attachments.length === 0 ? (
+              <button
+                className="flex items-center gap-1.5 rounded-xl bg-warm2 px-4 py-2.5 text-sm font-semibold text-warm transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => void stopGenerating()}
+                title="停止 AI 输出（保留已生成的部分）"
+              >
+                <StopIcon className="h-4 w-4" />
+                停止
+              </button>
+            ) : (
+              <button
+                className="rounded-xl bg-accent2 px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+                onClick={() => send()}
+              >
+                发送
+              </button>
+            )}
           </div>
         </footer>
       </main>

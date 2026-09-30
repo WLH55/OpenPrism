@@ -118,6 +118,121 @@ describe("TaskStore", () => {
     expect(await store.runs("u1", task.id)).toHaveLength(0);
   });
 
+  it("内置三件套（2026-09-29）：种三件时刻/tz/渠道正确、幂等、删除不复活（种子一次性）、未知 uid 不种", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    let seq = 0;
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => `tid-b${++seq}` });
+
+    expect(await store.ensureBuiltins("u1")).toBe(3);
+    const list = await store.list("u1");
+    expect(list.map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+    expect(list.find((t) => t.builtin === "daily-brief")!.trigger).toEqual({ kind: "daily", time: "08:30" });
+    expect(list.find((t) => t.builtin === "daily-report")!.trigger).toEqual({ kind: "daily", time: "20:00" });
+    expect(list.find((t) => t.builtin === "weekly-review")!.trigger).toEqual({ kind: "weekly", days: [7], time: "21:00" });
+    expect(list.every((t) => t.tzOffsetMinutes === 480 && (t.notifyChannel ?? "inapp") === "inapp")).toBe(true);
+    expect(list.every((t) => t.enabled)).toBe(true);
+
+    // 幂等：已种用户重复调用不再建
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(3);
+
+    // 删除后不复活：种子一次性（标记已置），想找回走提醒页模板重建
+    await store.remove("u1", list[0]!.id);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(2);
+
+    // 未知 uid 安全返回（不抛、不种）
+    expect(await store.ensureBuiltins("nope")).toBe(0);
+
+    // 部分种子自愈（评审 2026-09-29）：中途失败留下的行不撞主键，重入补齐并置标记
+    db.prepare("DELETE FROM users WHERE uid = 'u1'").run();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    db.prepare(
+      "INSERT INTO tasks (id, uid, title, instruction, trigger_json, enabled, tz_offset_minutes, created_ts, last_run_ts, notify_channel, builtin) VALUES ('builtin-daily-brief-u1', 'u1', 'x', 'y', ?, 1, 480, 1, NULL, NULL, 'daily-brief')",
+    ).run(JSON.stringify({ kind: "daily", time: "08:30" }));
+    expect(await store.ensureBuiltins("u1")).toBe(1); // 三行都在：不补建，仅 daily-brief 的占位指令被同步（返回=实际变更数，2026-09-30 语义）
+    const completed = await store.list("u1");
+    expect(completed).toHaveLength(3);
+    expect(completed.map((t) => t.builtin).sort()).toEqual(["daily-brief", "daily-report", "weekly-review"]);
+  });
+
+  it("指令单源同步（评审 2026-09-30 种子楔子）：已种子用户的旧口径指令被 DEFS 就地更新；新指令零 goal 残留", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-sync" });
+    await store.ensureBuiltins("u1");
+    // 模拟旧版本种下的口径（目标层级时代的 what=goals/goalCard 话术）
+    db.prepare("UPDATE tasks SET instruction = '旧口径：查 what=goals 与 goalCard' WHERE uid = 'u1'").run();
+    expect(await store.ensureBuiltins("u1")).toBe(3); // 三行指令都被同步
+    const synced = await store.list("u1");
+    expect(synced.every((t) => t.instruction !== "旧口径：查 what=goals 与 goalCard")).toBe(true);
+    expect(synced.every((t) => !/what=goals|goalCard/.test(t.instruction))).toBe(true); // 新口径回归锚
+    expect(await store.ensureBuiltins("u1")).toBe(0); // 幂等
+    // 删除不复活不受同步影响：删一件再跑，缺失行跳过、其余不变
+    await store.remove("u1", synced[0]!.id);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect(await store.list("u1")).toHaveLength(2);
+  });
+
+  it("create 的 builtin 值受白名单校验", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-bv" });
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "09:00" }, builtin: "daily-nope" as never }),
+    ).rejects.toThrow();
+  });
+
+  it("任务编辑与 customized 标记（2026-09-30 任务编辑入口，AC5/AC6）：改文案不被启动同步覆盖，恢复默认一键还原", async () => {
+    const db = testDb();
+    db.prepare("INSERT INTO users (uid, username, salt, pwd_hash, created_ts) VALUES ('u1', 'alice', 's', 'h', 1)").run();
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-edit" });
+    await store.ensureBuiltins("u1");
+    const brief = (await store.list("u1")).find((t) => t.builtin === "daily-brief")!;
+
+    // 改指令（≠ DEFS 副本）→ customized 置位；ensureBuiltins 跳过该行（不再覆盖用户文案）
+    const edited = await store.update("u1", brief.id, { instruction: "我的自定义简报口径" });
+    expect(edited.customized).toBe(true);
+    expect(await store.ensureBuiltins("u1")).toBe(0);
+    expect((await store.get("u1", brief.id))!.instruction).toBe("我的自定义简报口径");
+    expect((await store.get("u1", brief.id))!.customized).toBe(true);
+
+    // 未自定义的内置行照常同步：把 daily-report 改成旧口径 → 只有它被同步（brief 跳过）
+    db.prepare("UPDATE tasks SET instruction = '旧口径' WHERE uid = 'u1' AND builtin = 'daily-report'").run();
+    expect(await store.ensureBuiltins("u1")).toBe(1);
+    expect((await store.get("u1", brief.id))!.instruction).toBe("我的自定义简报口径"); // 用户的版本优先
+
+    // resetInstruction：还原 DEFS 副本并清除标记（恢复同步）
+    const restored = await store.update("u1", brief.id, { resetInstruction: true });
+    expect(restored.customized).toBeUndefined();
+    expect(restored.instruction).not.toBe("我的自定义简报口径");
+    expect(await store.ensureBuiltins("u1")).toBe(0); // 已是副本原文，幂等
+
+    // 把文案改回 DEFS 副本原文 = 自动恢复同步（customized 清除）
+    await store.update("u1", brief.id, { instruction: "再自定义一下" });
+    expect((await store.get("u1", brief.id))!.customized).toBe(true);
+    await store.update("u1", brief.id, { instruction: restored.instruction });
+    expect((await store.get("u1", brief.id))!.customized).toBeUndefined();
+
+    // 非内置任务 resetInstruction 明确报错；非内置改指令不置 customized
+    const custom = await store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "09:00" } });
+    await expect(store.update("u1", custom.id, { resetInstruction: true })).rejects.toThrow("只适用于内置任务");
+    expect((await store.update("u1", custom.id, { instruction: "z" })).customized).toBeUndefined();
+
+    // patch 白名单：HTTP 透传的多余键（id/builtin/customized）不注入任务
+    const hacked = (await store.update("u1", custom.id, {
+      title: "新标题",
+      ...({ id: "hack", builtin: "daily-brief", customized: true } as Record<string, unknown>),
+    } as never)) as typeof custom & { customized?: boolean };
+    expect(hacked.title).toBe("新标题");
+    expect(hacked.id).toBe(custom.id);
+    expect(hacked.builtin).toBeUndefined();
+    expect(hacked.customized).toBeUndefined();
+
+    // 空 title/空 instruction 拒绝（编辑入口收口）
+    await expect(store.update("u1", custom.id, { title: "  " })).rejects.toThrow("title");
+    await expect(store.update("u1", custom.id, { instruction: "" })).rejects.toThrow("instruction");
+  });
+
   it("updateLastRun 推进锚点并持久（同库新实例可见）", async () => {
     const db = testDb();
     const store = new TaskStore({ db, now: () => 1, randomUUID: () => "tid-2" });
@@ -213,8 +328,9 @@ describe("触发描述与到点注入（提醒会话上下文）", () => {
     expect(describeTrigger({ kind: "interval", every: 2, unit: "hour", startTs: 0 })).toBe("每 2 小时");
     expect(describeTrigger({ kind: "interval", every: 1, unit: "day", time: "09:00", startTs: 0 })).toBe("每天 09:00");
     expect(describeTrigger({ kind: "cron", expr: "0 9 * * *" })).toBe("cron 表达式 0 9 * * *");
-    // once 按任务时区显示（UTC+8：UTC 00:00 = 当地 08:00）
+    // once 按任务时区显示（UTC+8：UTC 00:00 = 当地 08:00）；秒非零补 :ss，整分保持 HH:mm
     expect(describeTrigger({ kind: "once", at: T("2026-09-03T00:00:00Z") }, TZ)).toBe("单次 2026-09-03 08:00");
+    expect(describeTrigger({ kind: "once", at: T("2026-09-03T00:00:30Z") }, TZ)).toBe("单次 2026-09-03 08:00:30");
   });
 
   it("taskTriggerMessage：自动触发写全任务内容、重复规则、计划时刻与触发时刻", () => {
@@ -262,6 +378,15 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(by("query_tasks").isConcurrencySafe?.({})).toBe(true);
   });
 
+  it("create_task 按用户钟面落 tz（评审 2026-09-29 #17）：tzOffsetMinutes 注入不再落 UTC 缺省", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-tz" });
+    const tools = createTaskTools({ store, uid: "u-tz", now: () => NOW, tzOffsetMinutes: TZ });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    await by("create_task").execute({ title: "明早八点叫我", instruction: "x", trigger: { kind: "daily", time: "08:00" } }, ctx);
+    const task = (await store.list("u-tz"))[0]!;
+    expect(task.tzOffsetMinutes).toBe(TZ); // 08:00 按用户当地解释，不再是 UTC 的 16:00
+  });
+
   it("query_tasks：列出 id/触发/启用态，nextDueAt 按任务时区算；enabled 过滤", async () => {
     const { store, by } = makeTools("u-query");
     await store.create("u-query", { title: "睡觉", instruction: "x", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
@@ -273,6 +398,21 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(new Date(result.tasks[0]!.nextDueAt + TZ * 60000).toISOString()).toBe("2026-09-03T23:00:00.000Z");
     const off = (await by("query_tasks").execute({ enabled: false }, ctx)) as { tasks: unknown[] };
     expect(off.tasks).toHaveLength(0);
+  });
+
+  it("query_tasks 带内置标记（评审 O4）：builtin 字段与「（内置）」回执标注——模型可定位'把内置的简报挪到九点'", async () => {
+    let seq = 0;
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => `tid-bq-${++seq}` });
+    const tools = createTaskTools({ store, uid: "u-bq", now: () => NOW });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    await store.create("u-bq", { title: "每日简报", instruction: "x", trigger: { kind: "daily", time: "08:30" }, builtin: "daily-brief", tzOffsetMinutes: 480 });
+    await store.create("u-bq", { title: "喝水", instruction: "x", trigger: { kind: "daily", time: "10:00" } });
+    const result = (await by("query_tasks").execute({}, ctx)) as { tasks: { title: string; builtin?: string }[] };
+    expect(result.tasks.find((t) => t.title === "每日简报")!.builtin).toBe("daily-brief");
+    expect(result.tasks.find((t) => t.title === "喝水")!.builtin).toBeUndefined();
+    const blocks = by("query_tasks").output.render!({}, result) as { text: string }[];
+    expect(blocks[0]!.text).toContain("每日简报（内置）");
+    expect(blocks[0]!.text).not.toContain("喝水（内置）");
   });
 
   it("update_task：停用/改触发；坏 trigger 拒绝；空 patch 拒绝", async () => {
@@ -293,5 +433,36 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(value.deleted).toBe("23:30 那个");
     expect(await store.list("u-delete")).toHaveLength(0);
     await expect(by("delete_task").execute({ taskId: task.id }, ctx)).rejects.toThrow();
+  });
+});
+
+describe("TaskStore（任务级通知渠道，2026-09-27）", () => {
+  it("notifyChannel：wechat 入库往返；缺省 NULL；非法值 create/update 都拒绝", async () => {
+    const db = testDb();
+    let seq = 0;
+    const store = new TaskStore({ db, now: () => 1, randomUUID: () => `tid-nc-${++seq}` });
+    const task = await store.create("u1", {
+      title: "喝水提醒",
+      instruction: "提醒喝水",
+      trigger: { kind: "daily", time: "10:00" },
+      notifyChannel: "wechat",
+    });
+    expect(task.notifyChannel).toBe("wechat");
+    expect((await store.list("u1"))[0]!.notifyChannel).toBe("wechat");
+
+    const plain = await store.create("u1", { title: "默认站内", instruction: "x", trigger: { kind: "daily", time: "11:00" } });
+    expect(plain.notifyChannel).toBeUndefined();
+    const raw = db.prepare("SELECT notify_channel FROM tasks WHERE id = ?").get(plain.id) as unknown as { notify_channel: string | null };
+    expect(raw.notify_channel).toBeNull();
+
+    await expect(
+      store.create("u1", { title: "x", instruction: "y", trigger: { kind: "daily", time: "12:00" }, notifyChannel: "sms" as never }),
+    ).rejects.toThrow("notifyChannel");
+    await expect(store.update("u1", task.id, { notifyChannel: "email" as never })).rejects.toThrow("notifyChannel");
+
+    const updated = await store.update("u1", task.id, { notifyChannel: "inapp" });
+    expect(updated.notifyChannel).toBe("inapp");
+    const cleared = await store.update("u1", task.id, {}); // 空 patch 原样保留
+    expect(cleared.notifyChannel).toBe("inapp");
   });
 });

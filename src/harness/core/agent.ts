@@ -14,7 +14,7 @@ import type { InputChannel, TurnEndReason } from "../session/events";
 import { InMemorySessionLog, type SessionLog } from "../session/log";
 import { projectSurface } from "../session/project";
 import { countTurns, currentGeneration, lastRequestHeader, retryBudgetUsed } from "../session/queries";
-import type { AssistantMessage, ContentBlock, ToolCallBlock, UserMessage } from "../types";
+import type { AssistantMessage, ContentBlock, ToolCallBlock, UserContent, UserMessage } from "../types";
 import { fnv1a } from "../util";
 import { runToolCalls } from "../tools/pipeline";
 import { ToolRegistry, type ToolDefinition } from "../tools/registry";
@@ -48,7 +48,8 @@ export interface AgentConfig {
 export interface Agent {
   readonly status: "idle" | "running";
   readonly sessionLog: SessionLog;
-  followup(text: string): void;
+  /** 唤醒并开新 Turn；text 走纯文本，块序列走多模态输入（图片/附件） */
+  followup(input: UserContent): void;
   steer(text: string): void;
   inject(text: string): void;
   /** 中止当前 Turn；默认清 Inbox */
@@ -60,11 +61,15 @@ export interface Agent {
 }
 
 interface InboxItem {
-  text: string;
+  content: ContentBlock[];
 }
 
-function userMessage(text: string): UserMessage {
-  return { role: "user", content: [{ type: "text", text }] };
+function userContent(input: UserContent): ContentBlock[] {
+  return typeof input === "string" ? [{ type: "text", text: input }] : input;
+}
+
+function userMessage(content: ContentBlock[]): UserMessage {
+  return { role: "user", content };
 }
 
 function errorMessage(text: string): string {
@@ -177,7 +182,7 @@ export function createAgent(config: AgentConfig): Agent {
     const turnNo = countTurns(log.readAll()) + 1;
     await log.append({ type: "turn/start", turn: turnNo });
     const openerChannel: InputChannel = fromSteer ? "steer" : "followup";
-    await log.append({ type: "user/message", channel: openerChannel, message: userMessage(opener.text) });
+    await log.append({ type: "user/message", channel: openerChannel, message: userMessage(opener.content) });
 
     let reason: TurnEndReason | null = null;
     let stickyMaxTokens = false;
@@ -191,11 +196,11 @@ export function createAgent(config: AgentConfig): Agent {
       }
       // inject：不唤醒，等下次请求捎带
       for (const item of inbox.inject.splice(0)) {
-        await log.append({ type: "user/message", channel: "inject", message: userMessage(item.text) });
+        await log.append({ type: "user/message", channel: "inject", message: userMessage(item.content) });
       }
       // steer：插入当前 Turn 下一步之前
       for (const item of inbox.steer.splice(0)) {
-        await log.append({ type: "user/message", channel: "steer", message: userMessage(item.text) });
+        await log.append({ type: "user/message", channel: "steer", message: userMessage(item.content) });
       }
 
       let request = applyOnRequest(buildRequest());
@@ -405,18 +410,18 @@ export function createAgent(config: AgentConfig): Agent {
       return status;
     },
     sessionLog: log,
-    followup(text: string): void {
-      inbox.followup.push({ text });
+    followup(input: UserContent): void {
+      inbox.followup.push({ content: userContent(input) });
       wake();
     },
     steer(text: string): void {
       // steer 也唤醒；空闲时没有"下一步"可插，作为下一 Turn 的开场输入
-      inbox.steer.push({ text });
+      inbox.steer.push({ content: userContent(text) });
       wake();
     },
     inject(text: string): void {
       // 不唤醒：等下次请求捎带
-      inbox.inject.push({ text });
+      inbox.inject.push({ content: userContent(text) });
     },
     cancel(options?: { clearInbox?: boolean }): void {
       const clearInbox = options?.clearInbox ?? true; // 默认清 Inbox
