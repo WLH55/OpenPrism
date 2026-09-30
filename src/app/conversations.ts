@@ -154,11 +154,12 @@ export class ConversationStore {
   }
 
   /**
-   * 定时提醒固定会话（2026-09-07）：每个伙伴一个，cid = feed:<agentId|default>。
+   * 定时提醒固定会话（2026-09-07）：每个伙伴一个，cid = feed:<uid>:<agentId|default>（2026-09-30 补 uid——
+   * cid 是全表主键，旧格式跨用户冲突，第二个用户首次触发任务时 INSERT 被主键静默忽略后回查 undefined 崩溃）。
    * 不存在即创建（置顶 + 绑定该伙伴），存在即复用；绑定该伙伴的所有定时任务提醒都进这一个会话。
    */
   async ensureTaskFeed(uid: string, agentId: string | undefined): Promise<ConversationEntry> {
-    const cid = `${TASK_FEED_CID_PREFIX}${agentId ?? "default"}`;
+    const cid = `${TASK_FEED_CID_PREFIX}${uid}:${agentId ?? "default"}`;
     const found = this.db
       .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
