@@ -213,10 +213,7 @@ export const api = {
       body: JSON.stringify({ planId, done, ...(date !== undefined ? { date } : {}) }),
     }),
 
-  // ── 目标层级（B3，2026-09-28）：方向/阶段/项目树 + UI 写入（修订=追加快照） ──
-  /** UI 建计划/里程碑（挂目标树）；对话建计划走 agent 工具，同一账本 */
-  createPlan: (input: { title: string; scope: string; due?: string; ndays?: number }) =>
-    request<{ planId: string }>("/api/plans", { method: "POST", body: JSON.stringify(input) }),
+  // ── 计划（2026-09-30 目标层级下线）：UI 建计划入口随 Plans 页移除，创建走对话（agent 工具，同一账本） ──
   /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定 */
   updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number }) =>
     request<{ ok: boolean; planId: string; title: string }>(`/api/plans/${encodeURIComponent(planId)}`, {

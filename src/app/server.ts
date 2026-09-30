@@ -1080,8 +1080,6 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   // 历史 goal 行在账本休眠保留；计划管理入口 = 「今天」页四范围 tab。
 
   // ── 定时任务（D6） ─────────────────────────────────────
-
-  // ── 定时任务（D6） ─────────────────────────────────────
   if (path === "/api/tasks" && (method === "GET" || method === "POST")) {
     if (method === "GET") return sendJson(res, 200, await deps.tasks.list(uid));
     const body = (await readBody(req)) as Record<string, unknown>;

@@ -60,13 +60,6 @@ export const TaskIcon = (p: P) => (
   </svg>
 );
 /** 计划页（B3 目标层级）：靶心——方向 → 阶段 → 项目的对齐 */
-export const PlansIcon = (p: P) => (
-  <svg {...base(p.className)}>
-    <circle cx="12" cy="12" r="9" />
-    <circle cx="12" cy="12" r="5" />
-    <circle cx="12" cy="12" r="1" />
-  </svg>
-);
 export const SkillsIcon = (p: P) => (
   <svg {...base(p.className)}>
     <path d="M14.5 6.5a3 3 0 0 0-2-2M14.5 17.5a3 3 0 0 0 2-2M6.5 14.5a3 3 0 0 0 2 2M6.5 6.5a3 3 0 0 0 2-2M10.5 4.5v3M10.5 16.5v3M4.5 10.5h3M16.5 10.5h3" />

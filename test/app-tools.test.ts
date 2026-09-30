@@ -172,10 +172,12 @@ describe("update_plan（2026-09-29 账本工具能力补全）", () => {
     const legacy = await ledger.append({ kind: "plan", source: "ui", planId: "plan-legacy01", title: "挂过树的旧打卡点", scope: "deadline", due: "2026-10-01", goalId: "goal-dead" }, 1000);
     await by("checkin_plan").execute({ planId: "plan-legacy01" }, ctx);
     await by("update_plan").execute({ planId: "plan-legacy01", title: "改名后的旧打卡点" }, ctx);
-    const after = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; title: string; goalId?: string }[] };
-    const row = after.plans.find((p) => p.planId === "plan-legacy01")!;
-    expect(row.title).toBe("改名后的旧打卡点");
-    expect(row.goalId).toBeUndefined(); // 修订即降级为独立计划（goalId 剥离）
+    const after = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; title: string }[] };
+    expect(after.plans.find((p) => p.planId === "plan-legacy01")!.title).toBe("改名后的旧打卡点");
+    // 断言落到账本行（评审 2026-09-30 testing）：plans 投影无条件不含 goalId，测不到真剥离；
+    // PUT /api/plans 与工具共用 mergePlanUpdate，这条同时守住两路
+    const activeRow = ledger.activeRecords().find((r) => r.kind === "plan" && (r as PlanRecord).planId === "plan-legacy01") as object;
+    expect("goalId" in activeRow).toBe(false);
     const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { plans: { planId: string; state: string }[] };
     expect(today.plans.find((p) => p.planId === "plan-legacy01")!.state).toBe("done"); // 打卡史保留
     expect(ledger.readAll().some((r) => r.seq === legacy.seq && r.kind === "plan")).toBe(true); // 旧行留痕未删
@@ -287,7 +289,16 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
     const flows = await by("query_ledger").execute({ what: "flows" }, ctx);
     expect(render(flows)).toContain("1 笔流水");
     expect(render(flows)).toContain("餐饮×1");
-    for (const value of [today, plans, flows]) expect(render(value)).not.toContain('{"');
+    // 完成面数据（评审 2026-09-30 W1/O3）：模型只看得见回执——今日完成/完成存档给内置汇报，打卡 seq 给撤历史卡
+    const week = (await by("create_plan").execute({ title: "周报", scope: "week" }, ctx)) as { planId: string };
+    await by("checkin_plan").execute({ planId: week.planId, date: "2026-09-01", time: "09:30" }, ctx); // 周二补卡 → doing + checkins 凭据
+    await by("checkin_plan").execute({ planId: created.planId }, ctx); // 读书 今日打卡 → doneToday
+    const today2 = await by("query_ledger").execute({ what: "today" }, ctx);
+    const text2 = render(today2);
+    expect(text2).toContain("今日完成：读书");
+    expect(text2).toContain("近 30 天完成 1 条：读书(");
+    expect(text2).toContain(`周报(${week.planId}, doing, 打卡`); // 未完成行带打卡 seq（撤历史卡凭据）
+    for (const value of [today, plans, flows, today2]) expect(render(value)).not.toContain('{"');
   });
 });
 
@@ -299,6 +310,8 @@ describe("defaultAssistantPrompt", () => {
     expect(prompt).toContain("record_flow");
     expect(prompt).toContain("query_ledger");
     expect(prompt).not.toContain("健身"); // 不举例任何默认分类
+    expect(prompt).not.toContain("create_goal"); // goal 三件已下线，提示词不得再提（评审 2026-09-30 回归锚）
+    expect(prompt).not.toContain("what=goals");
   });
 });
 

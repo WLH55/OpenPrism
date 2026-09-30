@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { View } from "../App";
 import { ChatIcon, CloseIcon, MenuIcon, ProgressIcon, TodayIcon } from "../icons";
 
-// 窄屏导航（2026-09-23 手机浏览器适配；2026-09-28 B3 重排）：底部五项标签栏（对话 / 今天 / 计划 / 成长 / 更多）
+// 窄屏导航（2026-09-23 手机浏览器适配；2026-09-30 目标层级下线后为四项）：底部标签栏（对话 / 今天 / 成长 / 更多）
 // + 左滑抽屉容器。「更多」打开抽屉（最近对话、盘面、伙伴、提醒与设置都在里面）；桌面端（md+）整块不渲染。
 
 type IconType = (p: { className?: string }) => JSX.Element;
