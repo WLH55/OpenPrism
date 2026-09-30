@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api2, api3, apiIm, type AgentLoose, type NotificationLoose, type TaskLoose, type TaskRunLoose, type TaskTriggerLoose } from "../api";
 import { Toggle } from "../ui";
 
@@ -536,6 +536,9 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const [agents, setAgents] = useState<AgentLoose[]>([]);
   const [history, setHistory] = useState<Record<string, TaskRunLoose[] | undefined>>({});
   const [message, setMessage] = useState<string | null>(null);
+  // 「立即跑」结果轮询句柄（2026-09-30）：换页/卸载时停表，避免对已卸载组件 setState
+  const pollRef = useRef<number | null>(null);
+  useEffect(() => () => { if (pollRef.current !== null) window.clearInterval(pollRef.current); }, []);
   const [createOpen, setCreateOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationLoose[]>([]);
   // 内置三件套模板（评审 2026-09-29 #13 单源）：服务端 BUILTIN_TASK_DEFS 投影，模板按钮唯一文案来源
@@ -643,6 +646,14 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
                 已自定义
               </span>
             )}
+            {task.lastRun?.status === "failed" && (
+              <span
+                className="shrink-0 cursor-help rounded bg-warm/10 px-1.5 py-0.5 text-[10px] font-medium text-warm"
+                title={task.lastRun.detail ?? "最近一次运行失败（悬停看原因；点「历史」看全部记录）"}
+              >
+                上次失败
+              </span>
+            )}
           </div>
           <div
             className={`${expandedId === task.id ? "whitespace-pre-wrap break-words" : "truncate"} cursor-pointer text-xs text-ink3`}
@@ -677,8 +688,30 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
           <button
             className="text-xs text-ink3 transition hover:text-ink"
             onClick={async () => {
+              // 手动触发的成败就地可见（2026-09-30）：run 是 202 异步回合，这里先记基数再轮询运行记录，
+              // 落行即报结果——失败不用再点「历史」翻
+              const before = (await api3.taskRuns(task.id).catch(() => [])).length;
               await api3.runTask(task.id);
-              setMessage("已触发（离线回合异步执行，稍后看历史与通知）");
+              setMessage("已触发，执行中…（跑完在这里报结果，回复落「定时提醒」会话）");
+              if (pollRef.current !== null) window.clearInterval(pollRef.current);
+              const startedAt = Date.now();
+              pollRef.current = window.setInterval(async () => {
+                const runs = await api3.taskRuns(task.id).catch(() => null);
+                if (runs === null) return; // 网络抖动：等下一轮
+                if (runs.length > before) {
+                  if (pollRef.current !== null) window.clearInterval(pollRef.current);
+                  pollRef.current = null;
+                  const last = runs[runs.length - 1]!;
+                  if (last.status === "failed") setMessage(`❌ 运行失败：${last.detail ?? "未知错误"}`);
+                  else if (last.status === "skipped") setMessage(`⏭️ 本次跳过：${last.detail ?? "错过触发窗口"}`);
+                  else setMessage("✅ 已完成——回复在「定时提醒」会话和通知里");
+                  void reload(); // 刷新任务行的「上次失败」徽标
+                } else if (Date.now() - startedAt > 90_000) {
+                  if (pollRef.current !== null) window.clearInterval(pollRef.current);
+                  pollRef.current = null;
+                  setMessage("还在跑（已超 90 秒）——稍后点「历史」看结果");
+                }
+              }, 2000);
             }}
           >
             立即跑

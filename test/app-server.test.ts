@@ -30,6 +30,7 @@ let root: string;
 let baseUrl: string;
 let staticUrl: string;
 let cookie: string;
+let tasks: import("../src/app/tasks").TaskStore; // 列表失败反馈断言（2026-09-30）直接种运行记录
 /** 会话装配读到的模型能力开关：本文件的图片消息用例按需翻转（模拟「模型接入」里的多模态勾选） */
 let multimodalModel = false;
 // ── 微信桥（2026-09-27）：fake iLink 注入（零网络），路由测试按需改写脚本 ──
@@ -80,7 +81,8 @@ beforeAll(async () => {
   const skills = new SkillStore({ db, now: () => 1, randomUUID: () => `sk-${Math.random().toString(36).slice(2, 8)}` });
   const mcps = new McpRegistry({ env: nodeEnv, db, now: () => 1, randomUUID: () => "mc-x" });
   const memory = new MemoryStore({ db, now: () => 5000, randomUUID: () => `mid-${Math.random().toString(36).slice(2, 8)}` });
-  const tasks = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+  const tasksStore = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+  tasks = tasksStore;
   const notifications = new NotificationStore({ db, now: () => 5000 });
   const memoryExtractor = new MemoryExtractor({
     db,
@@ -649,6 +651,14 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     // 手动触发要标明来路：注入上下文按 "manual" 写"用户点了立即跑"，不冒充到点触发
     const notices = (await (await fetch(`${baseUrl}/api/notifications`, { headers: { cookie } })).json()) as { text: string }[];
     expect(notices.some((n) => n.text.startsWith("（manual）"))).toBe(true);
+    // 列表附最近一次运行（2026-09-30 失败反馈）：failed + detail 直接随 GET /api/tasks 下发，任务行就地可见
+    await tasks.recordRun(users.get("lathan")!.uid, created.id, { ts: 2_000, status: "failed", detail: "余额不足" });
+    const withLast = (await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as {
+      id: string;
+      lastRun?: { ts: number; status: string; detail?: string } | null;
+    }[];
+    expect(withLast.find((t) => t.id === created.id)?.lastRun).toMatchObject({ status: "failed", detail: "余额不足" });
+    expect(withLast.find((t) => t.id.startsWith("builtin-daily-brief"))?.lastRun).toBe(null); // 未跑过的任务显式 null
     expect((await fetch(`${baseUrl}/api/tasks/${created.id}`, { method: "DELETE", headers: { cookie } })).status).toBe(200);
     const afterDelete = (await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as unknown[];
     expect(afterDelete).toHaveLength(3); // 只剩内置三件套（自建已删）

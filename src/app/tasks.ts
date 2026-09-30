@@ -565,6 +565,17 @@ export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
     return rows.map((row) => ({ ts: row.ts, status: row.status, ...(row.detail !== null ? { detail: row.detail } : {}) }));
   }
 
+  /** 每任务最近一次运行（2026-09-30 任务列表失败反馈用）；从未跑过的任务不进 Map */
+  async lastRuns(uid: string): Promise<Map<string, TaskRun>> {
+    const rows = this.deps.db
+      .prepare(
+        `SELECT r.task_id, r.ts, r.status, r.detail FROM task_runs r
+         JOIN (SELECT task_id, MAX(id) AS mid FROM task_runs WHERE uid = ? GROUP BY task_id) m ON m.mid = r.id`,
+      )
+      .all(uid) as unknown as { task_id: string; ts: number; status: TaskRun["status"]; detail: string | null }[];
+    return new Map(rows.map((row) => [row.task_id, { ts: row.ts, status: row.status, ...(row.detail !== null ? { detail: row.detail } : {}) }]));
+  }
+
   async recordRun(uid: string, id: string, run: TaskRun): Promise<void> {
     this.deps.db
       .prepare("INSERT INTO task_runs (uid, task_id, ts, status, detail) VALUES (?, ?, ?, ?, ?)")

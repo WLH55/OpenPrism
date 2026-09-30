@@ -381,6 +381,8 @@ export interface TaskLoose {
   /** 内置任务指令已被用户改过（2026-09-30 任务编辑）：启动同步跳过；「恢复默认文案」可清除 */
   customized?: boolean;
   lastRunTs?: number;
+  /** 最近一次运行结果（2026-09-30 失败反馈）：failed 时任务行带「上次失败」徽标，detail 为错误原因 */
+  lastRun?: { ts: number; status: string; detail?: string } | null;
 }
 // ── 记忆三层（对齐 DeepTutor：L1 工作区镜像 / L2 模块事实 / L3 跨模块知识） ──
 export interface MemoryOverviewLoose {
