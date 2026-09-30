@@ -525,6 +525,38 @@ export function Settings() {
         </div>
       </div>
 
+      {/* 数据导出（2026-09-30 SDD 数据导出）：透明，而且带得走 */}
+      <div className="mt-6 rounded-xl border border-line bg-surface p-4">
+        <div className="text-sm font-semibold text-ink">数据导出</div>
+        <p className="mt-1 text-xs leading-relaxed text-ink3">
+          你的流水、计划（含打卡）与全部对话随时可以导出带走：JSON 是全量备份（含历史与作废记录，机器可读），
+          Markdown 是按日期整理的时间线（可直接当日记翻，对话含你与助手的往来发言）。不绑架、不锁定。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <a
+            className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90"
+            href={api2.exportDataUrl("json")}
+            download
+          >
+            导出 JSON 全量备份
+          </a>
+          <a
+            className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-ink2 transition hover:border-accent hover:text-ink"
+            href={api2.exportDataUrl("md")}
+            download
+          >
+            导出 Markdown 时间线
+          </a>
+          <a
+            className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-ink2 transition hover:border-accent hover:text-ink"
+            href={api2.exportMemoryUrl()}
+            download
+          >
+            导出长期记忆
+          </a>
+        </div>
+      </div>
+
       <p className="mt-6 text-xs leading-relaxed text-ink3">
         OpenAI 兼容协议（DeepSeek / GLM / Qwen / Moonshot / OpenRouter…）。可接入多个平台；每个会话用哪个模型，在对话页右上角的模型选择器里选。保存后下一回合即生效，无需重启。
       </p>

@@ -28,6 +28,7 @@ import type { Ledger } from "./ledger";
 import { categoryView, listCategories, progressView, todayView } from "./fold";
 import { mergePlanUpdate, parseAt } from "./plans";
 import type { PlanRecord } from "./ledger";
+import { buildExportJson, buildExportMarkdown, type ExportConversation } from "./export";
 import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
 import { parseAttachments } from "./attachments";
 import { faceOf, readUserTz, updateUserFace, updateUserTz, validateTzOffsetMinutes, type UserRecord } from "./auth";
@@ -926,6 +927,36 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const body = JSON.stringify({ exportedAt: new Date().toISOString(), items }, null, 2);
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": 'attachment; filename="openprism-memory.json"' });
     res.end(body);
+    return;
+  }
+
+  // ── 数据导出（2026-09-30 SDD 数据导出）：随时带走——
+  // JSON = readAll 全量（含作废/休眠 goal 行，机器可读）；MD = active 口径时间线 + 对话文本轮次（人读） ──
+  const exportMatch = /^\/api\/export\/data\.(json|md)$/.exec(path);
+  if (exportMatch && method === "GET") {
+    const format = exportMatch[1]!;
+    const ledger = await deps.ledgerFor(uid);
+    const conversations: ExportConversation[] = (await deps.conversations.list(uid)).map((entry) => ({
+      cid: entry.id,
+      title: entry.title,
+      createdTs: entry.createdTs,
+      events: deps.conversations.readEvents(entry.id), // 不带 options = 全量升序
+    }));
+    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations };
+    const dateTag = new Date(input.exportedAt).toISOString().slice(0, 10).replace(/-/g, "");
+    if (format === "json") {
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="openprism-export-${dateTag}.json"`,
+      });
+      res.end(buildExportJson(input));
+    } else {
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition": `attachment; filename="openprism-export-${dateTag}.md"`,
+      });
+      res.end(buildExportMarkdown({ ...input, tzOffsetMinutes: readUserTz(deps.db, uid) ?? 0 }));
+    }
     return;
   }
 

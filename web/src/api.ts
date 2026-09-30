@@ -331,6 +331,8 @@ export const api2 = {
   consolidateMemory: () =>
     request<{ reviewed: number; expired: number; demoted: number; merged: number; skipped?: string }>("/api/memory/consolidate", { method: "POST" }),
   exportMemoryUrl: () => "/api/memory/export",
+  /** 数据导出（2026-09-30）：json = 全量备份（含历史与作废）；md = 按日时间线（人读） */
+  exportDataUrl: (format: "json" | "md") => `/api/export/data.${format}`,
 
   // ── 主题计数与向量召回（2026-09-18） ──────────────────
   listMemoryTopics: () =>
