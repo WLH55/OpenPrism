@@ -28,6 +28,9 @@ export interface TaskDef {
   notifyChannel?: "inapp" | "wechat";
   /** 内置任务标记（2026-09-29）：每用户种子一次性（users.builtins_seeded），删了不复活；UI 带「内置」徽标 */
   builtin?: BuiltinTaskKind;
+  /** 内置任务指令已被用户改过（2026-09-30 任务编辑）：ensureBuiltins 单源同步跳过；
+   *  resetInstruction 或把文案改回 DEFS 副本原文即自动清除（恢复同步）。非内置任务恒无此标记 */
+  customized?: boolean;
   tzOffsetMinutes: number;
   createdTs: number;
   lastRunTs?: number;
@@ -334,6 +337,7 @@ interface TaskRow {
   last_run_ts: number | null;
   notify_channel: string | null;
   builtin: string | null;
+  customized: number;
 }
 
 function rowToTask(row: TaskRow): TaskDef {
@@ -347,6 +351,7 @@ function rowToTask(row: TaskRow): TaskDef {
     enabled: row.enabled === 1,
     ...(row.notify_channel !== null ? { notifyChannel: row.notify_channel as "inapp" | "wechat" } : {}),
     ...(row.builtin !== null ? { builtin: row.builtin as BuiltinTaskKind } : {}),
+    ...(row.customized === 1 ? { customized: true } : {}),
     tzOffsetMinutes: row.tz_offset_minutes,
     createdTs: row.created_ts,
     ...(row.last_run_ts !== null ? { lastRunTs: row.last_run_ts } : {}),
@@ -484,7 +489,9 @@ export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
         continue;
       }
       // 指令单源同步（评审 2026-09-30 种子楔子）：指令文案活在 DB 行里，DEFS 改版只影响新用户——
-      // 已种子用户会带着旧口径（如 what=goals）触发，模型撞已下线视角；就地更新维持 DEFS 为唯一文案来源
+      // 已种子用户会带着旧口径（如 what=goals）触发，模型撞已下线视角；就地更新维持 DEFS 为唯一文案来源。
+      // 例外（2026-09-30 任务编辑）：用户改过文案（customized）的行跳过——用户的版本优先于 DEFS
+      if (existing.customized === true) continue;
       if (existing.instruction !== def.instruction) {
         await this.update(uid, id, { instruction: def.instruction });
         changed += 1;
@@ -494,17 +501,52 @@ export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
     return changed;
   }
 
-  async update(uid: string, id: string, patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">>): Promise<TaskDef> {
+  /** 编辑任务（2026-09-30 任务编辑入口）：白名单收口——HTTP 边界透传 body，未知键（id/builtin/customized…）不注入；
+   *  内置任务 instruction 与 DEFS 副本不同 = 用户自定义（启动同步跳过），改回副本原文自动恢复同步；
+   *  resetInstruction 一键还原 DEFS 副本（仅内置任务） */
+  async update(
+    uid: string,
+    id: string,
+    patch: Partial<Pick<TaskDef, "enabled" | "instruction" | "title" | "trigger" | "notifyChannel">> & { resetInstruction?: boolean },
+  ): Promise<TaskDef> {
     const task = await this.get(uid, id);
     if (!task) throw new Error(`task "${id}" 不存在`);
-    if (patch.trigger) validateTrigger(patch.trigger);
-    if (patch.notifyChannel !== undefined && patch.notifyChannel !== "inapp" && patch.notifyChannel !== "wechat") {
+    const { enabled, instruction, title, trigger, notifyChannel, resetInstruction } = patch;
+    if (trigger !== undefined) validateTrigger(trigger);
+    if (notifyChannel !== undefined && notifyChannel !== "inapp" && notifyChannel !== "wechat") {
       throw new Error("notifyChannel 只支持 inapp | wechat");
     }
-    const next: TaskDef = { ...task, ...patch };
+    if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("enabled 需为布尔值");
+    if (title !== undefined && (typeof title !== "string" || title.trim() === "")) throw new Error("title 必填且不能为空白");
+    const builtinDef = task.builtin !== undefined ? BUILTIN_TASK_DEFS.find((d) => d.builtin === task.builtin) : undefined;
+
+    let instructionNext = task.instruction;
+    let customizedNext = task.customized === true;
+    if (resetInstruction === true) {
+      if (builtinDef === undefined) throw new Error("resetInstruction 只适用于内置任务");
+      instructionNext = builtinDef.instruction;
+      customizedNext = false;
+    } else if (typeof instruction === "string") {
+      const trimmed = instruction.trim();
+      if (trimmed === "") throw new Error("instruction 必填且不能为空白");
+      instructionNext = trimmed;
+      // 与 DEFS 副本比较决定同步去留：同步路径自身传的就是副本原文，天然不置位
+      if (builtinDef !== undefined) customizedNext = trimmed !== builtinDef.instruction;
+    }
+
+    const { customized: _prev, ...rest } = task;
+    const next: TaskDef = {
+      ...rest,
+      instruction: instructionNext,
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(title !== undefined ? { title: title.trim() } : {}),
+      ...(trigger !== undefined ? { trigger } : {}),
+      ...(notifyChannel !== undefined ? { notifyChannel } : {}),
+      ...(customizedNext ? { customized: true } : {}),
+    };
     this.deps.db
-      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ?, notify_channel = ? WHERE id = ? AND uid = ?")
-      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, next.notifyChannel ?? null, id, uid);
+      .prepare("UPDATE tasks SET title = ?, instruction = ?, trigger_json = ?, enabled = ?, notify_channel = ?, customized = ? WHERE id = ? AND uid = ?")
+      .run(next.title, next.instruction, JSON.stringify(next.trigger), next.enabled ? 1 : 0, next.notifyChannel ?? null, next.customized === true ? 1 : 0, id, uid);
     return next;
   }
 

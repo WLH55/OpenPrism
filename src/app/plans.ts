@@ -28,10 +28,11 @@ export function parseAt(date: string | undefined, time: string | undefined, now:
 }
 
 /** 计划修订的校验+合并（纯函数，返回 append payload 的业务字段；seq/ts/source/actor 由调用方按写入方落账）。
- * 部分更新语义：title 空白串=未提供；周期切换不残留 due/ndays；goalId 修订时一律剥离（目标层级已下线）。 */
+ * 部分更新语义：title 空白串=未提供；周期切换不残留 due/ndays；goalId 修订时一律剥离（目标层级已下线）。
+ * timesPerPeriod（2026-09-30 习惯化）：undefined=保留；提供须 ≥1 整数且 scope ∈ day/week/month/year（习惯续期）。 */
 export function mergePlanUpdate(
   cur: PlanRecord,
-  changes: { title?: string; scope?: string; due?: string; ndays?: number },
+  changes: { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number },
 ): Omit<PlanRecord, "seq" | "ts" | "source" | "actor"> {
   const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
   const nextScope = changes.scope !== undefined ? scopes.find((s) => s === changes.scope) : undefined;
@@ -49,14 +50,24 @@ export function mergePlanUpdate(
     throw new Error("due 需为合法日期 YYYY-MM-DD（如 2026-10-04）");
   }
   if (mergedScope === "ndays" && (typeof nextNdays !== "number" || nextNdays < 1)) throw new Error("scope=ndays 需要 ndays ≥ 1");
+  // 习惯配额：只有可续期周期支持；deadline/ndays 是一次性设计，带配额没意义
+  if (changes.timesPerPeriod !== undefined && !(mergedScope === "day" || mergedScope === "week" || mergedScope === "month" || mergedScope === "year")) {
+    throw new Error("timesPerPeriod 只支持 day | week | month | year（deadline/ndays 是一次性计划，没有每期配额）");
+  }
+  const nextTimes =
+    mergedScope === "day" || mergedScope === "week" || mergedScope === "month" || mergedScope === "year"
+      ? (changes.timesPerPeriod !== undefined ? changes.timesPerPeriod : cur.timesPerPeriod) // 未提供=保留（只改标题不掉习惯）
+      : undefined; // 切到 deadline/ndays = 放弃习惯语义，配额随周期专属字段一并剥离
+  if (nextTimes !== undefined && (!Number.isInteger(nextTimes) || nextTimes < 1)) throw new Error("timesPerPeriod 需为 ≥1 的整数");
 
   // 先剥离旧凭据与周期专属字段，再按 mergedScope 按需重建（goalId 剥离后不再重建——新版本即独立计划）
-  const { seq: _seq, ts: _ts, source: _source, actor: _actor, due: _oldDue, ndays: _oldNdays, goalId: _oldGoalId, ...snapshot } = cur;
+  const { seq: _seq, ts: _ts, source: _source, actor: _actor, due: _oldDue, ndays: _oldNdays, timesPerPeriod: _oldTimes, goalId: _oldGoalId, ...snapshot } = cur;
   return {
     ...snapshot,
     ...(newTitle !== undefined && newTitle !== "" ? { title: newTitle } : {}),
     scope: mergedScope,
     ...(nextDue !== undefined ? { due: nextDue } : {}),
     ...(nextNdays !== undefined ? { ndays: nextNdays } : {}),
+    ...(nextTimes !== undefined ? { timesPerPeriod: nextTimes } : {}),
   };
 }

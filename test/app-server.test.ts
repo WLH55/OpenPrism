@@ -654,6 +654,83 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     expect(afterDelete).toHaveLength(3); // 只剩内置三件套（自建已删）
   });
 
+  it("任务编辑入口（2026-09-30，AC5/AC6）：PUT 全字段编辑生效；内置改文案置 customized、resetInstruction 还原；非内置 reset 拒绝", async () => {
+    const put = (path: string, body: unknown) =>
+      fetch(`${baseUrl}${path}`, { ...json(body), method: "PUT", headers: { "Content-Type": "application/json", cookie } }); // method 必须放在 ...json 之后（json() 设 POST）
+    const created = (await (await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ title: "编辑目标", instruction: "原指令", trigger: { kind: "daily", time: "23:00" } }),
+    })).json()) as { id: string };
+
+    // 全字段编辑（AC5）：标题/指令/调度/渠道一次 PUT 全生效
+    const edited = (await (await put(`/api/tasks/${created.id}`, {
+      title: "改名了",
+      instruction: "新指令",
+      trigger: { kind: "weekly", days: [1, 3], time: "09:30" },
+      notifyChannel: "wechat",
+    })).json()) as { title: string; instruction: string; trigger: { kind: string; time: string }; notifyChannel?: string };
+    expect(edited.title).toBe("改名了");
+    expect(edited.instruction).toBe("新指令");
+    expect(edited.trigger).toMatchObject({ kind: "weekly", time: "09:30" });
+    expect(edited.notifyChannel).toBe("wechat");
+
+    // 内置任务：改指令 → customized 置位（启动同步跳过的标记随行返回）
+    const list = (await (await fetch(`${baseUrl}/api/tasks`, { headers: { cookie } })).json()) as {
+      id: string;
+      builtin?: string;
+    }[];
+    const brief = list.find((t) => t.builtin === "daily-brief")!;
+    const customized = (await (await put(`/api/tasks/${brief.id}`, { instruction: "我的简报口径" })).json()) as {
+      customized?: boolean;
+      instruction: string;
+    };
+    expect(customized.customized).toBe(true);
+    // resetInstruction：还原默认文案 + 清除标记
+    const restored = (await (await put(`/api/tasks/${brief.id}`, { resetInstruction: true })).json()) as {
+      customized?: boolean;
+      instruction: string;
+    };
+    expect(restored.customized).toBeUndefined();
+    expect(restored.instruction).not.toBe("我的简报口径");
+    // 非内置 resetInstruction → 明确报错（server 统一 404 + message）
+    const resetNonBuiltin = await put(`/api/tasks/${created.id}`, { resetInstruction: true });
+    expect(resetNonBuiltin.status).toBe(404);
+    expect(((await resetNonBuiltin.json()) as { error: string }).error).toContain("只适用于内置任务");
+    // 清理
+    await fetch(`${baseUrl}/api/tasks/${created.id}`, { method: "DELETE", headers: { cookie } });
+  });
+
+  it("习惯计划 HTTP（2026-09-30 习惯化，AC1/AC3）：POST /api/plans 带配额落账、today 视图带进度；非法值与一次性 scope 400；PUT 修订配额", async () => {
+    const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
+    expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 0 })).status).toBe(400);
+    expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 1.5 })).status).toBe(400);
+    expect((await postPlan({ title: "坏配额", scope: "deadline", due: "2026-10-10", timesPerPeriod: 3 })).status).toBe(400);
+    const habit = (await (await postPlan({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 })).json()) as { planId: string };
+
+    // 打一次卡 → today 视图 1/3 进行中（tz=480 本地口径）
+    await fetch(`${baseUrl}/api/checkin`, { ...json({ planId: habit.planId, done: true }), headers: { "Content-Type": "application/json", cookie } });
+    const todayOf = async () =>
+      (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as {
+        plans: { planId: string; state: string; timesPerPeriod?: number; periodCount?: number }[];
+        top3: { planId?: string; progress?: string }[];
+      };
+    const row = (await todayOf()).plans.find((p) => p.planId === habit.planId)!;
+    expect(row).toMatchObject({ state: "doing", timesPerPeriod: 3, periodCount: 1 }); // 一卡 ≠ 已完成（用户原始诉求）
+    expect((await todayOf()).top3.find((t) => t.planId === habit.planId)?.progress).toBe("1/3");
+
+    // PUT 修订：配额 3→4（mergePlanUpdate 同源）
+    const updated = await fetch(`${baseUrl}/api/plans/${habit.planId}`, {
+      ...json({ timesPerPeriod: 4 }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(updated.status).toBe(200);
+    const row2 = (await todayOf()).plans.find((p) => p.planId === habit.planId)!;
+    expect(row2.timesPerPeriod).toBe(4);
+    expect(row2.periodCount).toBe(1); // 打卡跨修订保留（planId 稳定）
+  });
+
   it("notifications：手动跑产出未读→全部已读", async () => {
     let unreadBefore: unknown[] = [];
     for (let i = 0; i < 40; i++) {

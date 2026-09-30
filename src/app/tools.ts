@@ -84,7 +84,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         scope: {
           type: "string",
           description:
-            "day | week | month | year | ndays | deadline。周期习惯用 day/week/month/year/ndays（每个周期重新打卡，如\"每天背单词\"=day、\"每周跑两次\"=week）；一次性的事用 deadline 并填 due（打过一次就算完成，如\"周五前交报告\"）。计划没有次数字段——\"每周两次\"的\"两次\"这类量词要写进 title（如\"跑步（每周目标 2 次）\"），不要默默丢弃。用户话里没有\"每天/每周\"也没有截止日就先问一句要哪种，不要猜。",
+            "day | week | month | year | ndays | deadline。周期习惯（每天/每周…重复做的事）用 day/week/month/year 并带 timesPerPeriod（如\"每天背单词\"=day+timesPerPeriod 1、\"每周运动三天\"=week+timesPerPeriod 3）——跨周期自动续期，配额达成才算完成。不带 timesPerPeriod 的 day/week/month/year 是只覆盖创建所在那个周期的一次性计划（\"今天要做的\"=day、\"这周目标\"=week），周期过了就淡出，不要拿它装习惯。ndays=最近 N 天窗口内的一次性冲刺；一次性带截止日的事用 deadline 并填 due（打过一次就算完成，如\"周五前交报告\"）。用户话里没有明确周期也没有截止日就先问一句要哪种，不要猜。",
         },
         due: {
           type: "string",
@@ -92,21 +92,27 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
             "截止日 YYYY-MM-DD（scope=deadline 必填）。相对期限换算成该周期最后一天：本周内=本周日（周一起算）、本月内=月末、今年内=12-31，以系统注入的今天为准；用户说了具体日期就直接用，不要替他改。",
         },
         ndays: { type: "integer", description: "最近 N 天（scope=ndays 必填）" },
+        timesPerPeriod: {
+          type: "integer",
+          description:
+            "每周期目标数（≥1 整数，仅 day/week/month/year）：周期习惯必带。day=每天打卡几次（\"每天喝8杯水\"=8）；week/month/year=每期要覆盖几个不同日子（\"每周运动三天\"=3，同一天打两卡只算 1 天）。",
+        },
       },
     },
     output: {
       schema: {
         type: "object",
         required: ["planId", "title"],
-        properties: { planId: { type: "string" }, title: { type: "string" } },
+        properties: { planId: { type: "string" }, title: { type: "string" }, scope: { type: "string" }, timesPerPeriod: { type: "integer" } },
       },
       render: (_args, value) => {
-        const v = value as { title: string };
-        return [{ type: "text", text: `已建计划「${v.title}」` }];
+        const v = value as { title: string; scope?: string; timesPerPeriod?: number };
+        const quota = v.timesPerPeriod !== undefined ? `（习惯：${{ day: "每天", week: "每周", month: "每月", year: "每年" }[v.scope ?? "day"] ?? "每期"} ${v.timesPerPeriod}${v.scope === "day" ? " 次" : " 天"}）` : "";
+        return [{ type: "text", text: `已建计划「${v.title}」${quota}` }];
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
       if (input.goalId !== undefined) throw new Error("目标层级（方向/阶段/项目）已下线，计划都是独立待办，不要传 goalId");
       if (typeof input.title !== "string" || input.title.trim() === "") throw new Error("title 必填");
       if (input.title.trim().length > 200) throw new Error("title 过长（≤200 字）");
@@ -115,6 +121,12 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       if (!scope) throw new Error(`scope 必须是 ${scopes.join(" | ")}`);
       if (scope === "deadline" && typeof input.due !== "string") throw new Error("scope=deadline 需要 due（YYYY-MM-DD）");
       if (scope === "ndays" && (typeof input.ndays !== "number" || input.ndays < 1)) throw new Error("scope=ndays 需要 ndays ≥ 1");
+      if (input.timesPerPeriod !== undefined && (!Number.isInteger(input.timesPerPeriod) || input.timesPerPeriod < 1)) {
+        throw new Error("timesPerPeriod 需为 ≥1 的整数");
+      }
+      if (input.timesPerPeriod !== undefined && !(scope === "day" || scope === "week" || scope === "month" || scope === "year")) {
+        throw new Error("timesPerPeriod 只支持 day | week | month | year（deadline/ndays 是一次性计划，没有每期配额）");
+      }
       const planId = `plan-${randomUUID().slice(0, 8)}`;
       await append({
         kind: "plan",
@@ -125,15 +137,16 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         scope,
         ...(input.due !== undefined ? { due: input.due } : {}),
         ...(input.ndays !== undefined ? { ndays: input.ndays } : {}),
+        ...(input.timesPerPeriod !== undefined ? { timesPerPeriod: input.timesPerPeriod } : {}),
       });
-      return { planId, title: input.title.trim() };
+      return { planId, title: input.title.trim(), scope, ...(input.timesPerPeriod !== undefined ? { timesPerPeriod: input.timesPerPeriod } : {}) };
     },
     isConcurrencySafe: () => false,
   };
 
   const updatePlan: ToolDefinition = {
     name: "update_plan",
-    description: "修改计划：标题/截止日/周期，只传要改的字段，未提供的保持原值。比取消重建好——planId 不变，已打的卡都还在。",
+    description: "修改计划：标题/截止日/周期/每期配额，只传要改的字段，未提供的保持原值。比取消重建好——planId 不变，已打的卡都还在。",
     parameters: {
       type: "object",
       required: ["planId"],
@@ -143,6 +156,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         scope: { type: "string", description: "day | week | month | year | ndays | deadline；周期换了就改成用户最新说法" },
         due: { type: "string", description: "截止日 YYYY-MM-DD（scope=deadline 必有）；相对期限换算规则同 create_plan" },
         ndays: { type: "integer", description: "最近 N 天（scope=ndays 必填）" },
+        timesPerPeriod: {
+          type: "integer",
+          description: "改每周期目标数（≥1 整数，仅 day/week/month/year）：把普通计划升级成习惯（带上即跨周期续期），或改习惯配额（\"每周改成 4 天\"）。scope 换到 deadline/ndays 时不可带。",
+        },
       },
     },
     output: {
@@ -157,7 +174,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { planId?: string; title?: string; scope?: string; due?: string; ndays?: number; goalId?: string };
+      const input = (args ?? {}) as { planId?: string; title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
       if (input.goalId !== undefined) throw new Error("目标层级（方向/阶段/项目）已下线，计划都是独立待办，不要传 goalId");
       if (typeof input.planId !== "string" || input.planId === "") throw new Error("planId 必填（query_ledger 的 plans 里有）");
       const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as PlanRecord).planId === input.planId);
@@ -229,18 +246,19 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       date?: string;
       streakDays?: number;
       flows?: { category: string }[];
-      plans?: { planId?: string; title: string; state?: string; due?: string; doneToday?: boolean; doneAt?: number; checkins?: { seq: number }[] }[];
-      top3?: { kind: string; title: string; planId?: string; due?: string }[];
+      plans?: { planId?: string; title: string; state?: string; due?: string; doneToday?: boolean; doneAt?: number; checkins?: { seq: number }[]; scope?: string; timesPerPeriod?: number; periodCount?: number }[];
+      top3?: { kind: string; title: string; planId?: string; due?: string; progress?: string }[];
       total?: number;
       truncated?: boolean;
     };
     if (v.date !== undefined) {
       const undone = (v.plans ?? []).filter((p) => p.state !== "done");
+      const scopeWord: Record<string, string> = { day: "今天", week: "本周", month: "本月", year: "今年" };
       const lines = [
         `${v.date}：${(v.flows ?? []).length} 笔流水、${(v.plans ?? []).length} 个计划（${undone.length} 个未完成）、连续记录 ${v.streakDays} 天`,
       ];
       if ((v.top3 ?? []).length > 0) {
-        lines.push(`今日必做：${v.top3!.map((t) => `${t.title}${t.planId !== undefined ? `(${t.planId})` : ""}`).join("；")}`);
+        lines.push(`今日必做：${v.top3!.map((t) => `${t.title}${t.progress !== undefined ? ` ${t.progress}` : ""}${t.planId !== undefined ? `(${t.planId})` : ""}`).join("；")}`);
       }
       if (undone.length > 0) {
         lines.push(
@@ -248,7 +266,12 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
             .slice(0, 10)
             .map((p) => {
               const seqs = (p.checkins ?? []).slice(0, 2).map((c) => c.seq).join("/"); // 撤历史卡凭据（作废走 void_flow）
-              return `${p.title}(${p.planId ?? "?"}, ${p.state ?? "?"}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${seqs !== "" ? `, 打卡${seqs}` : ""})`;
+              // 习惯计划显示本期进度（本周 2/3）替代 state 词——模型/用户据此判断还差几次
+              const stateText =
+                p.timesPerPeriod !== undefined
+                  ? `${scopeWord[p.scope ?? "day"] ?? "本期"} ${p.periodCount ?? 0}/${p.timesPerPeriod}`
+                  : `${p.state ?? "?"}`;
+              return `${p.title}(${p.planId ?? "?"}, ${stateText}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${seqs !== "" ? `, 打卡${seqs}` : ""})`;
             })
             .join("、")}${undone.length > 10 ? ` 等 ${undone.length} 个` : ""}`,
         );
@@ -268,7 +291,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       return [{ type: "text", text: lines.join("\n") }];
     }
     if (v.plans !== undefined) {
-      const names = v.plans.slice(0, 10).map((p) => `${p.title}(${p.planId ?? "?"}${p.due !== undefined ? `, 截止 ${p.due}` : ""})`).join("；");
+      const names = v.plans
+        .slice(0, 10)
+        .map((p) => `${p.title}(${p.planId ?? "?"}${p.timesPerPeriod !== undefined ? `, 习惯${p.timesPerPeriod}` : ""}${p.due !== undefined ? `, 截止 ${p.due}` : ""})`)
+        .join("；");
       const more = (v.total ?? v.plans.length) - Math.min(10, v.plans.length);
       return [{ type: "text", text: `共 ${v.total} 个计划${v.truncated ? `（列表截断为前 ${v.plans.length} 个）` : ""}：${names}${more > 0 ? ` 等 ${more} 个未列出` : ""}` }];
     }
@@ -308,9 +334,10 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       if (input.what === "plans") {
         const all = active
           .filter((r): r is PlanRecord => r.kind === "plan")
-          .map(({ planId, title, scope, due }) => ({
+          .map(({ planId, title, scope, due, timesPerPeriod }) => ({
             planId, title, scope,
             ...(due !== undefined ? { due } : {}),
+            ...(timesPerPeriod !== undefined ? { timesPerPeriod } : {}),
           }));
         return { plans: all.slice(0, limit), total: all.length, truncated: all.length > limit };
       }

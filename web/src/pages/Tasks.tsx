@@ -113,6 +113,423 @@ const TPL_ICONS: [string, string][] = [
   ["weekly-review", "📈"],
 ];
 
+const inputCls =
+  "rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3";
+const selectCls = `${inputCls} w-auto`;
+
+// ── 调度选择器（创建/编辑共用，2026-09-30 任务编辑入口） ──────────────
+
+interface SchedState {
+  kind: SchedKind;
+  minute: number; // 每小时的第 M 分
+  hour: number;
+  minuteOfHour: number;
+  weekdays: number[];
+  monthDay: number;
+  onceDate: string;
+  onceHour: number;
+  onceMinute: number;
+  onceSecond: number;
+  customEvery: number;
+  customUnit: CustomUnit;
+  customEnd: "never" | "date";
+  customEndDate: string;
+}
+
+/** 触发器 → 选择器初值（编辑回填）。hourly cron 认得；其余 cron 表达不了就退化为 daily 初值——
+ *  编辑面板只在用户真正动了调度时才上抛新触发器，不动则原样保留 */
+function reverseMapTrigger(t: TaskTriggerLoose | undefined): SchedState {
+  const base: SchedState = {
+    kind: "daily",
+    minute: 0,
+    hour: 23,
+    minuteOfHour: 0,
+    weekdays: WORKDAYS,
+    monthDay: 1,
+    onceDate: localDateStr(new Date(Date.now() + 86400000)),
+    onceHour: 9,
+    onceMinute: 0,
+    onceSecond: 0,
+    customEvery: 1,
+    customUnit: "day",
+    customEnd: "never",
+    customEndDate: "",
+  };
+  if (t === undefined) return base;
+  const parts = typeof t.time === "string" && t.time !== "" ? t.time.split(":") : [];
+  const hour = parts.length >= 1 ? Number(parts[0]) : base.hour;
+  const minuteOfHour = parts.length >= 2 ? Number(parts[1]) : base.minuteOfHour;
+  switch (t.kind) {
+    case "daily":
+      return { ...base, kind: "daily", hour, minuteOfHour };
+    case "weekly": {
+      const days = t.days ?? [1];
+      const isWorkdays = WORKDAYS.every((d) => days.includes(d)) && days.length === WORKDAYS.length;
+      return { ...base, kind: isWorkdays ? "workday" : "weekly", weekdays: days, hour, minuteOfHour };
+    }
+    case "monthly":
+      return { ...base, kind: "monthly", monthDay: t.day ?? 1, hour, minuteOfHour };
+    case "once": {
+      const d = new Date(t.at ?? Date.now() + 86400000);
+      return { ...base, kind: "once", onceDate: localDateStr(d), onceHour: d.getHours(), onceMinute: d.getMinutes(), onceSecond: d.getSeconds() };
+    }
+    case "interval":
+      return {
+        ...base,
+        kind: "custom",
+        customEvery: t.every ?? 1,
+        customUnit: asUnit(t.unit),
+        customEnd: t.endTs !== undefined ? "date" : "never",
+        customEndDate: t.endTs !== undefined ? localDateStr(new Date(t.endTs)) : "",
+        hour,
+        minuteOfHour,
+      };
+    case "cron": {
+      const hourly = /^(\d{1,2}) \* \* \* \*$/.exec(t.expr ?? "");
+      return hourly !== null ? { ...base, kind: "hourly", minute: Number(hourly[1]) } : base;
+    }
+    default:
+      return base;
+  }
+}
+
+/** 选择器状态 → 触发器；无效中间态返回 null（单次缺日期/过去时刻、自定义重复缺结束日） */
+function buildSchedTrigger(s: SchedState): TaskTriggerLoose | null {
+  const createTime = `${pad(s.hour)}:${pad(s.minuteOfHour)}`;
+  switch (s.kind) {
+    case "hourly":
+      return { kind: "cron", expr: `${pad(s.minute)} * * * *` };
+    case "daily":
+      return { kind: "daily", time: createTime };
+    case "workday":
+      return { kind: "weekly", days: WORKDAYS, time: createTime };
+    case "weekly":
+      return { kind: "weekly", days: s.weekdays.length > 0 ? s.weekdays : [1], time: createTime };
+    case "monthly":
+      return { kind: "monthly", day: s.monthDay, time: createTime };
+    case "once": {
+      const at = new Date(`${s.onceDate}T${pad(s.onceHour)}:${pad(s.onceMinute)}:${pad(s.onceSecond)}`).getTime();
+      if (s.onceDate === "" || !Number.isFinite(at) || at <= Date.now()) return null;
+      return { kind: "once", at };
+    }
+    case "custom": {
+      if (s.customEnd === "date" && s.customEndDate === "") return null;
+      const every = Math.max(1, Math.floor(s.customEvery) || 1);
+      const timed = isTimedUnit(s.customUnit);
+      const start = new Date();
+      if (timed) start.setHours(s.hour, s.minuteOfHour, 0, 0); // 天及以上锚今天 HH:mm；分钟/小时从现在起算
+      const endTs = s.customEnd === "date" ? new Date(`${s.customEndDate}T23:59:59`).getTime() : undefined; // 含结束日当天
+      return {
+        kind: "interval",
+        every,
+        unit: s.customUnit,
+        ...(timed ? { time: createTime } : {}),
+        startTs: start.getTime(),
+        ...(endTs !== undefined && Number.isFinite(endTs) ? { endTs } : {}),
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+/** 选择器当前选择的人话摘要（实时显示在控件行右侧） */
+function schedSummary(s: SchedState): string {
+  const createTime = `${pad(s.hour)}:${pad(s.minuteOfHour)}`;
+  switch (s.kind) {
+    case "hourly":
+      return `每小时第 ${pad(s.minute)} 分`;
+    case "daily":
+      return `每天 ${createTime}`;
+    case "workday":
+      return `每工作日 ${createTime}`;
+    case "weekly":
+      return `每周${(s.weekdays.length > 0 ? s.weekdays : [1]).map((d) => WEEKDAY[d]).join("、")} ${createTime}`;
+    case "monthly":
+      return `每月 ${s.monthDay} 号 ${createTime}`;
+    case "once":
+      return `单次 ${s.onceDate} ${pad(s.onceHour)}:${pad(s.onceMinute)}:${pad(s.onceSecond)}`;
+    default: {
+      const every = Math.max(1, Math.floor(s.customEvery) || 1);
+      const end = s.customEnd === "date" && s.customEndDate !== "" ? ` · 至 ${s.customEndDate}` : " · 永不结束";
+      return isTimedUnit(s.customUnit) ? `${freqText(every, s.customUnit)} ${createTime}${end}` : `${freqText(every, s.customUnit)}${end}`;
+    }
+  }
+}
+
+/** 调度选择器：内部持有全部调度状态（挂载时读 initial），用户每改一次就上抛构建好的触发器；
+ *  没动过就不上抛——编辑面板据此保留原触发器（表不了的 cron 不会被意外改写） */
+function ScheduleFields({ initial, onChange }: { initial?: TaskTriggerLoose; onChange: (trigger: TaskTriggerLoose | null) => void }) {
+  const [st, setSt] = useState<SchedState>(() => reverseMapTrigger(initial));
+  const [customOpen, setCustomOpen] = useState(false);
+  const update = (patch: Partial<SchedState>): void => {
+    const next = { ...st, ...patch };
+    setSt(next);
+    onChange(buildSchedTrigger(next)); // 无效中间态上抛 null，提交侧拦
+  };
+  const summary = schedSummary(st);
+  return (
+    <div className="space-y-2">
+      <div className="text-sm font-medium text-ink">调度</div>
+      <div className="flex flex-wrap items-center gap-2">
+        <select className={selectCls} value={st.kind} onChange={(e) => update({ kind: e.target.value as SchedKind })}>
+          {SCHEDULE_TYPES.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+        {st.kind === "hourly" && (
+          <>
+            <span className="text-sm text-ink2">第</span>
+            <select className={selectCls} value={st.minute} onChange={(e) => update({ minute: Number(e.target.value) })}>
+              {MINUTES.map((m) => (
+                <option key={m} value={m}>
+                  {pad(m)}
+                </option>
+              ))}
+            </select>
+            <span className="text-sm text-ink2">分钟</span>
+          </>
+        )}
+        {st.kind === "weekly" && (
+          <span className="flex gap-1">
+            {[1, 2, 3, 4, 5, 6, 7].map((d) => (
+              <button
+                key={d}
+                type="button"
+                className={`h-8 w-8 rounded-lg border text-xs transition ${
+                  st.weekdays.includes(d) ? "border-accent bg-accent3 font-medium text-accent" : "border-line text-ink3 hover:border-accent hover:text-ink"
+                }`}
+                onClick={() => update({ weekdays: st.weekdays.includes(d) ? st.weekdays.filter((x) => x !== d) : [...st.weekdays, d].sort((a, b) => a - b) })}
+              >
+                {WEEKDAY[d]}
+              </button>
+            ))}
+          </span>
+        )}
+        {st.kind === "monthly" && (
+          <select className={selectCls} value={st.monthDay} onChange={(e) => update({ monthDay: Number(e.target.value) })}>
+            {DAYS_31.map((d) => (
+              <option key={d} value={d}>
+                {d} 号
+              </option>
+            ))}
+          </select>
+        )}
+        {st.kind === "once" && (
+          <>
+            <input type="date" className={selectCls} value={st.onceDate} onChange={(e) => update({ onceDate: e.target.value })} aria-label="日期" />
+            <select className={selectCls} value={st.onceHour} onChange={(e) => update({ onceHour: Number(e.target.value) })} aria-label="小时">
+              {HOURS.map((h) => (
+                <option key={h} value={h}>
+                  {pad(h)}
+                </option>
+              ))}
+            </select>
+            <select className={selectCls} value={st.onceMinute} onChange={(e) => update({ onceMinute: Number(e.target.value) })} aria-label="分钟">
+              {MINUTES.map((m) => (
+                <option key={m} value={m}>
+                  {pad(m)}
+                </option>
+              ))}
+            </select>
+            <select className={selectCls} value={st.onceSecond} onChange={(e) => update({ onceSecond: Number(e.target.value) })} aria-label="秒">
+              {SECONDS.map((s) => (
+                <option key={s} value={s}>
+                  {pad(s)}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+        {(st.kind === "daily" || st.kind === "workday" || st.kind === "weekly" || st.kind === "monthly" || (st.kind === "custom" && isTimedUnit(st.customUnit))) && (
+          <>
+            <span className="text-sm text-ink2">于</span>
+            <select className={selectCls} value={st.hour} onChange={(e) => update({ hour: Number(e.target.value) })} aria-label="小时">
+              {HOURS.map((h) => (
+                <option key={h} value={h}>
+                  {pad(h)}
+                </option>
+              ))}
+            </select>
+            <select className={selectCls} value={st.minuteOfHour} onChange={(e) => update({ minuteOfHour: Number(e.target.value) })} aria-label="分钟">
+              {MINUTES.map((m) => (
+                <option key={m} value={m}>
+                  {pad(m)}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+        {st.kind === "custom" && (
+          <button
+            type="button"
+            className="rounded-lg border border-line px-3 py-2 text-sm text-ink2 transition hover:border-accent hover:text-ink"
+            onClick={() => setCustomOpen(true)}
+          >
+            自定义重复…<span className="ml-1.5 text-xs text-accent">{summary}</span>
+          </button>
+        )}
+        <span className="ml-auto text-xs text-ink3">{summary}</span>
+      </div>
+      <p className="text-xs text-ink3">
+        按本地时区（UTC{-TZ_OFFSET_MINUTES >= 0 ? "+" : ""}
+        {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
+      </p>
+
+      {/* 自定义重复弹窗：每 N 天/周/月/年 + 结束条件（落 interval 触发器） */}
+      {customOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={() => setCustomOpen(false)}>
+          <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-[15px] font-semibold text-ink">自定义重复</h3>
+              <button className="text-lg leading-none text-ink3 transition hover:text-ink" onClick={() => setCustomOpen(false)} aria-label="关闭">
+                ×
+              </button>
+            </div>
+            <div className="mt-4 text-sm font-medium text-ink">重复频率</div>
+            <div className="mt-2 flex gap-2">
+              <input
+                type="number"
+                min={1}
+                className={`${inputCls} w-24`}
+                value={st.customEvery}
+                onChange={(e) => update({ customEvery: Number(e.target.value) })}
+                aria-label="重复间隔"
+              />
+              <select className={`${inputCls} flex-1`} value={st.customUnit} onChange={(e) => update({ customUnit: e.target.value as CustomUnit })} aria-label="重复单位">
+                {CUSTOM_UNITS.map((u) => (
+                  <option key={u} value={u}>
+                    {UNIT_CHAR[u]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-4 text-sm font-medium text-ink">结束</div>
+            <div className="mt-2 space-y-2">
+              <label className="flex items-center gap-2 text-sm text-ink2">
+                <input type="radio" checked={st.customEnd === "never"} onChange={() => update({ customEnd: "never" })} /> 永不结束
+              </label>
+              <label className="flex items-center gap-2 text-sm text-ink2">
+                <input type="radio" checked={st.customEnd === "date"} onChange={() => update({ customEnd: "date" })} /> 指定日期
+              </label>
+              {st.customEnd === "date" && <input type="date" className={inputCls} value={st.customEndDate} onChange={(e) => update({ customEndDate: e.target.value })} />}
+            </div>
+            <div className="mt-4 flex items-center justify-between">
+              <span className="text-xs text-ink3">
+                {freqText(Math.max(1, Math.floor(st.customEvery) || 1), st.customUnit)}
+                {st.customEnd === "date" && st.customEndDate !== "" ? ` · 至 ${st.customEndDate}` : " · 永不结束"}
+              </span>
+              <button className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => setCustomOpen(false)}>
+                确认
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 任务编辑面板（2026-09-30 任务编辑入口）：标题/指令/调度/通知渠道；内置任务可一键恢复默认文案 */
+function TaskEditPanel({
+  task,
+  templates,
+  onClose,
+  onSaved,
+}: {
+  task: TaskLoose;
+  templates: { builtin: string; title: string; instruction: string; trigger: TaskTriggerLoose; label: string }[] | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [title, setTitle] = useState(task.title);
+  const [instruction, setInstruction] = useState(task.instruction);
+  const [notifyChannel, setNotifyChannel] = useState<"inapp" | "wechat">(task.notifyChannel ?? "inapp");
+  const [trigger, setTrigger] = useState<TaskTriggerLoose | null>(task.trigger);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const tplDef = templates?.find((t) => t.builtin === task.builtin);
+
+  const save = async (): Promise<void> => {
+    if (title.trim() === "" || instruction.trim() === "") {
+      setMsg("标题和指令都不能为空");
+      return;
+    }
+    setBusy(true);
+    setMsg(null);
+    try {
+      await api3.updateTask(task.id, {
+        title: title.trim(),
+        instruction: instruction.trim(),
+        trigger: trigger ?? task.trigger, // 调度没动过（或中间态无效）就保持原触发器
+        ...(notifyChannel === "wechat" ? { notifyChannel: "wechat" as const } : { notifyChannel: "inapp" as const }),
+      });
+      onSaved();
+    } catch (e) {
+      setMsg(`保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const resetInstruction = async (): Promise<void> => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const next = await api3.updateTask(task.id, { resetInstruction: true });
+      setInstruction(next.instruction);
+      setMsg("已恢复默认文案（并恢复启动同步）");
+    } catch (e) {
+      setMsg(`恢复失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-1.5 rounded-xl border border-accent/40 bg-surface p-4">
+      <div className="grid grid-cols-2 gap-2">
+        <input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} aria-label="标题" />
+        <div className="flex items-center gap-2 text-xs text-ink3">
+          {task.builtin !== undefined && task.customized === true && <span className="rounded bg-warm/10 px-1.5 py-0.5 text-[10px] text-warm">文案已自定义</span>}
+          {task.builtin !== undefined && <span className="text-ink3">内置任务：改过文案后不再被启动同步覆盖</span>}
+        </div>
+      </div>
+      <textarea
+        className={`${inputCls} mt-2 w-full`}
+        rows={3}
+        value={instruction}
+        onChange={(e) => setInstruction(e.target.value)}
+        aria-label="指令"
+      />
+      <div className="mt-2">
+        <select className={inputCls} value={notifyChannel} onChange={(e) => setNotifyChannel(e.target.value === "wechat" ? "wechat" : "inapp")}>
+          <option value="inapp">通知渠道：站内（提醒页）</option>
+          <option value="wechat">通知渠道：微信机器人（站内 + 微信推送）</option>
+        </select>
+      </div>
+      <div className="mt-2">
+        <ScheduleFields key={task.id} initial={task.trigger} onChange={setTrigger} />
+      </div>
+      {msg && <p className="mt-2 text-xs text-ink3">{msg}</p>}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <button className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
+          保存
+        </button>
+        <button className="text-sm text-ink3 transition hover:text-ink" onClick={onClose}>
+          收起
+        </button>
+        {task.builtin !== undefined && tplDef !== undefined && (
+          <button className="ml-auto text-xs text-accent hover:underline" disabled={busy} onClick={() => void resetInstruction()} title={`恢复为默认文案：${tplDef.instruction.slice(0, 60)}…`}>
+            恢复默认文案
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** 提醒页：统计 + 每日/每周每月/已停用分组 + 最近通知，结构照 prototype 页 6 */
 export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChange: (n: number) => void }) {
   const [tasks, setTasks] = useState<TaskLoose[]>([]);
@@ -129,39 +546,16 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const applyTemplate = (t: { title: string; instruction: string; trigger: TaskTriggerLoose }): void => {
     setTitle(t.title);
     setInstruction(t.instruction);
-    if (t.trigger.kind === "daily") {
-      setSchedKind("daily");
-      const [h, m] = (t.trigger.time ?? "08:30").split(":");
-      setHour(Number(h));
-      setMinuteOfHour(Number(m));
-    } else if (t.trigger.kind === "weekly") {
-      setSchedKind("weekly");
-      setWeekdays(t.trigger.days ?? [1]);
-      const [h, m] = (t.trigger.time ?? "21:00").split(":");
-      setHour(Number(h));
-      setMinuteOfHour(Number(m));
-    }
+    // 调度器只读挂载初值：套模板后重挂（schedKey 自增），让控件回显模板时刻
+    setDraftTrigger(t.trigger);
+    setSchedKey((k) => k + 1);
   };
-  // 新建表单（结构化调度）
+  // 新建表单（2026-09-30 任务编辑：调度选择器抽成 ScheduleFields，创建/编辑共用）
   const [title, setTitle] = useState("");
   const [instruction, setInstruction] = useState("");
-  const [schedKind, setSchedKind] = useState<SchedKind>("daily");
-  const [minute, setMinute] = useState(0); // 每小时的第 M 分
-  const [hour, setHour] = useState(23);
-  const [minuteOfHour, setMinuteOfHour] = useState(0);
-  const [weekdays, setWeekdays] = useState<number[]>(WORKDAYS);
-  const [monthDay, setMonthDay] = useState(1);
-  // 单次（once 触发器）：年月日 + 时分秒，默认明天 09:00:00
-  const [onceDate, setOnceDate] = useState(() => localDateStr(new Date(Date.now() + 86400000)));
-  const [onceHour, setOnceHour] = useState(9);
-  const [onceMinute, setOnceMinute] = useState(0);
-  const [onceSecond, setOnceSecond] = useState(0);
-  // 自定义重复（interval 触发器）：每 N 天/周/月/年 + 结束条件
-  const [customEvery, setCustomEvery] = useState(1);
-  const [customUnit, setCustomUnit] = useState<CustomUnit>("day");
-  const [customEnd, setCustomEnd] = useState<"never" | "date">("never");
-  const [customEndDate, setCustomEndDate] = useState("");
-  const [customOpen, setCustomOpen] = useState(false);
+  const [draftTrigger, setDraftTrigger] = useState<TaskTriggerLoose | null>(null);
+  const [schedKey, setSchedKey] = useState(0);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [agentId, setAgentId] = useState("");
   // 通知渠道（2026-09-27）：站内（默认）| 微信机器人（站内记录 + 微信推送；未绑定时到点只发站内）
   const [notifyChannel, setNotifyChannel] = useState<"inapp" | "wechat">("inapp");
@@ -189,71 +583,23 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   }, [reloadNotifications]);
 
   const create = async () => {
-    const createTime = `${pad(hour)}:${pad(minuteOfHour)}`;
-    let trigger: TaskTriggerLoose;
-    switch (schedKind) {
-      case "hourly":
-        trigger = { kind: "cron", expr: `${pad(minute)} * * * *` };
-        break;
-      case "daily":
-        trigger = { kind: "daily", time: createTime };
-        break;
-      case "workday":
-        trigger = { kind: "weekly", days: WORKDAYS, time: createTime };
-        break;
-      case "weekly":
-        trigger = { kind: "weekly", days: weekdays.length > 0 ? weekdays : [1], time: createTime };
-        break;
-      case "monthly":
-        trigger = { kind: "monthly", day: monthDay, time: createTime };
-        break;
-      case "once": {
-        const at = new Date(`${onceDate}T${pad(onceHour)}:${pad(onceMinute)}:${pad(onceSecond)}`).getTime();
-        if (onceDate === "" || !Number.isFinite(at)) {
-          setMessage("单次：先选一个日期");
-          return;
-        }
-        if (at <= Date.now()) {
-          setMessage("单次时刻需要晚于现在");
-          return;
-        }
-        trigger = { kind: "once", at };
-        break;
-      }
-      case "custom": {
-        if (customEnd === "date" && customEndDate === "") {
-          setMessage("自定义重复：选了「指定日期」就要挑一个结束日期");
-          return;
-        }
-        const every = Math.max(1, Math.floor(customEvery) || 1);
-        const timed = isTimedUnit(customUnit);
-        const start = new Date();
-        if (timed) start.setHours(hour, minuteOfHour, 0, 0); // 天及以上：锚今天 HH:mm；分钟/小时：从现在起算
-        const endTs = customEnd === "date" ? new Date(`${customEndDate}T23:59:59`).getTime() : undefined; // 含结束日当天
-        trigger = {
-          kind: "interval",
-          every,
-          unit: customUnit,
-          ...(timed ? { time: createTime } : {}),
-          startTs: start.getTime(),
-          ...(endTs !== undefined && Number.isFinite(endTs) ? { endTs } : {}),
-        };
-        break;
-      }
-      default:
-        trigger = { kind: "daily", time: createTime };
+    if (draftTrigger === null) {
+      setMessage("调度还没选完整（单次要选未来的日期时刻，自定义重复选了结束日就要挑日期）");
+      return;
     }
     try {
       await api3.createTask({
         title,
         instruction,
-        trigger,
+        trigger: draftTrigger,
         tzOffsetMinutes: TZ_OFFSET_MINUTES,
         ...(agentId !== "" ? { agentId } : {}),
         ...(notifyChannel === "wechat" ? { notifyChannel } : {}),
       });
       setTitle("");
       setInstruction("");
+      setDraftTrigger(null);
+      setSchedKey((k) => k + 1);
       setCreateOpen(false);
       setMessage("已创建（到点以该伙伴身份跑一次离线回合，提醒落进它的定时提醒会话）");
       await reload();
@@ -277,99 +623,93 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
   const disabled = tasks.filter((t) => !t.enabled);
 
   const taskRow = (task: TaskLoose) => (
-    <div className={`flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 ${task.enabled ? "" : "opacity-70"}`}>
-      <span className={`num w-20 shrink-0 text-sm font-medium ${task.enabled ? "text-ink" : "text-ink3"}`}>
-        {triggerShort(task.trigger)}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5">
-          <span className="truncate text-[15px] text-ink">{task.title}</span>
-          {task.builtin !== undefined && (
-            <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent" title="内置任务：注册时自动创建，可改可关，删除后可用模板重建">
-              内置
-            </span>
+    <>
+      <div className={`flex items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 ${task.enabled ? "" : "opacity-70"}`}>
+        <span className={`num w-20 shrink-0 text-sm font-medium ${task.enabled ? "text-ink" : "text-ink3"}`}>
+          {triggerShort(task.trigger)}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-[15px] text-ink">{task.title}</span>
+            {task.builtin !== undefined && (
+              <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent" title="内置任务：注册时自动创建，可改可关，删除后可用模板重建">
+                内置
+              </span>
+            )}
+            {task.builtin !== undefined && task.customized === true && (
+              <span className="shrink-0 rounded bg-warm/10 px-1.5 py-0.5 text-[10px] text-warm" title="指令文案已被你改过：启动时的默认文案同步会跳过这条任务">
+                已自定义
+              </span>
+            )}
+          </div>
+          <div className="truncate text-xs text-ink3">
+            {task.instruction}
+            {task.lastRunTs ? ` · 上次 ${new Date(task.lastRunTs).toLocaleString()}` : " · 未跑过"}
+          </div>
+          {history[task.id] && (
+            <div className="mt-1 text-xs text-ink3">
+              {history[task.id]!.length === 0 && "（无运行记录）"}
+              {history[task.id]!
+                .slice(-5)
+                .reverse()
+                .map((run, i) => (
+                  <div key={i}>
+                    {new Date(run.ts).toLocaleString()} · {run.status}
+                    {run.detail ? `（${run.detail}）` : ""}
+                  </div>
+                ))}
+            </div>
           )}
         </div>
-        <div className="truncate text-xs text-ink3">
-          {task.instruction}
-          {task.lastRunTs ? ` · 上次 ${new Date(task.lastRunTs).toLocaleString()}` : " · 未跑过"}
+        <div className="flex shrink-0 items-center gap-2">
+          <button className="text-xs text-ink3 transition hover:text-ink" onClick={() => void showHistory(task.id)}>
+            历史
+          </button>
+          <button className="text-xs text-ink3 transition hover:text-ink" onClick={() => setEditingId(editingId === task.id ? null : task.id)}>
+            编辑
+          </button>
+          <button
+            className="text-xs text-ink3 transition hover:text-ink"
+            onClick={async () => {
+              await api3.runTask(task.id);
+              setMessage("已触发（离线回合异步执行，稍后看历史与通知）");
+            }}
+          >
+            立即跑
+          </button>
+          <button
+            className="text-xs text-ink3 transition hover:text-warm"
+            onClick={async () => {
+              await api3.deleteTask(task.id);
+              await reload();
+            }}
+          >
+            删除
+          </button>
+          <Toggle
+            checked={task.enabled}
+            title={task.enabled ? "停用" : "启用"}
+            onChange={async () => {
+              await api3.updateTask(task.id, { enabled: !task.enabled });
+              await reload();
+            }}
+          />
         </div>
-        {history[task.id] && (
-          <div className="mt-1 text-xs text-ink3">
-            {history[task.id]!.length === 0 && "（无运行记录）"}
-            {history[task.id]!
-              .slice(-5)
-              .reverse()
-              .map((run, i) => (
-                <div key={i}>
-                  {new Date(run.ts).toLocaleString()} · {run.status}
-                  {run.detail ? `（${run.detail}）` : ""}
-                </div>
-              ))}
-          </div>
-        )}
       </div>
-      <div className="flex shrink-0 items-center gap-2">
-        <button className="text-xs text-ink3 transition hover:text-ink" onClick={() => void showHistory(task.id)}>
-          历史
-        </button>
-        <button
-          className="text-xs text-ink3 transition hover:text-ink"
-          onClick={async () => {
-            await api3.runTask(task.id);
-            setMessage("已触发（离线回合异步执行，稍后看历史与通知）");
-          }}
-        >
-          立即跑
-        </button>
-        <button
-          className="text-xs text-ink3 transition hover:text-warm"
-          onClick={async () => {
-            await api3.deleteTask(task.id);
-            await reload();
-          }}
-        >
-          删除
-        </button>
-        <Toggle
-          checked={task.enabled}
-          title={task.enabled ? "停用" : "启用"}
-          onChange={async () => {
-            await api3.updateTask(task.id, { enabled: !task.enabled });
-            await reload();
+      {/* 编辑面板（2026-09-30 任务编辑入口）：标题/指令/调度/渠道；内置任务可恢复默认文案 */}
+      {editingId === task.id && (
+        <TaskEditPanel
+          task={task}
+          templates={templates}
+          onClose={() => setEditingId(null)}
+          onSaved={() => {
+            setEditingId(null);
+            void reload();
           }}
         />
-      </div>
-    </div>
+      )}
+    </>
   );
-
-  const inputCls =
-    "rounded-lg border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3";
-
-  const createTime = `${pad(hour)}:${pad(minuteOfHour)}`;
-  const scheduleSummary = (() => {
-    switch (schedKind) {
-      case "hourly":
-        return `每小时第 ${pad(minute)} 分`;
-      case "daily":
-        return `每天 ${createTime}`;
-      case "workday":
-        return `每工作日 ${createTime}`;
-      case "weekly":
-        return `每周${(weekdays.length > 0 ? weekdays : [1]).map((d) => WEEKDAY[d]).join("、")} ${createTime}`;
-      case "monthly":
-        return `每月 ${monthDay} 号 ${createTime}`;
-      case "once":
-        return `单次 ${onceDate} ${pad(onceHour)}:${pad(onceMinute)}:${pad(onceSecond)}`;
-      default: {
-        const every = Math.max(1, Math.floor(customEvery) || 1);
-        const end = customEnd === "date" && customEndDate !== "" ? ` · 至 ${customEndDate}` : " · 永不结束";
-        return isTimedUnit(customUnit) ? `${freqText(every, customUnit)} ${createTime}${end}` : `${freqText(every, customUnit)}${end}`;
-      }
-    }
-  })();
-
-  const selectCls = `${inputCls} w-auto`;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -409,118 +749,9 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
               <p className="mt-1 text-xs text-warm">还没绑定微信机器人——到菜单「IM 通道」扫码绑定前，到点只发站内。</p>
             )}
           </div>
-          <div className="mt-2 space-y-2">
-            <div className="text-sm font-medium text-ink">调度</div>
-            <div className="flex flex-wrap items-center gap-2">
-              <select className={selectCls} value={schedKind} onChange={(e) => setSchedKind(e.target.value as SchedKind)}>
-                {SCHEDULE_TYPES.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
-                  </option>
-                ))}
-              </select>
-              {schedKind === "hourly" && (
-                <>
-                  <span className="text-sm text-ink2">第</span>
-                  <select className={selectCls} value={minute} onChange={(e) => setMinute(Number(e.target.value))}>
-                    {MINUTES.map((m) => (
-                      <option key={m} value={m}>
-                        {pad(m)}
-                      </option>
-                    ))}
-                  </select>
-                  <span className="text-sm text-ink2">分钟</span>
-                </>
-              )}
-              {schedKind === "weekly" && (
-                <span className="flex gap-1">
-                  {[1, 2, 3, 4, 5, 6, 7].map((d) => (
-                    <button
-                      key={d}
-                      type="button"
-                      className={`h-8 w-8 rounded-lg border text-xs transition ${
-                        weekdays.includes(d)
-                          ? "border-accent bg-accent3 font-medium text-accent"
-                          : "border-line text-ink3 hover:border-accent hover:text-ink"
-                      }`}
-                      onClick={() =>
-                        setWeekdays(weekdays.includes(d) ? weekdays.filter((x) => x !== d) : [...weekdays, d].sort((a, b) => a - b))
-                      }
-                    >
-                      {WEEKDAY[d]}
-                    </button>
-                  ))}
-                </span>
-              )}
-              {schedKind === "monthly" && (
-                <select className={selectCls} value={monthDay} onChange={(e) => setMonthDay(Number(e.target.value))}>
-                  {DAYS_31.map((d) => (
-                    <option key={d} value={d}>
-                      {d} 号
-                    </option>
-                  ))}
-                </select>
-              )}
-              {schedKind === "once" && (
-                <>
-                  <input type="date" className={selectCls} value={onceDate} onChange={(e) => setOnceDate(e.target.value)} aria-label="日期" />
-                  <select className={selectCls} value={onceHour} onChange={(e) => setOnceHour(Number(e.target.value))} aria-label="小时">
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {pad(h)}
-                      </option>
-                    ))}
-                  </select>
-                  <select className={selectCls} value={onceMinute} onChange={(e) => setOnceMinute(Number(e.target.value))} aria-label="分钟">
-                    {MINUTES.map((m) => (
-                      <option key={m} value={m}>
-                        {pad(m)}
-                      </option>
-                    ))}
-                  </select>
-                  <select className={selectCls} value={onceSecond} onChange={(e) => setOnceSecond(Number(e.target.value))} aria-label="秒">
-                    {SECONDS.map((s) => (
-                      <option key={s} value={s}>
-                        {pad(s)}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-              {(schedKind === "daily" || schedKind === "workday" || schedKind === "weekly" || schedKind === "monthly" || (schedKind === "custom" && isTimedUnit(customUnit))) && (
-                <>
-                  <span className="text-sm text-ink2">于</span>
-                  <select className={selectCls} value={hour} onChange={(e) => setHour(Number(e.target.value))} aria-label="小时">
-                    {HOURS.map((h) => (
-                      <option key={h} value={h}>
-                        {pad(h)}
-                      </option>
-                    ))}
-                  </select>
-                  <select className={selectCls} value={minuteOfHour} onChange={(e) => setMinuteOfHour(Number(e.target.value))} aria-label="分钟">
-                    {MINUTES.map((m) => (
-                      <option key={m} value={m}>
-                        {pad(m)}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-              {schedKind === "custom" && (
-                <button
-                  type="button"
-                  className="rounded-lg border border-line px-3 py-2 text-sm text-ink2 transition hover:border-accent hover:text-ink"
-                  onClick={() => setCustomOpen(true)}
-                >
-                  自定义重复…<span className="ml-1.5 text-xs text-accent">{scheduleSummary}</span>
-                </button>
-              )}
-              <span className="ml-auto text-xs text-ink3">{scheduleSummary}</span>
-            </div>
-            <p className="text-xs text-ink3">
-              按本地时区（UTC{-TZ_OFFSET_MINUTES >= 0 ? "+" : ""}
-              {-TZ_OFFSET_MINUTES / 60}）调度；到点提醒会落进该伙伴的定时提醒会话。
-            </p>
+          {/* 调度选择器（创建/编辑共用组件，2026-09-30 任务编辑）：模板套用后 schedKey 重挂回显模板时刻 */}
+          <div className="mt-2">
+            <ScheduleFields key={schedKey} initial={draftTrigger ?? undefined} onChange={setDraftTrigger} />
           </div>
           {/* 模板按钮 = 服务端 BUILTIN_TASK_DEFS 单源投影（评审 2026-09-29 #13）：文案/时刻与种子同源，改指令只改 tasks.ts 一处 */}
           <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -558,59 +789,6 @@ export function Tasks({ unread, onUnreadChange }: { unread: number; onUnreadChan
         </div>
       )}
       {message && <p className="mb-4 text-sm text-ink3">{message}</p>}
-
-      {/* 自定义重复弹窗：每 N 天/周/月/年 + 结束条件（落 interval 触发器） */}
-      {customOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={() => setCustomOpen(false)}>
-          <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between">
-              <h3 className="text-[15px] font-semibold text-ink">自定义重复</h3>
-              <button className="text-lg leading-none text-ink3 transition hover:text-ink" onClick={() => setCustomOpen(false)} aria-label="关闭">
-                ×
-              </button>
-            </div>
-            <div className="mt-4 text-sm font-medium text-ink">重复频率</div>
-            <div className="mt-2 flex gap-2">
-              <input
-                type="number"
-                min={1}
-                className={`${inputCls} w-24`}
-                value={customEvery}
-                onChange={(e) => setCustomEvery(Number(e.target.value))}
-                aria-label="重复间隔"
-              />
-              <select className={`${inputCls} flex-1`} value={customUnit} onChange={(e) => setCustomUnit(e.target.value as CustomUnit)} aria-label="重复单位">
-                {CUSTOM_UNITS.map((u) => (
-                  <option key={u} value={u}>
-                    {UNIT_CHAR[u]}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="mt-4 text-sm font-medium text-ink">结束</div>
-            <div className="mt-2 space-y-2">
-              <label className="flex items-center gap-2 text-sm text-ink2">
-                <input type="radio" checked={customEnd === "never"} onChange={() => setCustomEnd("never")} /> 永不结束
-              </label>
-              <label className="flex items-center gap-2 text-sm text-ink2">
-                <input type="radio" checked={customEnd === "date"} onChange={() => setCustomEnd("date")} /> 指定日期
-              </label>
-              {customEnd === "date" && (
-                <input type="date" className={inputCls} value={customEndDate} onChange={(e) => setCustomEndDate(e.target.value)} />
-              )}
-            </div>
-            <div className="mt-4 flex items-center justify-between">
-              <span className="text-xs text-ink3">
-                {freqText(Math.max(1, Math.floor(customEvery) || 1), customUnit)}
-                {customEnd === "date" && customEndDate !== "" ? ` · 至 ${customEndDate}` : " · 永不结束"}
-              </span>
-              <button className="rounded-lg bg-accent2 px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => setCustomOpen(false)}>
-                确认
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* 统计行 */}
       <div className="mb-5 rounded-xl border border-line bg-surface px-4 py-3 text-sm text-ink2">

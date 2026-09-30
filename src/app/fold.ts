@@ -49,6 +49,10 @@ export interface TodayPlanView {
   /** 今天完成的确定性标记（评审 2026-09-29 #14）：周期型=今日打过卡；deadline 型=最新完成打卡在今天。
    * 与 done 的区别：deadline 的 done=doneEver（上周完成的打卡点 done=true 但 doneToday=false），模型/前端按它归因"今天的完成度" */
   doneToday: boolean;
+  /** 习惯计划（2026-09-30 习惯化）：配额与当前周期进度，成对出现。
+   * day=今日打卡次数；week/month/year=本期不同本地日数；done=进度 ≥ 配额（跨期自动清零重开） */
+  timesPerPeriod?: number;
+  periodCount?: number;
 }
 
 export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
@@ -75,21 +79,72 @@ export interface TodayView {
   top3: TopItem[];
 }
 
-/** 计划是否覆盖"今天"：scope 决定周期（创建 ts = 周期锚点） */
+/** 本地周键：该周周一的 dayKey（当地周一为一周之始） */
+function weekKey(ts: number, tzOffsetMinutes: number): number {
+  return dayKey(ts, tzOffsetMinutes) - ((localParts(ts, tzOffsetMinutes).weekday + 6) % 7);
+}
+
+/** at 是否落在 scope 的「当前周期」（习惯计划的计数窗口，2026-09-30 习惯化）：
+ *  day=同本地日；week=同周一键；month/year=同年月 */
+function inCurrentPeriod(scope: "day" | "week" | "month" | "year", at: number, now: number, tzOffsetMinutes: number): boolean {
+  switch (scope) {
+    case "day":
+      return dayKey(at, tzOffsetMinutes) === dayKey(now, tzOffsetMinutes);
+    case "week":
+      return weekKey(at, tzOffsetMinutes) === weekKey(now, tzOffsetMinutes);
+    case "month": {
+      const a = localParts(at, tzOffsetMinutes);
+      const b = localParts(now, tzOffsetMinutes);
+      return a.year === b.year && a.month === b.month;
+    }
+    case "year":
+      return localParts(at, tzOffsetMinutes).year === localParts(now, tzOffsetMinutes).year;
+  }
+}
+
+/** 习惯计划判定：带配额且周期可续（deadline/ndays 是一次性设计，入口拒绝配额；此处防御性排除）——
+ *  类型谓词：命中即 scope ∈ day/week/month/year 且 timesPerPeriod 存在 */
+export function isHabitPlan(plan: PlanRecord): plan is PlanRecord & { timesPerPeriod: number; scope: "day" | "week" | "month" | "year" } {
+  return (
+    plan.timesPerPeriod !== undefined &&
+    (plan.scope === "day" || plan.scope === "week" || plan.scope === "month" || plan.scope === "year")
+  );
+}
+
+/** 习惯计划当前周期进度：day=今日存活 done 打卡次数（"每天 8 杯水"按次）；
+ *  week/month/year=本期有存活 done 打卡的不同本地日数（"每周运动三天"按天） */
+export function habitPeriodCount(
+  plan: PlanRecord,
+  live: Array<FlowRecord | PlanRecord | CheckinRecord>,
+  now: number,
+  tzOffsetMinutes: number,
+): number {
+  if (!isHabitPlan(plan)) return 0; // 防御：非习惯计划无"本期进度"概念
+  if (plan.scope === "day") {
+    return live.filter(
+      (r): r is CheckinRecord =>
+        r.kind === "checkin" && r.done && r.planId === plan.planId && dayKey(r.at, tzOffsetMinutes) === dayKey(now, tzOffsetMinutes),
+    ).length;
+  }
+  const days = new Set<number>();
+  for (const r of live) {
+    if (r.kind !== "checkin" || !r.done || r.planId !== plan.planId) continue;
+    if (inCurrentPeriod(plan.scope, r.at, now, tzOffsetMinutes)) days.add(dayKey(r.at, tzOffsetMinutes));
+  }
+  return days.size;
+}
+
+/** 计划是否覆盖"今天"：scope 决定周期（创建 ts = 周期锚点）；
+ *  习惯计划（timesPerPeriod）跨周期续期，永远覆盖今天（2026-09-30 习惯化） */
 export function planScopeCoversToday(plan: PlanRecord, now: number, tzOffsetMinutes: number): boolean {
+  if (isHabitPlan(plan)) return true;
   const todayKey = dayKey(now, tzOffsetMinutes);
   const createdKey = dayKey(plan.ts, tzOffsetMinutes);
   switch (plan.scope) {
     case "day":
       return createdKey === todayKey;
-    case "week": {
-      // 当地周一为一周之始：周键 = 该周周一的 dayKey
-      const weekStartKey = (key: number, weekday: number) => key - ((weekday + 6) % 7);
-      return (
-        weekStartKey(createdKey, localParts(plan.ts, tzOffsetMinutes).weekday) ===
-        weekStartKey(todayKey, localParts(now, tzOffsetMinutes).weekday)
-      );
-    }
+    case "week":
+      return weekKey(plan.ts, tzOffsetMinutes) === weekKey(now, tzOffsetMinutes);
     case "month": {
       const a = localParts(plan.ts, tzOffsetMinutes);
       const b = localParts(now, tzOffsetMinutes);
@@ -155,12 +210,16 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
   const plans = live
     .filter((r): r is PlanRecord => r.kind === "plan" && (r.scope === "deadline" || planScopeCoversToday(r, now, tzOffsetMinutes)))
     .map((plan) => {
-      const doneToday = plan.scope === "deadline" ? doneEver.has(plan.planId) : checkinsToday.some((c) => c.planId === plan.planId);
-      const last = checkinsToday.filter((c) => c.planId === plan.planId).sort((a, b) => b.at - a.at)[0];
-      const state = stateOf(plan, doneToday);
+      const habit = isHabitPlan(plan);
+      const todayCheckins = checkinsToday.filter((c) => c.planId === plan.planId);
+      const periodCount = habit ? habitPeriodCount(plan, live, now, tzOffsetMinutes) : undefined;
+      const quotaMet = habit && (periodCount ?? 0) >= (plan.timesPerPeriod ?? 1);
+      const doneToday = habit ? quotaMet : plan.scope === "deadline" ? doneEver.has(plan.planId) : todayCheckins.length > 0;
+      const last = todayCheckins.sort((a, b) => b.at - a.at)[0];
+      const state = habit ? (quotaMet ? "done" : (periodCount ?? 0) > 0 ? "doing" : "todo") : stateOf(plan, doneToday);
       const lastDone = lastDoneAt.get(plan.planId);
-      // "今天完成"的确定性口径：周期型=state done（即今日有卡）；deadline 型=最新完成打卡落在今天
-      const doneTodayFlag = plan.scope === "deadline" ? lastDone !== undefined && dayKey(lastDone, tzOffsetMinutes) === todayK : doneToday;
+      // "今天完成"的确定性口径：习惯=今天有贡献卡；周期型=state done（即今日有卡）；deadline 型=最新完成打卡落在今天
+      const doneTodayFlag = habit ? todayCheckins.length > 0 : plan.scope === "deadline" ? lastDone !== undefined && dayKey(lastDone, tzOffsetMinutes) === todayK : doneToday;
       return {
         planId: plan.planId,
         title: plan.title,
@@ -169,6 +228,7 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         done: doneToday,
         ...(last !== undefined ? { checkinTs: last.at } : {}),
         state,
+        ...(habit ? { timesPerPeriod: plan.timesPerPeriod, periodCount } : {}),
         // 撤销口径（评审 2026-09-29 簇 A）：done 项都给可作废的打卡 seq——deadline 型=全部存活 done 打卡（doneEver），
         // 周期型=今日存活 done 打卡（撤销只退今天，不动历史）；追加 done:false 对两者都无效（CONTEXT.md 语义）
         ...(state === "done"
@@ -251,6 +311,8 @@ export interface TopItem {
   title: string;
   planId?: string;
   due?: string;
+  /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
+  progress?: string;
 }
 
 /** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成 */
@@ -281,6 +343,12 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
       if (doneEver.has(r.planId) || r.due === undefined) continue; // 已完成/无 due 不进
       if (r.due < todayStr) overdue.push(itemFor(r, "overdue"));
       else if (r.due === todayStr && !doneToday.has(r.planId)) dueToday.push(itemFor(r, "dueToday"));
+      continue;
+    }
+    // 习惯计划：本期配额未达 → 进"今天"桶并带进度；已达 → 不进（2026-09-30 习惯化）
+    if (isHabitPlan(r)) {
+      const count = habitPeriodCount(r, live, now, tzOffsetMinutes);
+      if (count < (r.timesPerPeriod ?? 1)) todayItems.push({ ...itemFor(r, "today"), progress: `${count}/${r.timesPerPeriod}` });
       continue;
     }
     if (planScopeCoversToday(r, now, tzOffsetMinutes) && !doneToday.has(r.planId)) todayItems.push(itemFor(r, "today"));

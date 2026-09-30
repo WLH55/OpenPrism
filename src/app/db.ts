@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   scope       TEXT,
   due         TEXT,
   ndays       INTEGER,
+  times_per_period INTEGER, -- 习惯计划：每周期目标数（day=每日次数；week/month/year=每期不同日数）。NULL=一次性本周期计划（2026-09-30 习惯化）
   checkin_plan_id TEXT,
   at          INTEGER,
   done        INTEGER,
@@ -147,7 +148,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_ts        INTEGER NOT NULL,
   last_run_ts       INTEGER,
   notify_channel    TEXT,
-  builtin           TEXT
+  builtin           TEXT,
+  customized        INTEGER NOT NULL DEFAULT 0 -- 内置任务指令已被用户改过（2026-09-30 任务编辑）：ensureBuiltins 单源同步跳过
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_uid ON tasks(uid, enabled);
 
@@ -447,6 +449,7 @@ export function ensureGoalKind(db: DatabaseSync): void {
       scope       TEXT,
       due         TEXT,
       ndays       INTEGER,
+      times_per_period INTEGER,
       checkin_plan_id TEXT,
       at          INTEGER,
       done        INTEGER,
@@ -518,6 +521,9 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "users", "color", "TEXT NOT NULL DEFAULT ''");
   ensureInterestKind(db); // 存量库 kind CHECK 补 interest（重建表，幂等）
   ensureGoalKind(db); // 存量库 kind CHECK 补 goal + goal 列（重建表，幂等，2026-09-28 B1）
+  // 习惯化 + 任务编辑新列（2026-09-30）：必须在 ensureGoalKind 之后——重建会 DROP 原表，先加的列会被带走
+  ensureColumn(db, "ledger_entries", "times_per_period", "INTEGER");
+  ensureColumn(db, "tasks", "customized", "INTEGER NOT NULL DEFAULT 0");
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }

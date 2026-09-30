@@ -136,6 +136,112 @@ describe("todayView 计划折叠", () => {
   });
 });
 
+describe("习惯计划折叠（2026-09-30 习惯化：timesPerPeriod）", () => {
+  const at = (month: number, day: number, hour = 4): number => Date.UTC(2026, month, day, hour); // 2026 年，04:00 UTC = 12:00 本地
+  // 9-28 是周一：本周 = 9-28..10-04，上周 = 9-21..9-27
+  const habitRun = { kind: "plan" as const, ts: at(8, 22), source: "ui" as const, planId: "run3", title: "每周运动三天", scope: "week" as const, timesPerPeriod: 3 };
+
+  it("按天计数（AC1/AC4）：同日两卡算 1 天，三个不同日打满 done；撤销口径=今日存活卡", () => {
+    const THU = at(8, 30, 4); // 周四 12:00 本地
+    const base = [
+      habitRun,
+      { kind: "checkin" as const, ts: at(8, 28, 5), source: "ui" as const, planId: "run3", at: at(8, 28, 5), done: true }, // 周一 13:00 本地
+      { kind: "checkin" as const, ts: at(8, 28, 6), source: "ui" as const, planId: "run3", at: at(8, 28, 6), done: true }, // 周一 14:00 本地（同日第二卡）
+      { kind: "checkin" as const, ts: at(8, 29, 5), source: "ui" as const, planId: "run3", at: at(8, 29, 5), done: true }, // 周二
+      { kind: "checkin" as const, ts: at(8, 30, 2), source: "ui" as const, planId: "run3", at: at(8, 30, 2), done: true }, // 周四上午（今天）
+    ];
+    const p = todayView(records(...base), THU, TZ).plans.find((x) => x.planId === "run3")!;
+    expect(p.timesPerPeriod).toBe(3);
+    expect(p.periodCount).toBe(3); // 周一（两卡算 1 天）+ 周二 + 周四
+    expect(p.state).toBe("done"); // 配额达成才算完成
+    expect(p.done).toBe(true);
+    expect(p.doneSeqs).toEqual([4]); // 撤销 = 今日存活卡 seq（seq 由 records 顺序编号：plan=0，卡=1..4）
+    // 撤销今天的卡 → 回到 2/3 进行中
+    const undone = todayView(records(...base, { kind: "void", ts: THU - 1000, source: "ui", targetSeq: 4 }), THU, TZ).plans.find((x) => x.planId === "run3")!;
+    expect(undone.state).toBe("doing");
+    expect(undone.periodCount).toBe(2);
+    expect(undone.done).toBe(false);
+  });
+
+  it("打 1 天=进行中 1/3、0 天=待做（AC1）：不因今天打过一次卡就显示已完成", () => {
+    const one = todayView(records(habitRun, { kind: "checkin", ts: NOW - 3600_000, source: "ui", planId: "run3", at: NOW - 3600_000, done: true }), NOW, TZ).plans.find((x) => x.planId === "run3")!;
+    expect(one.state).toBe("doing");
+    expect(one.periodCount).toBe(1);
+    expect(one.done).toBe(false);
+    expect(one.doneToday).toBe(true); // 今天有贡献卡（今日完成归因仍成立）
+    const zero = todayView(records(habitRun), NOW, TZ).plans.find((x) => x.planId === "run3")!;
+    expect(zero.state).toBe("todo");
+    expect(zero.periodCount).toBe(0);
+  });
+
+  it("跨周自动清零重开（AC1）：上周打满，本周一回到 0/3 待做；上周的卡不算新周期；计划不淡出", () => {
+    const NEXT_MON = at(9, 5, 4); // 10-05 周一 12:00 本地
+    const view = todayView(
+      records(
+        habitRun,
+        { kind: "checkin", ts: at(8, 28, 5), source: "ui", planId: "run3", at: at(8, 28, 5), done: true }, // 上周一
+        { kind: "checkin", ts: at(8, 29, 5), source: "ui", planId: "run3", at: at(8, 29, 5), done: true }, // 上周二
+        { kind: "checkin", ts: at(8, 30, 5), source: "ui", planId: "run3", at: at(8, 30, 5), done: true }, // 上周四（上周已打满）
+      ),
+      NEXT_MON,
+      TZ,
+    );
+    const p = view.plans.find((x) => x.planId === "run3")!;
+    expect(p).toBeDefined(); // 习惯跨周期续期——不像一次性 week 计划那样过周淡出
+    expect(p.periodCount).toBe(0); // 旧卡归旧周期
+    expect(p.state).toBe("todo");
+    expect(p.done).toBe(false);
+  });
+
+  it("day 配额按打卡次数（AC4）：同日两卡各算一次；旧 day 习惯永远覆盖今天（跨周期续期）", () => {
+    const water = { kind: "plan" as const, ts: at(8, 18), source: "ui" as const, planId: "water2", title: "每天喝两杯", scope: "day" as const, timesPerPeriod: 2 }; // 上上周创建
+    const view = todayView(
+      records(
+        water,
+        { kind: "checkin" as const, ts: NOW - 86400_000, source: "ui" as const, planId: "water2", at: NOW - 86400_000, done: true }, // 昨天的卡不算今天
+        { kind: "checkin" as const, ts: NOW - 7200_000, source: "ui" as const, planId: "water2", at: NOW - 7200_000, done: true },
+        { kind: "checkin" as const, ts: NOW - 3600_000, source: "ui" as const, planId: "water2", at: NOW - 3600_000, done: true },
+      ),
+      NOW,
+      TZ,
+    );
+    const p = view.plans.find((x) => x.planId === "water2")!;
+    expect(p).toBeDefined(); // 创建于上上周的 day 习惯今天仍在视图（无 timesPerPeriod 的旧 day 计划早淡出了）
+    expect(p.periodCount).toBe(2); // 今天两卡 = 2/2
+    expect(p.state).toBe("done");
+    expect(p.doneSeqs).toEqual([2, 3]); // 撤销退今天的两张卡
+  });
+
+  it("无 timesPerPeriod 的周期计划保持旧语义（AC2 回归锚）：上周的 week 计划本周不再出现", () => {
+    const NEXT_MON = at(9, 5, 4);
+    const view = todayView(records({ kind: "plan", ts: at(8, 22), source: "ui", planId: "once-week", title: "上周的周计划", scope: "week" }), NEXT_MON, TZ);
+    expect(view.plans.some((p) => p.planId === "once-week")).toBe(false); // 一次性本周期计划照旧过期淡出
+    const top = top3(records({ kind: "plan", ts: at(8, 22), source: "ui", planId: "once-week", title: "上周的周计划", scope: "week" }), NEXT_MON, TZ);
+    expect(top).toEqual([]);
+  });
+
+  it("top3：习惯未达配额进今天桶带进度，打满即出列（AC1）", () => {
+    const THU = at(8, 30, 4);
+    const partial = top3(
+      records(habitRun, { kind: "checkin", ts: at(8, 29, 5), source: "ui", planId: "run3", at: at(8, 29, 5), done: true }),
+      THU,
+      TZ,
+    );
+    expect(partial).toEqual([{ kind: "today", title: "每周运动三天", planId: "run3", progress: "1/3" }]);
+    const met = top3(
+      records(
+        habitRun,
+        { kind: "checkin", ts: at(8, 28, 5), source: "ui", planId: "run3", at: at(8, 28, 5), done: true },
+        { kind: "checkin", ts: at(8, 29, 5), source: "ui", planId: "run3", at: at(8, 29, 5), done: true },
+        { kind: "checkin", ts: at(8, 30, 2), source: "ui", planId: "run3", at: at(8, 30, 2), done: true },
+      ),
+      THU,
+      TZ,
+    );
+    expect(met).toEqual([]); // 3/3 已达 → 不再催
+  });
+});
+
 describe("goal 持久化（历史数据休眠保留，2026-09-30 下线）", () => {
   it("roundtrip：历史 goal 行/带 goalId 的 plan 重开账本字段完整——Ledger.open 读服务器真实数据不炸", async () => {
     const db = openDb(":memory:");
