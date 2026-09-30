@@ -524,6 +524,31 @@ export function openDb(dbPath: string): DatabaseSync {
   // 习惯化 + 任务编辑新列（2026-09-30）：必须在 ensureGoalKind 之后——重建会 DROP 原表，先加的列会被带走
   ensureColumn(db, "ledger_entries", "times_per_period", "INTEGER");
   ensureColumn(db, "tasks", "customized", "INTEGER NOT NULL DEFAULT 0");
+  migrateTaskFeedCid(db); // 提醒会话 cid 补 uid（存量改名，幂等，2026-09-30）
   db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
+}
+
+/**
+ * 提醒会话 cid 历史格式 feed:<agentId|default> 不含 uid：cid 是 conversations 全表主键，
+ * 多用户下跨用户冲突——第二个用户首次触发任务时 INSERT OR IGNORE 被主键静默忽略，
+ * 回查得 undefined 直接崩溃（task_runs 全数 failed，2026-09-30 生产事故）。
+ * 一次性改名为 feed:<uid>:<agentId|default>；conversation_events.cid 同步搬移（事件表无外键，
+ * 两步 UPDATE 包一个事务）。uid/agentId 均为 UUID 不含冒号，GLOB 'feed:*:*' 区分新旧格式。幂等。
+ */
+export function migrateTaskFeedCid(db: DatabaseSync): void {
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      UPDATE conversation_events SET cid = (
+        SELECT 'feed:' || c.uid || ':' || COALESCE(c.agent_id, 'default') FROM conversations c WHERE c.cid = conversation_events.cid
+      ) WHERE cid IN (SELECT cid FROM conversations WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*');
+      UPDATE conversations SET cid = 'feed:' || uid || ':' || COALESCE(agent_id, 'default')
+      WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*';
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
