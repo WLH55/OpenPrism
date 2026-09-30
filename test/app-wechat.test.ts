@@ -296,6 +296,33 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     expect(await fixture.bridge.pushToWechat(UID, "再推")).toBe(false);
   });
 
+  it("pushToWechat：带最近入站消息的 contextToken（落库，重启不丢）——主动推送不再赌空串（2026-09-30 ret=-2 实锤）", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "好的。" }]);
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
+    fixture.iLink.on(
+      (url) => url.endsWith("/ilink/bot/getupdates"),
+      () => ({
+        ret: 0,
+        errcode: 0,
+        get_updates_buf: "cur-a",
+        msgs: [{ message_id: 31, from_user_id: "wxuser-1", message_type: 1, item_list: [{ type: 1, text_item: { text: "在吗" } }], context_token: "ctx-31" }],
+      }),
+    );
+    await bindActive(fixture);
+    await fixture.bridge.pollOnce(UID); // 入站一条 → contextToken 落库
+    expect(fixture.db.prepare("SELECT last_context_token FROM wechat_binds WHERE uid = ?").get(UID)).toMatchObject({ last_context_token: "ctx-31" });
+
+    expect(await fixture.bridge.pushToWechat(UID, "【喝水】该喝水了")).toBe(true);
+    const push = JSON.parse(fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!.init?.body ?? "{}").msg;
+    expect(push.context_token).toBe("ctx-31"); // 任务推送挂上入站上下文，而非空串
+
+    // 重启模拟：新桥实例同库——token 不丢，推送继续可用
+    const reborn = new WechatBridge({ env: envOf(fixture.iLink.fetch), db: fixture.db, masterKey: fixture.masterKey, conversations: fixture.conversations, notifications: fixture.notifications, now: NOW });
+    expect(await reborn.pushToWechat(UID, "重启后")).toBe(true);
+    const push2 = JSON.parse(fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!.init?.body ?? "{}").msg;
+    expect(push2.context_token).toBe("ctx-31");
+  });
+
   it("startAll：重启后恢复 active 绑定轮询；expired 不启；解绑即停", async () => {
     const fixture = makeFixture([{ kind: "text", text: "用不到" }]);
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
