@@ -731,6 +731,40 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     expect(row2.periodCount).toBe(1); // 打卡跨修订保留（planId 稳定）
   });
 
+  it("数据导出（2026-09-30 SDD）：JSON 全量附件含账本与会话事件；MD 时间线含日期分组与对话轮次；未登录 401", async () => {
+    // AC3：未登录被全局闸拦下
+    expect((await fetch(`${baseUrl}/api/export/data.json`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/export/data.md`)).status).toBe(401);
+
+    // AC1：JSON 全量下载——attachment 头 + 账本记录 + 会话事件（此前批次落的数据都在）
+    const jsonRes = await fetch(`${baseUrl}/api/export/data.json`, { headers: { cookie } });
+    expect(jsonRes.status).toBe(200);
+    expect(jsonRes.headers.get("content-disposition")).toContain("attachment");
+    expect(jsonRes.headers.get("content-disposition")).toContain("openprism-export-");
+    const parsed = (await jsonRes.json()) as {
+      exportedAt: string;
+      ledger: { kind: string }[];
+      conversations: { cid: string; events: { type: string }[] }[];
+    };
+    expect(parsed.exportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(parsed.ledger.length).toBeGreaterThan(0);
+    expect(parsed.ledger.some((r) => r.kind === "plan")).toBe(true);
+    expect(parsed.conversations.length).toBeGreaterThan(0);
+    expect(parsed.conversations.some((c) => c.events.some((e) => e.type === "user/message"))).toBe(true);
+
+    // AC2：MD 人读时间线
+    const mdRes = await fetch(`${baseUrl}/api/export/data.md`, { headers: { cookie } });
+    expect(mdRes.status).toBe(200);
+    expect(mdRes.headers.get("content-type")).toContain("text/markdown");
+    const md = await mdRes.text();
+    expect(md).toContain("# OpenPrism 数据导出");
+    expect(md).toContain("## 生活记录");
+    expect(md).toMatch(/### \d{4}-\d{2}-\d{2} 周./); // 日期分组标题（含星期）
+    expect(md).toContain("## 对话记录");
+    expect(md).toContain("**用户**");
+    expect(md).toContain("**助手**");
+  });
+
   it("notifications：手动跑产出未读→全部已读", async () => {
     let unreadBefore: unknown[] = [];
     for (let i = 0; i < 40; i++) {
