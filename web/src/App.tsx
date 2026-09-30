@@ -3,6 +3,7 @@ import { api, api3, type ConversationEntry, type MeLoose } from "./api";
 import { Profile } from "./pages/Profile";
 import { FaceAvatar } from "./components/FaceEditor";
 import { LightboxHost } from "./lightbox";
+import { VersionWatch } from "./version-watch";
 import { Login } from "./pages/Login";
 import { Chat } from "./pages/Chat";
 import { Today } from "./pages/Today";
@@ -446,6 +447,7 @@ export function App() {
 
   return (
     <LightboxHost>
+      <VersionWatch />
       <Shell
         me={me}
         onFaceSaved={setMe}
