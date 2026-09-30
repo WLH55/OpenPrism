@@ -19,6 +19,9 @@ function ledger(): LedgerRecord[] {
     { seq: 4, ts: NOW - 30000, source: "ui", kind: "void", targetSeq: 3, reason: "记错" }, // 作废上面的流水
     { seq: 5, ts: NOW - 20000, source: "ui", kind: "goal", goalId: "g1", level: "direction", title: "历史方向", status: "active" }, // 休眠 goal 行
     { seq: 6, ts: NOW - 10000, source: "ui", kind: "event", time: NOW - 10000, category: "运动", note: "跑步", value: 30, unit: "分钟" }, // 存活流水
+    { seq: 7, ts: NOW - 9000, source: "ui", kind: "plan", planId: "gone", title: "已作废计划的打卡", scope: "day" },
+    { seq: 8, ts: NOW - 8500, source: "ui", kind: "checkin", planId: "gone", at: NOW - 8500, done: true },
+    { seq: 9, ts: NOW - 8000, source: "ui", kind: "void", targetSeq: 7, reason: "不做了" }, // 作废计划本身——打卡行保留但计划行不进 MD
   ];
 }
 
@@ -41,7 +44,7 @@ describe("buildExportJson", () => {
       conversations: { cid: string; title: string; events: unknown[] }[];
     };
     expect(parsed.exportedAt).toBe("2026-09-28T17:00:00.000Z");
-    expect(parsed.ledger).toHaveLength(7); // 一条不少——含 void 与休眠 goal
+    expect(parsed.ledger).toHaveLength(10); // 一条不少——含 void 与休眠 goal
     expect(parsed.ledger.some((r) => r.kind === "void")).toBe(true);
     expect(parsed.ledger.some((r) => r.kind === "goal")).toBe(true);
     expect(parsed.conversations[0]!.cid).toBe("c-1");
@@ -57,6 +60,8 @@ describe("buildExportMarkdown", () => {
     expect(md).toContain("建计划：每周运动三天（每周 3 天）"); // 习惯配额（D13 口径）
     expect(md).toContain("建计划：交周报（截止 2026-10-04）");
     expect(md).toContain("打卡 ✓ 每周运动三天");
+    expect(md).toContain("打卡 ✓ 已作废计划的打卡"); // 被作废计划的打卡仍显示其标题（只作显示引用，不复活计划行）
+    expect(md).not.toContain("建计划：已作废计划的打卡"); // 计划本体已作废——建计划行不进人读版
     expect(md).toContain("运动 30分钟｜跑步"); // 存活流水
     expect(md).not.toContain("午餐"); // 被作废的流水不进人读版
     expect(md).not.toContain("记错"); // void reason 同理
