@@ -14,18 +14,17 @@ import { Memory } from "./pages/Memory";
 import { Tasks } from "./pages/Tasks";
 import { Panels } from "./pages/Panels";
 import { Progress } from "./pages/Progress";
-import { NotifyChannels } from "./pages/NotifyChannels";
 import { IM } from "./pages/IM";
 import { BottomTabs, Drawer } from "./components/MobileNav";
 import { RepoLinkBar } from "./components/RepoLink";
 import {
   AgentsIcon, CategoryIcon, ChatIcon, ChevronDownIcon, ImIcon, LogoutIcon, MemoryIcon,
-  MenuIcon, ModelIcon, MoonIcon, NotifyIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
+  MenuIcon, ModelIcon, MoonIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
 } from "./icons";
 
 export type View =
   | "chat" | "today" | "category" | "progress"
-  | "agents" | "agent-edit" | "task" | "skills" | "memory" | "model" | "notify" | "im" | "profile";
+  | "agents" | "agent-edit" | "task" | "skills" | "memory" | "model" | "im" | "profile";
 
 function toggleTheme(): void {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -50,14 +49,13 @@ function viewTitle(view: View): string {
     case "skills": return "技能 / MCP";
     case "memory": return "长期记忆";
     case "model": return "模型接入";
-    case "notify": return "通知通道";
     case "im": return "IM 通道";
     case "profile": return "个人资料";
   }
 }
 
 /** 「更多」标签高亮条件：抽屉开着，或当前页是抽屉专属页 */
-const MORE_VIEWS: View[] = ["category", "agents", "agent-edit", "task", "skills", "memory", "model", "notify", "im", "profile"]; // 2026-09-28 B3：盘面从底部栏下架，归入更多
+const MORE_VIEWS: View[] = ["category", "agents", "agent-edit", "task", "skills", "memory", "model", "im", "profile"]; // 2026-09-28 B3：盘面从底部栏下架，归入更多
 
 interface SidebarProps {
   me: MeLoose;
@@ -221,7 +219,6 @@ function SidebarContent({
             {menuItem("skills", "技能 / MCP", SkillsIcon)}
             {menuItem("memory", "长期记忆", MemoryIcon)}
             {menuItem("model", "模型接入", ModelIcon)}
-            {menuItem("notify", "通知通道", NotifyIcon)}
             {menuItem("im", "IM 通道", ImIcon)}
             <div className="mx-3 my-1 border-t border-line" />
             <button
@@ -397,7 +394,6 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
               {view === "skills" && <Skills />}
               {view === "memory" && <Memory />}
               {view === "model" && <Settings />}
-              {view === "notify" && <NotifyChannels />}
               {view === "im" && <IM />}
               {view === "profile" && <Profile me={me} onSaved={onFaceSaved} />}
             </div>
