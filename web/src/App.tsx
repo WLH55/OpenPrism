@@ -17,6 +17,7 @@ import { Progress } from "./pages/Progress";
 import { NotifyChannels } from "./pages/NotifyChannels";
 import { IM } from "./pages/IM";
 import { BottomTabs, Drawer } from "./components/MobileNav";
+import { RepoLinkBar } from "./components/RepoLink";
 import {
   AgentsIcon, CategoryIcon, ChatIcon, ChevronDownIcon, ImIcon, LogoutIcon, MemoryIcon,
   MenuIcon, ModelIcon, MoonIcon, NotifyIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
@@ -197,7 +198,8 @@ function SidebarContent({
         </div>
       </div>
 
-      {/* 左下角：个人头像下拉 */}
+      {/* 左下角：GitHub 开源入口 + 个人头像下拉 */}
+      <RepoLinkBar />
       <div className="relative px-3 pb-4" ref={avatarRef}>
         <button
           onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}

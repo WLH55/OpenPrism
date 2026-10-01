@@ -59,10 +59,12 @@ const json = (body: unknown): { method: string; headers: Record<string, string>;
   body: JSON.stringify(body),
 });
 
+// beforeAll 装配、用例复用（注册上限用例另起 maxUsers 实例共用同一份 deps）
+let serverDeps: Parameters<typeof createAppServer>[0];
+
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "op-app-server-"));
   const masterKey = Buffer.alloc(32, 3);
-
   const { adapter } = createMockLlmAdapter([
     {
       kind: "tool-calls",
@@ -108,7 +110,7 @@ beforeAll(async () => {
     db,
   );
 
-  const serverDeps = {
+  serverDeps = {
     env: nodeEnv,
     db,
     masterKey,
@@ -180,6 +182,29 @@ describe("HTTP API", () => {
     expect(dup.status).toBe(409);
     const bad = await fetch(`${baseUrl}/api/auth/login`, json({ username: "lathan", password: "wrong!!" }));
     expect(bad.status).toBe(401);
+  });
+
+  it("注册上限（maxUsers）：达到即 403 引导自部署/联系作者，老用户登录不受影响；未配置 = 不限制", async () => {
+    // 复用同一份 deps 起第二个实例：现有 1 个用户（lathan），maxUsers=1 → 已满
+    const capped = createAppServer({ ...serverDeps, maxUsers: 1 });
+    await new Promise<void>((resolve) => capped.listen(0, "127.0.0.1", resolve));
+    const cappedUrl = `http://127.0.0.1:${(capped.address() as { port: number }).port}`;
+    try {
+      const full = await fetch(`${cappedUrl}/api/auth/register`, json({ username: "newcomer", password: "hunter2" }));
+      expect(full.status).toBe(403);
+      const body = (await full.json()) as { error: string };
+      expect(body.error).toContain("注册用户已达上限");
+      expect(body.error).toContain("https://github.com/WLH55/OpenPrism");
+      expect(body.error).toContain("联系作者");
+      // 已有用户不受影响：登录照常
+      const still = await fetch(`${cappedUrl}/api/auth/login`, json({ username: "lathan", password: "hunter2" }));
+      expect(still.status).toBe(200);
+      // 未配置 maxUsers 的原实例 = 不限制
+      const open = await fetch(`${baseUrl}/api/auth/register`, json({ username: "spare-seat", password: "hunter2" }));
+      expect(open.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => capped.close(() => resolve()));
+    }
   });
 
   it("聊天闭环：建会话→发消息→Turn 完成→今天页出现该笔流水（折叠 0 token）", async () => {

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import { Prism } from "../icons";
+import { RepoLinkInline } from "../components/RepoLink";
 
 /** 登录/注册：居中品牌区 + 分段切换，结构照 prototype 页 1 */
 export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }) {
@@ -107,7 +108,8 @@ export function Login({ onLoggedIn }: { onLoggedIn: (username: string) => void }
         </button>
       </form>
 
-      <p className="mt-6 text-center text-xs text-ink3">数据只存在你自己的设备上 · 模型 Key 由你自己配置</p>
+      <RepoLinkInline />
+      <p className="mt-3 text-center text-xs text-ink3">数据只存在你自己的设备上 · 模型 Key 由你自己配置</p>
     </div>
   );
 }

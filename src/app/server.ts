@@ -47,6 +47,8 @@ export interface ServerDeps {
   masterKey: Buffer;
   /** 启动时载入、注册时追加的共享用户表（键 = username） */
   users: Map<string, UserRecord>;
+  /** 注册用户数上限（2026-10-01 公开自部署防滥用）：达到即拒新注册（403 引导自部署/联系作者）；缺省 = 不限制 */
+  maxUsers?: number;
   /** uid 二级索引（可选；认证查询免线性扫描） */
   usersByUid?: Map<string, UserRecord>;
   sessions: SessionStore;
@@ -261,6 +263,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
     if (password.length < 6) return sendError(res, 400, "password 至少 6 位");
     if (deps.users.has(username)) return sendError(res, 409, "username already taken");
+    if (deps.maxUsers !== undefined && deps.users.size >= deps.maxUsers) {
+      return sendError(res, 403, `注册用户已达上限（${deps.maxUsers} 个），暂时无法注册新账号。如需体验：可到 GitHub 下载源码本地部署使用（https://github.com/WLH55/OpenPrism ），或联系作者为你开放注册。`);
+    }
     const uid = deps.env.randomUUID();
     const user: UserRecord = { uid, username, password: await hashPassword(password), createdTs: deps.env.now() };
     appendUser(deps.db, user);

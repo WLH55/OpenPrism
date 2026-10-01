@@ -30,6 +30,9 @@ async function main(): Promise<void> {
   const dataRoot = resolve(process.env.OP_DATA ?? "./data");
   const port = Number(process.env.OP_PORT ?? 8787);
   const dbFile = process.env.OP_DB ? resolve(process.env.OP_DB) : appPaths(dataRoot).dbFile;
+  // 注册上限（2026-10-01）：默认 50 防公开滥用；OP_MAX_USERS=0/负数 = 不限制（自部署放开用）
+  const maxUsersRaw = Number(process.env.OP_MAX_USERS ?? 50);
+  const maxUsers = Number.isFinite(maxUsersRaw) && maxUsersRaw > 0 ? Math.floor(maxUsersRaw) : undefined;
   await mkdir(dataRoot, { recursive: true });
 
   const db = openDb(dbFile);
@@ -41,6 +44,9 @@ async function main(): Promise<void> {
 
   const masterKey = await loadOrCreateMasterKey(dataRoot, appPaths(dataRoot).secretKeyFile);
   const users = await loadUsers(db);
+  if (maxUsers !== undefined && users.size >= maxUsers) {
+    process.stdout.write(`[openprism] 现有用户 ${users.size} 已达注册上限 ${maxUsers}，新注册将被拒绝（OP_MAX_USERS 可调）\n`);
+  }
   const usersByUid = new Map([...users.values()].map((u) => [u.uid, u]));
   const sessions = new SessionStore(db, () => Date.now());
 
@@ -187,6 +193,7 @@ async function main(): Promise<void> {
     db,
     masterKey,
     users,
+    ...(maxUsers !== undefined ? { maxUsers } : {}),
     usersByUid,
     sessions,
     conversations,

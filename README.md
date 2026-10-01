@@ -116,7 +116,7 @@ pnpm start         # 启动，默认 http://127.0.0.1:8787
 | `OP_PORT` | `8787` | HTTP 监听端口 |
 | `OP_DATA` | `./data` | 数据目录（主密钥 `secret.key` 落在这里） |
 | `OP_DB` | `{OP_DATA}/openprism.db` | SQLite 数据库文件路径 |
-
+| `OP_MAX_USERS` | `50` | 注册用户数上限（公开自部署防滥用）；`0` = 不限制 |
 手机（同一 Wi-Fi）直接访问 `http://<电脑局域网地址>:8787`；部署到服务器与公网端口映射见 [docs/deployment.md](./docs/deployment.md)。
 
 ```bash
