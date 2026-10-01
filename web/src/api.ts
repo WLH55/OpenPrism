@@ -185,7 +185,11 @@ export const api = {
     request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
   activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
-  testModel: (id: string) => request<{ ok: boolean; error?: string }>(`/api/models/${id}/test`, { method: "POST" }),
+  // 连接测试客户端也设兜底超时（服务端 45s 中断之外，网络层挂起时浏览器侧 60s 必出结果，页面不再干等）
+  testModel: (id: string) => request<{ ok: boolean; error?: string }>(`/api/models/${id}/test`, { method: "POST", signal: AbortSignal.timeout(60_000) }),
+  /** 表单草稿测试（未保存也能测）：Key 留空且 editingId 有值时，服务端沿用该行已存 Key */
+  testModelDraft: (draft: { baseURL: string; model: string; apiKey?: string; kind?: string; editingId?: string | null }) =>
+    request<{ ok: boolean; error?: string }>("/api/models/test", { method: "POST", body: JSON.stringify(draft), signal: AbortSignal.timeout(60_000) }),
 
   listConversations: () => request<ConversationEntry[]>("/api/conversations"),
   createConversation: (title?: string) =>

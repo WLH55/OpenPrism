@@ -805,6 +805,16 @@ export function migrateLegacyMemory(db: DatabaseSync, deps: { now(): number; ran
   const flag = db.prepare("SELECT value FROM meta WHERE key = 'memory_v2_migrated'").get() as { value: string } | undefined;
   if (flag) return;
 
+  // 无旧表（schema v2 起不再建；老库由 dropLegacyTables 删）：新库无历史可迁，直接落标记
+  // （水位线由现行管线自管），否则下面的 SELECT 会撞不存在的表
+  const legacy = db
+    .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('l2_entries','memory_slots')")
+    .get() as { n: number };
+  if (legacy.n === 0) {
+    db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('memory_v2_migrated', ?)").run(String(deps.now()));
+    return;
+  }
+
   const now = deps.now();
   const insertItem = db.prepare(
     `INSERT INTO memory_items (uid, id, kind, status, origin, topic, norm_key, content, importance, source_ref, valid_from)

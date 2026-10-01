@@ -6,7 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const SCHEMA_VERSION = 1;
+// 2（2026-10-01）：删遗留七表（L1/L2/L3 旧记忆六表 + model_config），存量库由 dropLegacyTables 收尾
+export const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -184,22 +185,14 @@ CREATE TABLE IF NOT EXISTS wechat_binds (
   bound_ts      INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memory_slots (
-  uid        TEXT NOT NULL,
-  slot       TEXT NOT NULL CHECK (slot IN ('recent','profile','scope','preferences')),
-  content_md TEXT NOT NULL DEFAULT '',
-  updated_ts INTEGER,
-  PRIMARY KEY (uid, slot)
-);
-
 CREATE TABLE IF NOT EXISTS memory_meta (
   uid         TEXT PRIMARY KEY,
   last_run_ts INTEGER,
   runs        INTEGER NOT NULL DEFAULT 0
 );
 
--- 记忆条目化（2026-09-10，WeKnora 化重构 Spec §6.1）：条目 = 唯一真相，supersede 链不物理删除；
--- 旧 L1/L2/L3 六表（l1_entities/l1_changes/l2_entries/l2_meta/l3_meta/memory_slots）代码零引用，仅为回滚保留。
+-- 记忆条目化（2026-09-10，WeKnora 化重构 Spec §6.1）：条目 = 唯一真相，supersede 链不物理删除。
+-- 旧 L1/L2/L3 六表已删（2026-10-01，dropLegacyTables）；老库升级时 migrateLegacyMemory 先吸收后删表。
 -- kind 增 interest（2026-09-18 主题计数晋升）；存量库 CHECK 无 interest，由 ensureInterestKind 重建表迁移。
 CREATE TABLE IF NOT EXISTS memory_items (
   uid           TEXT NOT NULL,
@@ -248,66 +241,7 @@ CREATE TABLE IF NOT EXISTS memory_topic_stats (
   PRIMARY KEY (uid, normalized_key)
 );
 
--- 记忆三层（2026-09-07，对齐 DeepTutor）：L1 实时镜像快照 + 变更日志；L2 每模块事实 + seen 门控；L3 槽增量 meta。
-CREATE TABLE IF NOT EXISTS l1_entities (
-  uid         TEXT NOT NULL,
-  surface     TEXT NOT NULL CHECK (surface IN ('chat','ledger','tasks')),
-  ref         TEXT NOT NULL,
-  label       TEXT NOT NULL DEFAULT '',
-  ts          INTEGER NOT NULL DEFAULT 0,
-  fingerprint TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (uid, surface, ref)
-);
-CREATE INDEX IF NOT EXISTS idx_l1_surface ON l1_entities(uid, surface);
-
-CREATE TABLE IF NOT EXISTS l1_changes (
-  uid     TEXT NOT NULL,
-  surface TEXT NOT NULL,
-  id      INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind    TEXT NOT NULL CHECK (kind IN ('added','modified','removed')),
-  ref     TEXT NOT NULL,
-  label   TEXT NOT NULL DEFAULT '',
-  ts      INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_l1_changes_surface ON l1_changes(uid, surface, id);
-
-CREATE TABLE IF NOT EXISTS l2_entries (
-  uid        TEXT NOT NULL,
-  surface    TEXT NOT NULL CHECK (surface IN ('chat','ledger','tasks')),
-  id         TEXT NOT NULL,
-  section    TEXT NOT NULL DEFAULT '',
-  text       TEXT NOT NULL,
-  refs_json  TEXT NOT NULL DEFAULT '[]',
-  created_ts INTEGER NOT NULL,
-  updated_ts INTEGER,
-  PRIMARY KEY (uid, surface, id)
-);
-CREATE INDEX IF NOT EXISTS idx_l2_surface ON l2_entries(uid, surface, created_ts);
-
-CREATE TABLE IF NOT EXISTS l2_meta (
-  uid            TEXT NOT NULL,
-  surface        TEXT NOT NULL,
-  seen_refs_json TEXT NOT NULL DEFAULT '[]',
-  last_update_ts INTEGER,
-  PRIMARY KEY (uid, surface)
-);
-
-CREATE TABLE IF NOT EXISTS l3_meta (
-  uid            TEXT NOT NULL,
-  slot           TEXT NOT NULL CHECK (slot IN ('recent','profile','scope','preferences')),
-  seen_json      TEXT NOT NULL DEFAULT '[]',
-  last_update_ts INTEGER,
-  PRIMARY KEY (uid, slot)
-);
-
-CREATE TABLE IF NOT EXISTS model_config (
-  uid      TEXT PRIMARY KEY,
-  base_url TEXT NOT NULL DEFAULT '',
-  model    TEXT NOT NULL DEFAULT '',
-  key_enc  TEXT
-);
-
--- 多模型接入（2026-09-07）：model_providers 多行 + model_active 激活指针；model_config 仅作旧数据迁移源。
+-- 多模型接入（2026-09-07）：model_providers 多行 + model_active 激活指针；旧单表 model_config 已删（2026-10-01）。
 CREATE TABLE IF NOT EXISTS model_providers (
   id             TEXT PRIMARY KEY,
   uid            TEXT NOT NULL,
@@ -529,7 +463,8 @@ export function openDb(dbPath: string): DatabaseSync {
   ensureColumn(db, "wechat_binds", "last_context_token", "TEXT");
   ensureColumn(db, "wechat_binds", "last_msg_ts", "INTEGER");
   migrateTaskFeedCid(db); // 提醒会话 cid 补 uid（存量改名，幂等，2026-09-30）
-  db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
+  // REPLACE 而非 IGNORE：schema_version 声明「当前 schema 版本」，升级（如 v2 删遗留表）后跟随代码刷新
+  db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }
 
@@ -548,11 +483,30 @@ export function migrateTaskFeedCid(db: DatabaseSync): void {
         SELECT 'feed:' || c.uid || ':' || COALESCE(c.agent_id, 'default') FROM conversations c WHERE c.cid = conversation_events.cid
       ) WHERE cid IN (SELECT cid FROM conversations WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*');
       UPDATE conversations SET cid = 'feed:' || uid || ':' || COALESCE(agent_id, 'default')
-      WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*';
+        WHERE cid LIKE 'feed:%' AND cid NOT GLOB 'feed:*:*';
     `);
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+/**
+ * 遗留表清理（2026-10-01，schema v2）：旧记忆六表（l1_entities/l1_changes/l2_entries/l2_meta/
+ * l3_meta/memory_slots）+ 单模型 model_config 已无代码读写，DROP 收尾。
+ * 幂等（IF EXISTS，中断最坏删一半、下次启动续删）。
+ * 必须在 migrateLegacyMemory / migrateLegacyModelConfig 之后调用——老库升级先吸收数据再删表，
+ * 顺序由 main.ts 装配保证。
+ */
+export function dropLegacyTables(db: DatabaseSync): void {
+  db.exec(`
+    DROP TABLE IF EXISTS l1_entities;
+    DROP TABLE IF EXISTS l1_changes;
+    DROP TABLE IF EXISTS l2_entries;
+    DROP TABLE IF EXISTS l2_meta;
+    DROP TABLE IF EXISTS l3_meta;
+    DROP TABLE IF EXISTS memory_slots;
+    DROP TABLE IF EXISTS model_config;
+  `);
 }

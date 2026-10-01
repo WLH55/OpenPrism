@@ -39,6 +39,7 @@ import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type M
 import type { MemoryExtractor } from "./memory-extract";
 import { forgetTopic, listUnpromotedTopics, promoteTopicManually, restoreTopic } from "./memory-topics";
 import type { WechatBridge } from "./wechat-bridge";
+import { gatewayExtraHeaders, timeoutSignal, MODEL_TEST_TIMEOUT_MS } from "./provider-gateways";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -57,6 +58,10 @@ export interface ServerDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** 连接测试：默认用当前配置发一次 1-token 非流式请求；测试注入 fake（零网络） */
   modelTester?(uid: string, config: ModelConfig | null): Promise<void>;
+  /** 连接测试总时长（挂起端点到点中断，报「连接超时」）；缺省 45s；测试注入小值 */
+  modelTestTimeoutMs?: number;
+  /** embedding 连接测试（按配置直测，不落库）：已保存行与表单草稿共用；测试注入 fake（零网络） */
+  embeddingConfigTester?(config: ModelConfig, timeoutMs: number): Promise<void>;
   /** 记忆提取/整理用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（extract 返回 409）；测试注入 mock */
   adapterFor?(uid: string): Promise<{ adapter: LlmAdapter; model: string } | null>;
   /** embedding 提供方连接测试（发一次最小 embed 请求）；测试注入 fake（零网络） */
@@ -197,13 +202,26 @@ async function defaultModelTester(deps: ServerDeps, uid: string, config: ModelCo
     baseURL: config.baseURL,
     apiKey: config.keyEnc ? open(deps.masterKey, config.keyEnc) : "",
     stream: false,
+    extraHeaders: gatewayExtraHeaders(config.baseURL, `openprism:test:${uid}`),
   });
-  await adapter.complete({
-    provider: "byok",
-    model: config.model,
-    system: "",
-    messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "ping" }] }],
-  });
+  // 挂起端点（连不上/黑洞/代理不放行）到点中断，别让前端干等到浏览器自己断
+  const guard = timeoutSignal(deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS);
+  try {
+    await adapter.complete(
+      {
+        provider: "byok",
+        model: config.model,
+        system: "",
+        messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "ping" }] }],
+      },
+      { signal: guard.signal },
+    );
+  } catch (error) {
+    if (guard.timedOut()) throw new Error(`连接超时（${Math.round((deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS) / 1000)}s 无响应）`);
+    throw error;
+  } finally {
+    guard.cleanup();
+  }
 }
 
 function setSecurityHeaders(res: ServerResponse): void {
@@ -391,6 +409,32 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return sendJson(res, 200, { id: created.id });
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  // 表单草稿连接测试（2026-10-01）：填一半就能测，不落库；Key 留空且在编辑已有行时沿用已存 Key
+  if (path === "/api/models/test" && method === "POST") {
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; kind?: unknown; editingId?: string };
+    try {
+      const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
+      validateBaseURL(baseURL);
+      const model = String(body.model ?? "").trim();
+      if (model === "") throw new Error("model 必填");
+      const kind = parseProviderKind(body.kind) ?? "chat";
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+      let keyEnc: string | undefined;
+      if (apiKey !== "") keyEnc = seal(deps.masterKey, apiKey);
+      else if (body.editingId) keyEnc = readModelProviderConfig(deps.db, uid, body.editingId)?.keyEnc;
+      const config: ModelConfig = { baseURL, model, kind, ...(keyEnc !== undefined ? { keyEnc } : {}) };
+      if (kind === "embedding") {
+        if (!deps.embeddingConfigTester) return sendError(res, 409, "embedding_tester_unavailable");
+        await deps.embeddingConfigTester(config, deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS);
+      } else {
+        const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
+        await tester(uid, config);
+      }
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      return sendJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error).slice(0, 300) });
     }
   }
   const modelsMatch = /^\/api\/models\/([^/]+)(\/[^/]*)?$/.exec(path);

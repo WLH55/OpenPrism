@@ -11,6 +11,7 @@ const PLATFORM_PATTERNS: [RegExp, string][] = [
   [/bigmodel\.cn|zhipu/i, "智谱 GLM"],
   [/dashscope|aliyuncs/i, "通义千问 Qwen"],
   [/moonshot/i, "Moonshot Kimi"],
+  [/opencode\.ai/i, "OpenCode Go"],
   [/openrouter/i, "OpenRouter"],
   [/openai\.com/i, "OpenAI"],
   [/siliconflow/i, "硅基流动"],
@@ -60,6 +61,9 @@ const MODEL_PRESETS: ModelPreset[] = [
   { id: "siliconflow", label: "硅基流动", baseURL: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3.2", contextWindow: null, desc: "DeepSeek / Qwen / GLM 开源模型托管；窗口因模型而异" },
   { id: "nvidia", label: "NVIDIA NIM", baseURL: "https://integrate.api.nvidia.com/v1", model: "meta/llama-3.3-70b-instruct", contextWindow: null, desc: "NIM 托管的开源模型" },
   { id: "novita", label: "Novita AI", baseURL: "https://api.novita.ai/openai/v1", model: "moonshotai/kimi-k2.5", contextWindow: null, desc: "kimi-k2.5 / glm-5 / minimax-m2.7 等" },
+  // OpenCode Go（订阅制聚合网关）：须带 x-opencode-session 头（服务端已自动处理）；仅 OpenAI 兼容型号可用，
+  // qwen/minimax 走 Anthropic 端点的型号不支持；模型清单见 https://opencode.ai/zen/go/v1/models
+  { id: "opencode", label: "OpenCode Go", baseURL: "https://opencode.ai/zen/go/v1", model: "kimi-k3", contextWindow: null, desc: "kimi-k3 / glm-5.3 / deepseek-v4-pro（OpenAI 兼容型号；需订阅，Key 填其访问令牌）" },
   { id: "litellm", label: "LiteLLM 代理", baseURL: "http://localhost:4000/v1", model: "", contextWindow: null, desc: "自托管统一网关（请把占位 URL 换成你的代理地址）" },
   { id: "ollama", label: "本地 Ollama", baseURL: "http://localhost:11434/v1", model: "", contextWindow: null, desc: "本机 Ollama 的 OpenAI 兼容端点；窗口按拉取的模型填" },
 ];
@@ -85,6 +89,9 @@ export function Settings() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  // 连接测试用独立 pending 态（不动 busy）：测试是慢请求，不能把整页按钮都锁死——之前那样页面看着就「卡住」了
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [formTesting, setFormTesting] = useState(false);
   const [memoryConfig, setMemoryConfig] = useState<{ interestThreshold: number; embeddingProviderId: string | null }>({ interestThreshold: 3, embeddingProviderId: null });
 
   const reload = () => {
@@ -209,7 +216,7 @@ export function Settings() {
   };
 
   const test = async (id: string) => {
-    setBusy(true);
+    setTestingId(id);
     setMessage(null);
     try {
       const result = await api.testModel(id);
@@ -217,7 +224,27 @@ export function Settings() {
     } catch (e) {
       setMessage({ ok: false, text: `连接失败：${(e as Error).message}` });
     } finally {
-      setBusy(false);
+      setTestingId(null);
+    }
+  };
+
+  // 表单草稿测试：不保存即可测当前填的 baseURL/模型/Key；编辑时 Key 留空 = 服务端沿用已存 Key
+  const testDraft = async () => {
+    setFormTesting(true);
+    setMessage(null);
+    try {
+      const result = await api.testModelDraft({
+        baseURL: form.baseURL.trim(),
+        model: form.model.trim(),
+        apiKey: form.apiKey.trim(),
+        kind: form.kind,
+        ...(form.editingId !== null ? { editingId: form.editingId } : {}),
+      });
+      setMessage(result.ok ? { ok: true, text: "连接成功（尚未保存，保存后生效）" } : { ok: false, text: `连接失败：${result.error ?? "未知错误"}` });
+    } catch (e) {
+      setMessage({ ok: false, text: `连接失败：${(e as Error).message}` });
+    } finally {
+      setFormTesting(false);
     }
   };
 
@@ -264,11 +291,11 @@ export function Settings() {
             <div className="flex shrink-0 gap-1.5">
               <button
                 type="button"
-                disabled={busy}
+                disabled={testingId !== null}
                 className="rounded-lg border border-accent px-2.5 py-1.5 text-xs font-medium text-accent transition hover:bg-accent3 disabled:opacity-60"
                 onClick={() => void test(p.id)}
               >
-                测试连接
+                {testingId === p.id ? "测试中…" : "测试连接"}
               </button>
               <button
                 type="button"
@@ -466,6 +493,14 @@ export function Settings() {
             </button>
             <button
               type="button"
+              disabled={formTesting || form.baseURL.trim() === "" || form.model.trim() === ""}
+              className="rounded-lg border border-accent px-4 py-2.5 text-[15px] font-medium text-accent transition hover:bg-accent3 disabled:opacity-60"
+              onClick={() => void testDraft()}
+            >
+              {formTesting ? "测试中…" : "测试连接"}
+            </button>
+            <button
+              type="button"
               disabled={busy}
               className="rounded-lg border border-line bg-surface px-4 py-2.5 text-[15px] font-medium text-ink transition hover:bg-surface2 disabled:opacity-60"
               onClick={closeForm}
@@ -473,6 +508,7 @@ export function Settings() {
               取消
             </button>
           </div>
+          <p className="text-xs text-ink3">先测再存：编辑时 Key 留空则用该行已存 Key 测。</p>
         </form>
       )}
 

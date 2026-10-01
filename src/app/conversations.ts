@@ -38,8 +38,9 @@ export interface ConversationDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** providerId 缺省/null = 跟随用户全局激活模型 */
   modelConfigFor(uid: string, providerId?: string | null): Promise<ModelConfig | null>;
-  /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行） */
-  adapterFactory(uid: string, providerId: string | null, config: ModelConfig): LlmAdapter;
+  /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行）。
+   *  sessionKey = 会话稳定标识（聊天 cid / `task:<taskId>`），OpenCode Go 等网关按它带 x-opencode-session 头 */
+  adapterFactory(uid: string, providerId: string | null, config: ModelConfig, sessionKey?: string): LlmAdapter;
   now(): number;
   /** 用户档案时区（分钟，UTC+local；2026-09-29 起按会话 uid 读——浏览器上报/个人资料页可改）；缺省按服务器本地时区 */
   tzOffsetMinutes?(uid: string): number;
@@ -347,7 +348,7 @@ export class ConversationStore {
     try {
       const config = await this.deps.modelConfigFor(uid, providerId);
       if (!config) throw new ModelNotConfiguredError();
-      const adapter = this.deps.adapterFactory(uid, providerId, config);
+      const adapter = this.deps.adapterFactory(uid, providerId, config, `title:${cid}`);
       const response = await adapter.complete({
         provider: "title",
         model: config.model,
@@ -492,7 +493,7 @@ export class ConversationStore {
     return createAgent({
       env,
       sessionLog,
-      adapter: this.deps.adapterFactory(uid, providerId, config),
+      adapter: this.deps.adapterFactory(uid, providerId, config, conversationId),
       model: {
         provider: "byok",
         model: config.model,

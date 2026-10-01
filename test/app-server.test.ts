@@ -21,6 +21,7 @@ import { NotificationStore } from "../src/app/notify";
 import { SqliteSessionLog } from "../src/app/session-log";
 import type { TaskDef, TaskRunTrigger } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
+import { open } from "../src/app/secretbox";
 import { WechatBridge } from "../src/app/wechat-bridge";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
@@ -1239,5 +1240,101 @@ describe("微信桥路由（2026-09-27 iLink 绑定）", () => {
     expect(((await (await fetch(`${baseUrl}/api/wechat/bind/agent`, { headers: { cookie } })).json()) as { agentId: string | null }).agentId).toBeNull();
 
     expect((await put("aid-nope")).status).toBe(404);
+  });
+});
+
+describe("模型连接测试（表单草稿 /api/models/test + 挂起端点超时，2026-10-01）", () => {
+  /** 起一台按需改写 deps 的临时实例（同 db/会话，cookie 通用） */
+  const spin = async (patch: Record<string, unknown>): Promise<{ url: string; close: () => Promise<void> }> => {
+    const server = createAppServer({ ...serverDeps, ...patch } as Parameters<typeof createAppServer>[0]);
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    return {
+      url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+      close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
+    };
+  };
+  const post = (url: string, body: unknown) =>
+    fetch(`${url}/api/models/test`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(body) });
+
+  it("未保存草稿直测：配置与密封 Key 传给 tester（OpenCode Go 场景）；编辑留空沿用已存 Key", async () => {
+    const captured: { uid: string; config: import("../src/app/secretbox").ModelConfig | null }[] = [];
+    const instance = await spin({
+      modelTester: async (uid: string, config: import("../src/app/secretbox").ModelConfig | null) => {
+        captured.push({ uid, config });
+      },
+    });
+    try {
+      // 新草稿带 Key：baseURL/model 原样到达 tester，Key 以密封态传入、可解出明文
+      const draft = await post(instance.url, { baseURL: "https://opencode.ai/zen/go/v1", model: "kimi-k3", apiKey: "sk-draft" });
+      expect(((await draft.json()) as { ok: boolean }).ok).toBe(true);
+      expect(captured).toHaveLength(1);
+      const me = (await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json()) as { uid: string };
+      expect(captured[0]!.uid).toBe(me.uid);
+      expect(captured[0]!.config?.baseURL).toBe("https://opencode.ai/zen/go/v1");
+      expect(captured[0]!.config?.model).toBe("kimi-k3");
+      expect(open(serverDeps.masterKey, captured[0]!.config?.keyEnc ?? "")).toBe("sk-draft");
+
+      // 编辑已有行、Key 留空 → 沿用该行已存 Key（与保存语义一致）
+      const add = (await (await fetch(`${baseUrl}/api/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", cookie },
+        body: JSON.stringify({ baseURL: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "sk-stored" }),
+      })).json()) as { id: string };
+      const editDraft = await post(instance.url, { baseURL: "https://api.deepseek.com", model: "deepseek-chat", editingId: add.id });
+      expect(((await editDraft.json()) as { ok: boolean }).ok).toBe(true);
+      expect(captured).toHaveLength(2);
+      expect(open(serverDeps.masterKey, captured[1]!.config?.keyEnc ?? "")).toBe("sk-stored");
+
+      // 校验失败也回 200 + ok:false（连接测试端点的错误语义），不落库
+      const before = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { providers: unknown[] };
+      const badUrl = await post(instance.url, { baseURL: "ftp://bad", model: "x" });
+      expect(((await badUrl.json()) as { ok: boolean; error?: string }).error).toContain("baseURL");
+      const noModel = await post(instance.url, { baseURL: "https://ok.example.com/v1", model: "" });
+      expect(((await noModel.json()) as { ok: boolean; error?: string }).error).toContain("model");
+      const after = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { providers: unknown[] };
+      expect(after.providers).toHaveLength(before.providers.length);
+
+      await fetch(`${baseUrl}/api/models/${add.id}`, { method: "DELETE", headers: { cookie } });
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it("embedding 草稿：走 embeddingConfigTester（按配置直测），不碰 modelTester", async () => {
+    const embedCaptured: { baseURL: string; model: string }[] = [];
+    let chatCalls = 0;
+    const instance = await spin({
+      modelTester: async () => {
+        chatCalls += 1;
+      },
+      embeddingConfigTester: async (config: import("../src/app/secretbox").ModelConfig) => {
+        embedCaptured.push({ baseURL: config.baseURL, model: config.model });
+      },
+    });
+    try {
+      const res = await post(instance.url, { baseURL: "https://e.example.com/v1", model: "emb-1", kind: "embedding", apiKey: "sk-e" });
+      expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+      expect(embedCaptured).toEqual([{ baseURL: "https://e.example.com/v1", model: "emb-1" }]);
+      expect(chatCalls).toBe(0);
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it("挂起端点：总时长兜底到点中断，报「连接超时」而非让前端无限等", async () => {
+    // fetch 永不返回，仅在 abort 时拒绝（模拟连不上/黑洞端点）；超时注入 30ms（小真实延迟）
+    const hangingFetch = (_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+      });
+    const instance = await spin({ modelTester: undefined, modelTestTimeoutMs: 30, env: { ...nodeEnv, fetch: hangingFetch as unknown as typeof nodeEnv.fetch } });
+    try {
+      const res = await post(instance.url, { baseURL: "https://hang.example.com/v1", model: "m" });
+      const body = (await res.json()) as { ok: boolean; error?: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toContain("连接超时");
+    } finally {
+      await instance.close();
+    }
   });
 });

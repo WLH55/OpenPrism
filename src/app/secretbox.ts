@@ -1,4 +1,4 @@
-// BYOK Key 密封（Q8 铁律的技术面）：Key 只以 AES-256-GCM 密文落盘（model_config 表的 key_enc），
+// BYOK Key 密封（Q8 铁律的技术面）：Key 只以 AES-256-GCM 密文落盘（model_providers 表的 key_enc），
 // 明文只在内存中短暂存在、只发往用户配置的 baseURL。主密钥 32B 落 data/secret.key（已 gitignore，不入库——
 // 钥匙不锁在保险箱里）。
 
@@ -73,6 +73,7 @@ const PLATFORM_PATTERNS: [RegExp, string][] = [
   [/bigmodel\.cn|zhipu/i, "智谱 GLM"],
   [/dashscope|aliyuncs/i, "通义千问 Qwen"],
   [/moonshot/i, "Moonshot Kimi"],
+  [/opencode\.ai/i, "OpenCode Go"],
   [/openrouter/i, "OpenRouter"],
   [/openai\.com/i, "OpenAI"],
   [/siliconflow/i, "硅基流动"],
