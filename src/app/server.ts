@@ -264,7 +264,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (password.length < 6) return sendError(res, 400, "password 至少 6 位");
     if (deps.users.has(username)) return sendError(res, 409, "username already taken");
     if (deps.maxUsers !== undefined && deps.users.size >= deps.maxUsers) {
-      return sendError(res, 403, `注册用户已达上限（${deps.maxUsers} 个），暂时无法注册新账号。如需体验：可到 GitHub 下载源码本地部署使用（https://github.com/WLH55/OpenPrism ），或联系作者为你开放注册。`);
+      return sendError(res, 403, "注册用户已达上限，暂时无法注册新账号。如需体验：可到 GitHub 下载源码本地部署使用（https://github.com/WLH55/OpenPrism ），或联系作者为你开放注册。");
     }
     const uid = deps.env.randomUUID();
     const user: UserRecord = { uid, username, password: await hashPassword(password), createdTs: deps.env.now() };
