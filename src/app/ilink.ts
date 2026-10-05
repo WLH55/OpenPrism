@@ -21,6 +21,14 @@ export class ILinkTokenExpiredError extends Error {
   }
 }
 
+/** ret=-2（errmsg=prepare failed）：推送所挂的上下文已过期（2026-10-06 真机实证）——用户在微信里发条消息即可刷新 context_token 恢复 */
+export class ILinkContextStaleError extends Error {
+  constructor(detail: string) {
+    super(`ilink context stale（ret=-2）: ${detail}`);
+    this.name = "ILinkContextStaleError";
+  }
+}
+
 export interface ILinkCredentials {
   botToken: string;
   ilinkBotId: string;
@@ -180,6 +188,8 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
       };
       // 2026-09-28 真机排障：HTTP 200 不等于送达——业务码必须检查，否则静默丢单（WeKnora 原版也不查，属共同盲区）
       if (raw.errcode === -14) throw new ILinkTokenExpiredError();
+      // ret=-2 = 上下文过期（2026-10-06）：主动推送必须挂在用户最近消息的 context_token 上，窗口约 12–14h（社区逆向口径）
+      if (raw.ret === -2) throw new ILinkContextStaleError(String(raw.errmsg ?? ""));
       if ((raw.ret ?? 0) !== 0 || (raw.errcode ?? 0) !== 0) {
         throw new Error(`ilink sendmessage ret=${raw.ret} errcode=${raw.errcode}: ${String(raw.errmsg ?? "").slice(0, 200)}`);
       }

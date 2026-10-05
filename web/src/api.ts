@@ -494,6 +494,8 @@ export interface WechatBindState {
   bound: boolean;
   state: "active" | "expired";
   ilinkBotId?: string;
+  /** 上次用户消息时刻（ms；2026-10-06 健康度）——缺省 = 绑定后从未对话，主动推送不可用 */
+  lastMsgTs?: number;
 }
 
 export const apiIm = {

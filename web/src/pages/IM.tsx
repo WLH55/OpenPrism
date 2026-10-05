@@ -8,6 +8,48 @@ import { CloseIcon } from "../icons";
 
 type ScanPhase = "idle" | "waiting" | "scaned" | "expired";
 
+// 上下文窗口阈值（2026-10-06）：与服务端 WECHAT_CONTEXT_THRESHOLDS 同口径（社区逆向实测 12–14h 取中）
+const CONTEXT_WARN_MS = 11 * 3600_000;
+const CONTEXT_STALE_MS = 13 * 3600_000;
+
+/** 推送通道健康度四态：微信要求主动推送挂在你最近的回复上，约 12 小时无回复会暂停（回一句话即恢复） */
+function contextHealth(lastMsgTs: number | undefined, now: number): { kind: "never" | "fresh" | "soon" | "stale"; label: string; chip: string; hint: string } {
+  if (lastMsgTs === undefined) {
+    return {
+      kind: "never",
+      label: "未对话",
+      chip: "bg-surface2 text-ink3",
+      hint: "你还没在微信里给机器人发过消息——主动推送需要挂在你的消息上，先发一条，定时任务才推得到。",
+    };
+  }
+  const age = now - lastMsgTs;
+  if (age < CONTEXT_WARN_MS) {
+    const h = Math.floor(age / 3600_000);
+    return {
+      kind: "fresh",
+      label: "通道新鲜",
+      chip: "bg-accent3 text-accent",
+      hint: `上次你的消息在 ${h} 小时前，推送正常。收到提醒时随手回一个字，通道就不会断。`,
+    };
+  }
+  if (age < CONTEXT_STALE_MS) {
+    const h = Math.floor(age / 3600_000);
+    return {
+      kind: "soon",
+      label: "窗口将过期",
+      chip: "bg-warm2 text-warm",
+      hint: `距你上次回复已 ${h} 小时（微信窗口约 12–14 小时）——现在回一句话，到点的提醒才不会断。`,
+    };
+  }
+  const h = Math.floor(age / 3600_000);
+  return {
+    kind: "stale",
+    label: "已过期",
+    chip: "bg-warm2 text-warm",
+    hint: `已约 ${h} 小时没有你的回复，机器人暂时推不出消息——在微信里随便回一句，推送立即恢复。`,
+  };
+}
+
 export function IM() {
   const [state, setState] = useState<WechatBindState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -119,6 +161,7 @@ export function IM() {
 
   const bound = state?.bound === true && state.state === "active";
   const expired = state?.bound === true && state.state === "expired";
+  const health = bound && state !== null ? contextHealth(state.lastMsgTs, Date.now()) : null;
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-6">
@@ -157,6 +200,16 @@ export function IM() {
                 <div className="text-sm text-ink2">
                   机器人 ID：<span className="font-mono text-xs text-ink3">{state.ilinkBotId}</span>
                 </div>
+                {/* 推送通道健康度（2026-10-06）：微信主动推送挂在用户最近回复上，约 12h 无回复会断 */}
+                {health !== null && (
+                  <div className="rounded-lg bg-surface2/60 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-ink2">推送通道</span>
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${health.chip}`}>{health.label}</span>
+                    </div>
+                    <div className="mt-1 text-xs leading-relaxed text-ink3">{health.hint}</div>
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-3">
                   <span className="shrink-0 text-sm text-ink2">对话伙伴</span>
                   <select
@@ -222,6 +275,7 @@ export function IM() {
       <p className="mt-5 text-xs leading-relaxed text-ink3">
         通道走腾讯 iLink Bot 官方接口（WeKnora 同款）：扫码授权、纯出站连接（无需公网回调）。
         登录凭证失效时轮询自动停下，站内会收到重新绑定的提醒。
+        微信限制：机器人的主动推送要挂在你最近的回复上，约 12 小时无回复会暂停——上方会显示通道健康度，收到提醒时随手回一个字即可保持畅通。
       </p>
 
       {/* 扫码弹层：二维码 + 实时状态 */}

@@ -8,12 +8,36 @@ import type { PlatformEnv } from "../harness/index";
 import type { ConversationStore } from "./conversations";
 import type { NotificationStore } from "./notify";
 import { open, seal } from "./secretbox";
-import { createILinkClient, ILinkTokenExpiredError, type ILinkClient, type ILinkCredentials, type ILinkInboundMessage } from "./ilink";
+import {
+  createILinkClient,
+  ILinkContextStaleError,
+  ILinkTokenExpiredError,
+  type ILinkClient,
+  type ILinkCredentials,
+  type ILinkInboundMessage,
+} from "./ilink";
 
 export const WECHAT_FEED_CID = (uid: string): string => `wechat:${uid}`;
 const WECHAT_FEED_TITLE = "微信对话";
 /** 回复单条上限（防御性；iLink 无公开文档，WeKnora 通知侧截 500） */
 const REPLY_MAX_CHARS = 4000;
+
+/** 上下文窗口阈值（2026-10-06，社区逆向口径 12–14h 取中）：warn=推送开始内嵌回复提醒，stale=大概率已推不出去。
+ * web IM 页健康度展示用同一组口径（web/src/pages/IM.tsx 以同值常量对齐）。 */
+export const WECHAT_CONTEXT_THRESHOLDS = { warnMs: 11 * 3600_000, staleMs: 13 * 3600_000 };
+
+/** 推送内嵌保活提醒（AC6 纯函数）：距上次用户消息 ≥ warnMs 时在推送文本末尾追加一句回复引导，合计不超 500 字符防御上限 */
+export function withContextNudge(text: string, lastMsgTs: number | undefined, now: number): string {
+  if (lastMsgTs === undefined || now - lastMsgTs < WECHAT_CONTEXT_THRESHOLDS.warnMs) return text.slice(0, 500);
+  const nudge = "\n\n——顺带一提：微信约 12 小时内没你的回复，就不让我主动发消息了；随手回一个字，之后的提醒就不会断。";
+  return `${text.slice(0, 500 - nudge.length)}${nudge}`;
+}
+
+/** 推送结局（2026-10-06 失败可见化）：失败原因分类供调用方给出可操作指引——
+ * unbound=未绑定（用户本无期待，静默）；rebind=绑定失效（重新扫码）；stale-context=窗口过期（回句话即恢复）；error=其他 */
+export type WechatPushOutcome =
+  | { delivered: true }
+  | { delivered: false; reason: "unbound" | "rebind" | "stale-context" | "error"; message?: string };
 
 interface WechatBindRow {
   uid: string;
@@ -93,10 +117,15 @@ export class WechatBridge {
     this.deps.db.prepare("DELETE FROM wechat_binds WHERE uid = ?").run(uid);
   }
 
-  status(uid: string): { bound: boolean; state: "active" | "expired"; ilinkBotId?: string } {
+  status(uid: string): { bound: boolean; state: "active" | "expired"; ilinkBotId?: string; lastMsgTs?: number } {
     const bind = this.readBind(uid);
     if (!bind) return { bound: false, state: "active" };
-    return { bound: true, state: bind.state, ilinkBotId: bind.ilink_bot_id };
+    return {
+      bound: true,
+      state: bind.state,
+      ilinkBotId: bind.ilink_bot_id,
+      ...(bind.last_msg_ts != null ? { lastMsgTs: bind.last_msg_ts } : {}),
+    };
   }
 
   /** 「微信对话」会话当前绑定的伙伴（2026-09-28 增补）：null = 默认助手；会话未建也视为 null */
@@ -256,18 +285,22 @@ export class WechatBridge {
 
   // ── 主动推送（任务通知） ────────────────────────────────
 
-  /** 推文本到绑定微信；未绑定/过期/失败 → false（调用方静默退站内）。
+  /** 推文本到绑定微信；未绑定/失败 → 分类结局（调用方按 reason 给用户可操作提示）。
    * 上下文 = 最近入站消息的 contextToken（2026-09-30）：iLink 主动推送必须挂在用户消息的上下文上，
    * 空串只在服务端恰好还有新鲜会话时侥幸放行——从不依赖运气，没存过就空串试一次，失败退站内。 */
-  async pushToWechat(uid: string, text: string): Promise<boolean> {
+  async pushToWechat(uid: string, text: string): Promise<WechatPushOutcome> {
     const bind = this.readBind(uid);
-    if (!bind || bind.state !== "active") return false;
+    if (!bind) return { delivered: false, reason: "unbound" };
+    if (bind.state !== "active") return { delivered: false, reason: "rebind" }; // 绑过但已过期：重新扫码
     try {
       await this.client.sendMessage(bind.botToken, bind.ilink_user_id, bind.last_context_token ?? "", text.slice(0, 500));
-      return true;
+      return { delivered: true };
     } catch (error) {
-      console.error("[wechat] 任务通知推送失败（静默退站内）:", error instanceof Error ? error.message : error);
-      return false;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("[wechat] 任务通知推送失败（静默退站内）:", message);
+      if (error instanceof ILinkTokenExpiredError) return { delivered: false, reason: "rebind", message };
+      if (error instanceof ILinkContextStaleError) return { delivered: false, reason: "stale-context", message };
+      return { delivered: false, reason: "error", message };
     }
   }
 }

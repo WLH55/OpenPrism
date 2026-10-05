@@ -52,6 +52,8 @@ export interface ConversationDeps {
   memoryVector?: MemoryVectorLike;
   /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
   tasks?: TaskStoreLike;
+  /** 微信绑定状态源（A4，2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报绑定真相；缺省不回报 */
+  wechatStatus?(uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
   /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
   onTurnDone?(uid: string): void;
 }
@@ -483,6 +485,8 @@ export class ConversationStore {
           now,
           // 触发时刻按用户钟面解释（评审 2026-09-29 #17）
           tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
+          // 微信绑定真相（A4 2026-10-06）：模型不再猜「绑没绑」
+          ...(this.deps.wechatStatus ? { wechatStatus: (uidRun: string) => this.deps.wechatStatus!(uidRun) } : {}),
         }),
       );
     }

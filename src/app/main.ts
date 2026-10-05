@@ -22,7 +22,7 @@ import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extra
 import { createMemoryVector } from "./memory-vector";
 import { Scheduler, TaskStore, taskTriggerMessage, type TaskDef, type TaskRunTrigger } from "./tasks";
 import { NotificationStore } from "./notify";
-import { WechatBridge } from "./wechat-bridge";
+import { WechatBridge, withContextNudge } from "./wechat-bridge";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 import { gatewayExtraHeaders, timeoutSignal, MODEL_TEST_TIMEOUT_MS } from "./provider-gateways";
@@ -126,6 +126,8 @@ async function main(): Promise<void> {
       memory,
       memoryVector,
       tasks,
+      // 微信绑定真相（A4 2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报；桥在下方构建，回调惰性求值无 TDZ 问题
+      wechatStatus: (uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number } => wechat.status(uid),
       onTurnDone: (uidTurn) => memoryExtractor.notify(uidTurn),
     },
     db,
@@ -140,7 +142,10 @@ async function main(): Promise<void> {
   // 助手回复直接落在会话里；同时落一条站内通知兜底（提醒页徽标）。
   // 投给模型的是触发上下文（自动触发说明 + 任务内容 + 重复规则 + 计划/触发时刻），不是光秃秃一句指令——
   // 否则模型把到点指令当成用户刚说的话，回头反问"每天还是今天一次、几点提醒"。
-  // 任务级通知渠道（2026-09-27）：选微信机器人 = 站内记录之上加推；未绑定/过期/失败静默退站内，任务不失败。
+  // 任务级通知渠道（2026-09-27）：选微信机器人 = 站内记录之上加推；未绑定静默退站内，任务不失败。
+  // 失败可见化（2026-10-06）：绑定过但推送失败 → 12h 去重的站内提醒（进程内 Map，重启丢一次可接受），
+  // 文案按原因给可操作指引；推送文本自身在上下文临近过期（≥11h 无用户消息）时内嵌一句回复引导。
+  const wechatPushWarnedAt = new Map<string, number>();
   const taskRunner = async (uidRun: string, task: TaskDef, run: TaskRunTrigger): Promise<void> => {
     const feed = await conversations.ensureTaskFeed(uidRun, task.agentId);
     const agent = await conversations.agent(uidRun, feed.id);
@@ -154,7 +159,25 @@ async function main(): Promise<void> {
         : "（任务已执行，无文本输出）";
     await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: text.slice(0, 500) });
     if (task.notifyChannel === "wechat") {
-      await wechat.pushToWechat(uidRun, `【${task.title}】${text}`.slice(0, 500));
+      const bind = wechat.status(uidRun);
+      const outcome = await wechat.pushToWechat(uidRun, withContextNudge(`【${task.title}】${text}`.slice(0, 480), bind.lastMsgTs, Date.now()));
+      if (!outcome.delivered && outcome.reason !== "unbound") {
+        const now = Date.now();
+        if (now - (wechatPushWarnedAt.get(uidRun) ?? 0) >= 12 * 3600_000) {
+          wechatPushWarnedAt.set(uidRun, now);
+          const hint =
+            outcome.reason === "stale-context"
+              ? `⚠️ 微信推送失败（对话窗口过期）：「${task.title}」只落了站内。在微信里给机器人随便回一句话，之后的推送就会恢复。`
+              : outcome.reason === "rebind"
+                ? "⚠️ 微信推送失败：微信绑定已过期——到「IM 通道」页重新扫码即可恢复。"
+                : `⚠️ 微信推送失败（${outcome.message ?? "未知原因"}）——这条提醒已落站内。`;
+          try {
+            await notifications.push(uidRun, { kind: "wechat_push_failed", text: hint });
+          } catch {
+            // 站内提醒尽力而为
+          }
+        }
+      }
     }
   };
 
