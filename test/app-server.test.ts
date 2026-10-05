@@ -738,16 +738,20 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
   });
 
   it("习惯计划 HTTP（2026-09-30 习惯化，AC1/AC3）：POST /api/plans 带配额落账、today 视图带进度；非法值与一次性 scope 400；PUT 修订配额", async () => {
-    const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
+    // 独立新用户（2026-10-06 修日期敏感）：top3 按用户算且容量只有 3——共用用户的旧 deadline 计划
+    // （写死 10-04/10-05）过了日期变逾期后会把习惯挤出 top3，断言随日历漂移；新用户账本干净、永不受前序用例残留影响
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "habit-fresh", password: "hunter2" }));
+    const habitCookie = (reg.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie: habitCookie } });
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 0 })).status).toBe(400);
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 1.5 })).status).toBe(400);
     expect((await postPlan({ title: "坏配额", scope: "deadline", due: "2026-10-10", timesPerPeriod: 3 })).status).toBe(400);
     const habit = (await (await postPlan({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 })).json()) as { planId: string };
 
     // 打一次卡 → today 视图 1/3 进行中（tz=480 本地口径）
-    await fetch(`${baseUrl}/api/checkin`, { ...json({ planId: habit.planId, done: true }), headers: { "Content-Type": "application/json", cookie } });
+    await fetch(`${baseUrl}/api/checkin`, { ...json({ planId: habit.planId, done: true }), headers: { "Content-Type": "application/json", cookie: habitCookie } });
     const todayOf = async () =>
-      (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as {
+      (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie: habitCookie } })).json()) as {
         plans: { planId: string; state: string; timesPerPeriod?: number; periodCount?: number }[];
         top3: { planId?: string; progress?: string }[];
       };
@@ -759,7 +763,7 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     const updated = await fetch(`${baseUrl}/api/plans/${habit.planId}`, {
       ...json({ timesPerPeriod: 4 }),
       method: "PUT",
-      headers: { "Content-Type": "application/json", cookie },
+      headers: { "Content-Type": "application/json", cookie: habitCookie },
     });
     expect(updated.status).toBe(200);
     const row2 = (await todayOf()).plans.find((p) => p.planId === habit.planId)!;
