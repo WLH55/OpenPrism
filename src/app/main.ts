@@ -164,7 +164,6 @@ async function main(): Promise<void> {
       if (!outcome.delivered && outcome.reason !== "unbound") {
         const now = Date.now();
         if (now - (wechatPushWarnedAt.get(uidRun) ?? 0) >= 12 * 3600_000) {
-          wechatPushWarnedAt.set(uidRun, now);
           const hint =
             outcome.reason === "stale-context"
               ? `⚠️ 微信推送失败（对话窗口过期）：「${task.title}」只落了站内。在微信里给机器人随便回一句话，之后的推送就会恢复。`
@@ -173,6 +172,7 @@ async function main(): Promise<void> {
                 : `⚠️ 微信推送失败（${outcome.message ?? "未知原因"}）——这条提醒已落站内。`;
           try {
             await notifications.push(uidRun, { kind: "wechat_push_failed", text: hint });
+            wechatPushWarnedAt.set(uidRun, now); // 发送成功才占用 12h 去重名额——失败不禁声下一次
           } catch {
             // 站内提醒尽力而为
           }

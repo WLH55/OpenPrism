@@ -297,7 +297,7 @@ export class WechatBridge {
       return { delivered: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error("[wechat] 任务通知推送失败（静默退站内）:", message);
+      console.error("[wechat] 任务通知推送失败（分类退站内，调用方会给恢复指引）:", message);
       if (error instanceof ILinkTokenExpiredError) return { delivered: false, reason: "rebind", message };
       if (error instanceof ILinkContextStaleError) return { delivered: false, reason: "stale-context", message };
       return { delivered: false, reason: "error", message };
