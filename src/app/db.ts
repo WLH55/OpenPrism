@@ -184,6 +184,15 @@ CREATE TABLE IF NOT EXISTS wechat_binds (
   bound_ts      INTEGER NOT NULL
 );
 
+-- 微信推送待补投（2026-10-09）：推送最终失败（含降级重试失败）时入队，该用户下次入站消息用新鲜 token 补发
+CREATE TABLE IF NOT EXISTS wechat_pending (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid        TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  created_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS wechat_pending_uid ON wechat_pending (uid);
+
 CREATE TABLE IF NOT EXISTS memory_slots (
   uid        TEXT NOT NULL,
   slot       TEXT NOT NULL CHECK (slot IN ('recent','profile','scope','preferences')),

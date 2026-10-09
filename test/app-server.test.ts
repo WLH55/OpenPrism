@@ -59,6 +59,12 @@ const json = (body: unknown): { method: string; headers: Record<string, string>;
   body: JSON.stringify(body),
 });
 
+/** 相对今天的未来日期（YYYY-MM-DD）：due 用例禁止写死日期——真实时钟下写死的「未来」终会变成逾期，污染 top3 排序（2026-10-09 实锤） */
+const isoAfter = (days: number): string => {
+  const d = new Date(Date.now() + days * 86400000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "op-app-server-"));
   const masterKey = Buffer.alloc(32, 3);
@@ -306,7 +312,7 @@ describe("HTTP API", () => {
       expect(res.status, `due="${bad}"`).toBe(400);
     }
     expect((await fetch(`${baseUrl}/api/plans`, {
-      ...json({ title: "好日期", scope: "deadline", due: "2026-10-04" }),
+      ...json({ title: "好日期", scope: "deadline", due: isoAfter(5) }),
       headers: { "Content-Type": "application/json", cookie },
     })).status).toBe(200);
   });
@@ -315,12 +321,12 @@ describe("HTTP API", () => {
     const uid = users.get("lathan")!.uid;
     const ledger = await ledgers.get(uid)!;
     const created = await fetch(`${baseUrl}/api/plans`, {
-      ...json({ title: "交报告", scope: "deadline", due: "2026-10-05" }),
+      ...json({ title: "交报告", scope: "deadline", due: isoAfter(3) }),
       headers: { "Content-Type": "application/json", cookie },
     });
     const { planId } = (await created.json()) as { planId: string };
     const upd = await fetch(`${baseUrl}/api/plans/${planId}`, {
-      ...json({ title: "交年度报告", due: "2026-10-10" }),
+      ...json({ title: "交年度报告", due: isoAfter(7) }),
       method: "PUT",
       headers: { "Content-Type": "application/json", cookie },
     });
@@ -330,7 +336,7 @@ describe("HTTP API", () => {
     };
     const plan = today.plans.find((p) => p.planId === planId)!;
     expect(plan.title).toBe("交年度报告");
-    expect(plan.due).toBe("2026-10-10");
+    expect(plan.due).toBe(isoAfter(7));
     expect(today.plans.filter((p) => p.planId === planId)).toHaveLength(1); // planId 稳定不重复
     // 修订留痕：账本里同 planId 两条 plan（旧版+新版），折叠层只剩新版（旧版被 void）
     const allOfPlan = ledger.readAll().filter((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
@@ -715,7 +721,7 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 0 })).status).toBe(400);
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 1.5 })).status).toBe(400);
-    expect((await postPlan({ title: "坏配额", scope: "deadline", due: "2026-10-10", timesPerPeriod: 3 })).status).toBe(400);
+    expect((await postPlan({ title: "坏配额", scope: "deadline", due: isoAfter(7), timesPerPeriod: 3 })).status).toBe(400);
     const habit = (await (await postPlan({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 })).json()) as { planId: string };
 
     // 打一次卡 → today 视图 1/3 进行中（tz=480 本地口径）
