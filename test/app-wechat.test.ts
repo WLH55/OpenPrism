@@ -111,7 +111,7 @@ const bindActive = async (fixture: ReturnType<typeof makeFixture>) => {
 const iLinkOk = { ret: 0, errcode: 0 };
 
 describe("iLink 客户端（协议面）", () => {
-  it("getUpdates：头协议（AuthorizationType/Bearer）+ 游标推进 + 用户文本提取（bot 消息与空文本跳过）", async () => {
+  it("getUpdates：头协议（AuthorizationType/Bearer）+ 游标推进 + 用户文本提取（bot 消息跳过；媒体消息保留 media 面）", async () => {
     const iLink = fakeILink();
     iLink.on(
       (url) => url.endsWith("/ilink/bot/getupdates"),
@@ -128,7 +128,10 @@ describe("iLink 客户端（协议面）", () => {
     );
     const client = createILinkClient({ fetch: iLink.fetch });
     const { msgs, nextCursor } = await client.getUpdates("tok-1", "cursor-1");
-    expect(msgs).toEqual([{ messageId: "11", fromUserId: "wxuser-1", messageType: 1, text: "记一下跑步 30 分钟", contextToken: "ctx-1" }]);
+    expect(msgs).toEqual([
+      { messageId: "11", fromUserId: "wxuser-1", messageType: 1, text: "记一下跑步 30 分钟", media: [], contextToken: "ctx-1" },
+      { messageId: "13", fromUserId: "wxuser-1", messageType: 1, text: "", media: [{ kind: "image", encryptQueryParam: "x", aesKeyRaw: "" }], contextToken: "" },
+    ]);
     expect(nextCursor).toBe("cursor-2");
     const call = iLink.calls.find((c) => c.url.endsWith("/ilink/bot/getupdates"))!;
     expect(call.init?.headers?.AuthorizationType).toBe("ilink_bot_token");

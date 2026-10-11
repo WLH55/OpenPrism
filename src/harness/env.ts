@@ -20,6 +20,8 @@ export interface EnvFetchResponse {
   text(): Promise<string>;
   /** 真实 fetch 的 body 可能为 null（204、无 body 响应等） */
   body?: EnvReadableStream | null;
+  /** 二进制读取面（iLink CDN 媒体下载等）：真实 Response 原生具备；fake 按需实现 */
+  arrayBuffer?(): Promise<ArrayBuffer>;
 }
 
 export type EnvFetch = (input: string, init?: EnvFetchRequest) => Promise<EnvFetchResponse>;

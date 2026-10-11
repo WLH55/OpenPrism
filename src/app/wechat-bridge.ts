@@ -4,17 +4,28 @@
 // 会话模型：cid = wechat:<uid>（置顶固定会话，web 端同步可见同一份日志）；非绑定微信用户的消息忽略。
 
 import type { DatabaseSync } from "node:sqlite";
-import type { PlatformEnv } from "../harness/index";
+import type { ContentBlock, PlatformEnv } from "../harness/index";
 import type { ConversationStore } from "./conversations";
+import { ModelNotMultimodalError } from "./conversations";
 import type { NotificationStore } from "./notify";
 import { open, seal } from "./secretbox";
 import {
+  ATTACHMENT_TOTAL_MAX_BYTES,
+  FILE_MAX_CHARS,
+  FILE_NAME_MAX,
+  IMAGE_MAX_BYTES,
+  IMAGE_MAX_COUNT,
+} from "./attachments";
+import { decodeTextFile, decryptAes128Ecb, mediaTypeForFileName, parseAesKey, sniffImageType, WECHAT_DOWNLOAD_MAX_BYTES } from "./wechat-media";
+import {
+  buildCdnDownloadUrl,
   createILinkClient,
   ILinkContextStaleError,
   ILinkTokenExpiredError,
   type ILinkClient,
   type ILinkCredentials,
   type ILinkInboundMessage,
+  type ILinkMediaItem,
 } from "./ilink";
 
 export const WECHAT_FEED_CID = (uid: string): string => `wechat:${uid}`;
@@ -105,7 +116,12 @@ export class WechatBridge {
     // 欢迎语后台推：不 await（iLink 慢/挂不拖绑定闭环的路由响应，轮询也已先启）；
     // 无 context_token 的主动推送是否被接受属 Q5 实测项，失败不拦绑定但必须留日志（排障）
     void this.client
-      .sendMessage(creds.botToken, creds.ilinkUserId, "", "绑定成功！以后直接在这里跟我说话就行；定时任务也可以选「微信机器人」通知到这里。")
+      .sendMessage(
+        creds.botToken,
+        creds.ilinkUserId,
+        "",
+        "绑定成功！以后直接在这里跟我说话就行；图片、文本文件、语音（自动转文字）也可以直接发；定时任务可以选「微信机器人」通知到这里。",
+      )
       .catch((error) => console.error("[wechat] 欢迎语推送失败（不拦绑定，Q5 实测项）:", error instanceof Error ? error.message : error));
   }
 
@@ -215,18 +231,48 @@ export class WechatBridge {
     }
   }
 
-  /** 一条入站消息 → 会话回合 → 回复推回（串行：回合跑完才处理下一条/下一轮拉取，天然保序） */
+  /** 一条入站消息 → 会话回合 → 回复推回（串行：回合跑完才处理下一条/下一轮拉取，天然保序）。
+   * 媒体面（2026-10-11）：语音转写并入文本；图片/文件下载解密后走 attachments 管线；
+   * transport/配置类失败（下载/解密/超限/模型非多模态）不跑回合——直接回说明文本，不进轮询退避（重试无意义且伤同批后续消息）。 */
   private async handle(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage): Promise<void> {
     if (msg.fromUserId !== bind.ilink_user_id) return; // 非绑定微信用户：忽略（AC5）
-    // 上下文锚（2026-09-30）：入站即存——任务推送要用它挂上下文，空串凭空推送会被 iLink 拒（ret=-2 实锤）
+    // 上下文锚（2026-09-30）：任何入站即存——媒体消息也算「用户回复」，保活窗口靠它刷新；空串 token 照存
+    // （空串凭空推送会被 iLink 拒 ret=-2 实锤，但锚的语义是「最近一次」，存了不亏）
     this.deps.db
       .prepare("UPDATE wechat_binds SET last_context_token = ?, last_msg_ts = ? WHERE uid = ?")
       .run(msg.contextToken, this.now(), uid);
+    const text = [msg.text, ...msg.media.flatMap((m) => (m.kind === "voice" && (m.voiceText ?? "") !== "" ? [m.voiceText!] : []))]
+      .filter((part) => part !== "")
+      .join("\n");
+    const downloadable = msg.media.filter((m) => m.kind === "image" || m.kind === "file");
+    if (text === "" && downloadable.length === 0) {
+      // 到这里只剩空转写语音：转写失败说明（不跑回合）；纯空消息在 getUpdates 层已被丢弃
+      await this.pushNotice(bind, msg, "这条语音没能转写出文字——麻烦打字发我，或者重新说一遍。");
+      return;
+    }
     await this.ensureFeed(uid);
     const cid = WECHAT_FEED_CID(uid);
+    let attachments: ContentBlock[] = [];
+    if (downloadable.length > 0) {
+      const result = await this.mediaToAttachments(msg, downloadable);
+      if ("failure" in result) {
+        await this.pushNotice(bind, msg, result.failure);
+        return;
+      }
+      attachments = result.blocks;
+    }
     const agent = await this.deps.conversations.agent(uid, cid);
     const before = agent.sessionLog.readAll().length;
-    await this.deps.conversations.send(uid, cid, msg.text);
+    try {
+      await this.deps.conversations.send(uid, cid, text, attachments);
+    } catch (error) {
+      // 多模态校验失败不消耗回合：配置类错误给指引，不上抛进轮询退避
+      if (error instanceof ModelNotMultimodalError) {
+        await this.pushNotice(bind, msg, "当前模型不支持看图——到网页端「设置」里切换为多模态模型后再发，或直接到网页端对话里发图。");
+        return;
+      }
+      throw error;
+    }
     await agent.whenIdle();
     const events = agent.sessionLog.readAll().slice(before);
     const reply = events
@@ -256,6 +302,64 @@ export class WechatBridge {
         error instanceof Error ? error.message : error,
       );
     }
+  }
+
+  /** 说明性回复（媒体失败/转写失败等，不跑回合的路径）：尽力推送，失败留日志 */
+  private async pushNotice(bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage, text: string): Promise<void> {
+    try {
+      await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, text.slice(0, REPLY_MAX_CHARS));
+    } catch (error) {
+      console.error("[wechat] 说明推送失败:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  /** 图片/文件媒体项 → 附件块（下载 → 解密 → 探测/限额）；任一失败返回面向用户的说明文本（整条消息不进回合） */
+  private async mediaToAttachments(msg: ILinkInboundMessage, items: ILinkMediaItem[]): Promise<{ blocks: ContentBlock[] } | { failure: string }> {
+    const blocks: ContentBlock[] = [];
+    let imageCount = 0;
+    let totalBytes = 0;
+    for (const item of items) {
+      const label = item.kind === "image" ? "图片" : `文件「${item.fileName ?? "附件"}」`;
+      if ((item.sizeBytes ?? 0) > WECHAT_DOWNLOAD_MAX_BYTES) {
+        return { failure: `${label}超过微信通道 ${Math.round(WECHAT_DOWNLOAD_MAX_BYTES / 1024 / 1024)}MB 上限，没能接收` };
+      }
+      let cipher: Uint8Array;
+      try {
+        cipher = await this.client.downloadMedia(buildCdnDownloadUrl(item.encryptQueryParam));
+      } catch (error) {
+        console.error(`[wechat] 媒体下载失败（messageId=${msg.messageId}）:`, error instanceof Error ? error.message : error);
+        return { failure: `${label}下载失败，稍后重发一次试试` };
+      }
+      if (cipher.length > WECHAT_DOWNLOAD_MAX_BYTES) {
+        return { failure: `${label}超过微信通道 ${Math.round(WECHAT_DOWNLOAD_MAX_BYTES / 1024 / 1024)}MB 上限，没能接收` };
+      }
+      let plain: Buffer;
+      try {
+        plain = decryptAes128Ecb(cipher, parseAesKey(item.aesKeyRaw));
+      } catch (error) {
+        console.error(`[wechat] 媒体解密失败（messageId=${msg.messageId}）:`, error instanceof Error ? error.message : error);
+        return { failure: `${label}解密失败，稍后重发一次试试` };
+      }
+      if (item.kind === "image") {
+        const mediaType = sniffImageType(plain);
+        if (mediaType === null) return { failure: "收到不支持的图片格式（微信通道目前支持 PNG / JPEG / WebP / GIF）" };
+        if (plain.length > IMAGE_MAX_BYTES) return { failure: `图片超过 ${Math.round(IMAGE_MAX_BYTES / 1024 / 1024)}MB 上限，压缩或裁剪后再发` };
+        imageCount += 1;
+        if (imageCount > IMAGE_MAX_COUNT) return { failure: `这条消息里的图片超过 ${IMAGE_MAX_COUNT} 张上限，分开发吧` };
+        totalBytes += plain.length;
+        blocks.push({ type: "image", mediaType, data: plain.toString("base64") });
+      } else {
+        const decoded = decodeTextFile(plain);
+        if (!decoded.ok) return { failure: `文件「${item.fileName ?? "附件"}」是二进制文件，微信通道暂只支持文本类文件（txt / md / csv / 代码等）` };
+        if (decoded.text.length > FILE_MAX_CHARS) return { failure: `文件「${item.fileName ?? "附件"}」超过 ${FILE_MAX_CHARS} 字上限，分段发或到网页端上传` };
+        totalBytes += Buffer.byteLength(decoded.text, "utf8");
+        blocks.push({ type: "file", name: (item.fileName ?? "附件").slice(0, FILE_NAME_MAX), mediaType: mediaTypeForFileName(item.fileName), text: decoded.text });
+      }
+      if (totalBytes > ATTACHMENT_TOTAL_MAX_BYTES) {
+        return { failure: `这条消息的附件合计超过 ${Math.round(ATTACHMENT_TOTAL_MAX_BYTES / 1024 / 1024)}MB 上限，分开发吧` };
+      }
+    }
+    return { blocks };
   }
 
   private async ensureFeed(uid: string): Promise<void> {
