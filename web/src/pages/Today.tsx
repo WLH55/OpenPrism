@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type TodayPlanView, type TodayView, type TopItemLoose } from "../api";
+import { api, apiW, type NotePayloadLoose, type ProgressPayloadLoose, type TodayPlanView, type TodayView, type TopItemLoose, type WidgetLoose } from "../api";
 import { catColor } from "../catcolor";
 import { daysUntil } from "../days";
 import { CheckSolidIcon } from "../icons";
@@ -290,7 +290,164 @@ function Top3Card({ items, pendingPlanId, onCheckin }: { items: TopItemLoose[]; 
   );
 }
 
-/** 今天页：Top3 + 快速记录 + 三统计卡 + 计划四段范围切换（今天/本周/全部/已完成；计划管理唯一入口，2026-09-30 目标层级下线） */
+/** 我的卡片（2026-10-12 工作台化一期）：Agent/对话里建的配置驱动小卡——note 便签 | progress 进度。
+ *  就地编辑/删除（Agent 工具之外的另一更新通道，手机 web 上不必开对话就能推进度）。 */
+function WidgetCard({ widget, onChanged }: { widget: WidgetLoose; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await fn();
+      onChanged();
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const actions = (
+    <div className="flex shrink-0 items-center gap-2 text-xs text-ink3">
+      <button className="transition hover:text-accent" onClick={() => setEditing(!editing)}>
+        {editing ? "收起" : "编辑"}
+      </button>
+      <button
+        className="transition hover:text-warm"
+        onClick={() => {
+          if (window.confirm(`删除卡片「${widget.title}」？`)) void run(() => apiW.deleteWidget(widget.id));
+        }}
+      >
+        删除
+      </button>
+    </div>
+  );
+
+  if (widget.kind === "note") {
+    const payload = widget.payload as NotePayloadLoose;
+    return (
+      <div className="rounded-xl border border-line bg-surface px-4 py-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0 truncate text-sm font-medium text-ink">{widget.title}</div>
+          {actions}
+        </div>
+        {editing ? (
+          <NoteEdit
+            initial={payload.text}
+            busy={busy}
+            onSave={(text) => void run(async () => {
+              await apiW.updateWidget(widget.id, { payload: { text } });
+              setEditing(false);
+            })}
+          />
+        ) : (
+          <p className="mt-1.5 whitespace-pre-wrap break-words text-[15px] text-ink2">{payload.text}</p>
+        )}
+      </div>
+    );
+  }
+
+  const payload = widget.payload as ProgressPayloadLoose;
+  const pct = Math.max(0, Math.min(100, Math.round((payload.value / payload.target) * 100)));
+  // 大目标给大步长（300 页的书 ±1 太磨人）；改具体数值走编辑
+  const step = payload.target >= 100 ? 5 : 1;
+  return (
+    <div className="rounded-xl border border-line bg-surface px-4 py-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 truncate text-sm font-medium text-ink">{widget.title}</div>
+        {actions}
+      </div>
+      <div className="mt-2 flex items-center gap-3">
+        <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-surface2">
+          <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="num shrink-0 text-sm font-medium text-ink">
+          {payload.value}
+          <span className="text-ink3">
+            /{payload.target}
+            {payload.unit ?? ""}
+          </span>
+        </span>
+      </div>
+      {!editing && (
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            disabled={busy}
+            className="num h-7 w-7 rounded-full border border-line text-sm text-ink transition hover:border-accent hover:text-accent disabled:opacity-50"
+            onClick={() => void run(() => apiW.updateWidget(widget.id, { payload: { value: Math.max(0, payload.value - step) } }))}
+          >
+            −
+          </button>
+          <button
+            disabled={busy}
+            className="num h-7 w-7 rounded-full border border-line text-sm text-ink transition hover:border-accent hover:text-accent disabled:opacity-50"
+            onClick={() => void run(() => apiW.updateWidget(widget.id, { payload: { value: payload.value + step } }))}
+          >
+            ＋
+          </button>
+          <span className="num text-xs text-ink3">{pct}%</span>
+        </div>
+      )}
+      {editing && (
+        <ProgressEdit
+          initial={payload}
+          busy={busy}
+          onSave={(patch) => void run(async () => {
+            await apiW.updateWidget(widget.id, { payload: patch });
+            setEditing(false);
+          })}
+        />
+      )}
+    </div>
+  );
+}
+
+function NoteEdit({ initial, busy, onSave }: { initial: string; busy: boolean; onSave: (text: string) => void }) {
+  const [text, setText] = useState(initial);
+  return (
+    <div className="mt-2">
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        maxLength={2000}
+        className="w-full rounded-lg border border-line bg-surface2 px-3 py-2 text-sm text-ink outline-none focus:border-accent"
+      />
+      <button
+        disabled={busy || text.trim() === ""}
+        className="mt-1.5 rounded-md bg-accent px-3 py-1.5 text-xs text-white transition hover:bg-accent2 disabled:opacity-50"
+        onClick={() => onSave(text.trim())}
+      >
+        保存
+      </button>
+    </div>
+  );
+}
+
+function ProgressEdit({ initial, busy, onSave }: { initial: ProgressPayloadLoose; busy: boolean; onSave: (patch: { value?: number; target?: number; unit?: string }) => void }) {
+  const [value, setValue] = useState(String(initial.value));
+  const [target, setTarget] = useState(String(initial.target));
+  const [unit, setUnit] = useState(initial.unit ?? "");
+  const valid = Number.isFinite(Number(value)) && Number(value) >= 0 && Number.isFinite(Number(target)) && Number(target) > 0;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2">
+      <input value={value} onChange={(e) => setValue(e.target.value)} className="num w-20 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <span className="text-sm text-ink3">/</span>
+      <input value={target} onChange={(e) => setTarget(e.target.value)} className="num w-20 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="单位" maxLength={20} className="w-16 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <button
+        disabled={busy || !valid}
+        className="rounded-md bg-accent px-3 py-1.5 text-xs text-white transition hover:bg-accent2 disabled:opacity-50"
+        onClick={() => onSave({ value: Number(value), target: Number(target), unit: unit.trim() })}
+      >
+        保存
+      </button>
+    </div>
+  );
+}
+
+/** 今天页：Top3 + 快速记录 + 三统计卡 + 我的卡片 + 计划四段范围切换（今天/本周/全部/已完成；计划管理唯一入口，2026-09-30 目标层级下线） */
 export function Today() {
   const [view, setView] = useState<TodayView | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -301,6 +458,8 @@ export function Today() {
   const [error, setError] = useState<string | null>(null);
   const [planTab, setPlanTab] = useState<"today" | "week" | "all" | "done">("today");
   const [pendingTop, setPendingTop] = useState<string | null>(null); // Top3 打卡在途的 planId（防二击重复落账）
+  const [widgets, setWidgets] = useState<WidgetLoose[]>([]);
+  const [widgetsError, setWidgetsError] = useState(false);
 
   // 返回 Promise（2026-10-01 打卡即显）：行内乐观翻转后要等新数据落地再解锁，避免解锁瞬间仍在旧 props 上吃到二击
   const reload = useCallback(async () => {
@@ -311,7 +470,19 @@ export function Today() {
     }
   }, []);
 
+  const reloadWidgets = useCallback(() => {
+    // 失败不覆盖已有卡片、也不伪装成空态引导（评审 P2）：单独的失败行，下次挂载/操作自然重试
+    void apiW
+      .listWidgets()
+      .then((list) => {
+        setWidgets(list);
+        setWidgetsError(false);
+      })
+      .catch(() => setWidgetsError(true));
+  }, []);
+
   useEffect(() => void reload(), [reload]);
+  useEffect(reloadWidgets, [reloadWidgets]);
 
   const quickRecord = async () => {
     if (category.trim() === "") {
@@ -480,6 +651,25 @@ export function Today() {
           <div className="num mt-1 text-xl font-semibold text-warm">{view.streakDays} 天</div>
         </div>
       </div>
+
+      {/* 我的卡片（2026-10-12 工作台化一期）：Agent/对话里建的配置驱动卡片——note 便签 | progress 进度；
+          空态给一行行动引导（空态行动入口原则） */}
+      {widgetsError ? (
+        <div className="mb-5 rounded-xl border border-line bg-surface px-4 py-3 text-sm text-ink3">卡片加载失败，稍后重试</div>
+      ) : widgets.length > 0 ? (
+        <section className="mb-5">
+          <h2 className="mb-2 text-sm font-semibold text-ink">我的卡片</h2>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            {widgets.map((w) => (
+              <WidgetCard key={w.id} widget={w} onChanged={reloadWidgets} />
+            ))}
+          </div>
+        </section>
+      ) : (
+        <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3 text-sm text-ink3">
+          还没有自定义卡片——在对话里说一句（如「帮我建张读书进度卡，目标 300 页」），它就会出现在这里
+        </div>
+      )}
 
       {/* 计划四段范围切换（2026-09-29 B4）：今天=今日应做（未来项移出）｜本周=+截止≤周日｜全部=+远期｜已完成=近 30 天存档 */}
       <section className="mb-6">

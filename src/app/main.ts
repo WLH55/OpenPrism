@@ -23,6 +23,7 @@ import { createMemoryVector } from "./memory-vector";
 import { Scheduler, TaskStore, taskTriggerMessage, type TaskDef, type TaskRunTrigger } from "./tasks";
 import { NotificationStore } from "./notify";
 import { WechatBridge, withContextNudge } from "./wechat-bridge";
+import { WidgetStore } from "./widgets";
 import { createAppServer } from "./server";
 import { createOpenAICompatAdapter, type LlmAdapter } from "../harness/index";
 import { gatewayExtraHeaders, timeoutSignal, MODEL_TEST_TIMEOUT_MS } from "./provider-gateways";
@@ -81,6 +82,8 @@ async function main(): Promise<void> {
   const mcps = new McpRegistry({ env: nodeEnv, db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const memory = new MemoryStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   const tasks = new TaskStore({ db, now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
+  // 今天页自定义卡片（2026-10-12 工作台化一期）：会话装配（Agent 工具）与 REST CRUD 共用同一实例
+  const widgets = new WidgetStore(db, { now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   // 旧 L2/槽数据一次性迁移（幂等）；水位线初始化 = 现状（历史不重喂，见 Spec §6.4）
   migrateLegacyMemory(db, { now: () => Date.now(), randomUUID: () => nodeEnv.randomUUID() });
   // 遗留七表收尾删除（2026-10-01，schema v2）：必须在上面两个吸收迁移之后——老库先搬数据再删表
@@ -126,6 +129,7 @@ async function main(): Promise<void> {
       memory,
       memoryVector,
       tasks,
+      widgets,
       // 微信绑定真相（A4 2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报；桥在下方构建，回调惰性求值无 TDZ 问题
       wechatStatus: (uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number } => wechat.status(uid),
       onTurnDone: (uidTurn) => memoryExtractor.notify(uidTurn),
@@ -259,6 +263,7 @@ async function main(): Promise<void> {
     tasks,
     notifications,
     taskRunner,
+    widgets,
     wechat, // 微信桥（2026-09-27）：IM 绑定路由
     ...(existsSync(staticDir) ? { staticDir } : {}),
   });

@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   model_provider_id TEXT,
   pinned        INTEGER NOT NULL DEFAULT 0,
   switches_json TEXT NOT NULL DEFAULT '[]',
-  created_ts    INTEGER NOT NULL
+  created_ts    INTEGER NOT NULL,
+  scene         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_conv_uid ON conversations(uid, created_ts);
 
@@ -292,6 +293,19 @@ CREATE TABLE IF NOT EXISTS archives (
   updated_ts INTEGER
 );
 
+-- 今天页自定义卡片（2026-10-12，工作台化一期）：Agent/用户创建的配置驱动小卡；
+-- kind 枚举（note|progress）服务端校验，payload_json 按 kind 校验后落库，渲染在前端按 kind 分发。
+CREATE TABLE IF NOT EXISTS widgets (
+  id          TEXT PRIMARY KEY,
+  uid         TEXT NOT NULL,
+  kind        TEXT NOT NULL CHECK (kind IN ('note','progress')),
+  title       TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  sort        INTEGER NOT NULL DEFAULT 0,
+  created_ts  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_widgets_uid ON widgets(uid, sort);
+
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -425,6 +439,7 @@ export function openDb(dbPath: string): DatabaseSync {
   db.exec(DDL);
   ensureColumn(db, "conversations", "model_provider_id", "TEXT"); // 会话级模型绑定（2026-09-07）
   ensureColumn(db, "conversations", "pinned", "INTEGER NOT NULL DEFAULT 0"); // 置顶（定时提醒会话）
+  ensureColumn(db, "conversations", "scene", "TEXT"); // 场景标签（2026-10-12 工作台化一期）：可选，侧栏按场景过滤
   ensureColumn(db, "tasks", "notify_channel", "TEXT"); // 任务级通知渠道（inapp 默认 | wechat，2026-09-27）
   ensureColumn(db, "tasks", "builtin", "TEXT"); // 内置任务标记（daily-brief|daily-report|weekly-review，2026-09-29）
   ensureColumn(db, "users", "builtins_seeded", "INTEGER NOT NULL DEFAULT 0"); // 内置三件套种子一次性标记（删了不复活，2026-09-29）

@@ -80,6 +80,8 @@ export interface ServerDeps {
   taskRunner(uid: string, task: import("./tasks").TaskDef, run: import("./tasks").TaskRunTrigger): Promise<void>;
   /** 微信桥（2026-09-27）：IM 绑定路由用；缺省 = 未装配（相关路由 404）；测试注入 fake fetch 驱动的桥 */
   wechat?: WechatBridge;
+  /** 今天页自定义卡片（2026-10-12 工作台化一期）：REST CRUD；缺省 = 未装配（相关路由 404） */
+  widgets?: import("./widgets").WidgetStore;
   staticDir?: string;
 }
 
@@ -668,6 +670,18 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         return sendError(res, 404, String((error as Error).message));
       }
     }
+    // 场景标签（2026-10-12 工作台化一期）：scene = null 清除；返回更新后的会话条目
+    if (sub === "/scene" && method === "PUT") {
+      const body = (await readBody(req)) as { scene?: string | null };
+      try {
+        const entry = await deps.conversations.setScene(uid, cid, body.scene === null ? null : String(body.scene ?? ""));
+        return sendJson(res, 200, entry);
+      } catch (error) {
+        const message = String((error as Error).message);
+        if (message.includes("不存在")) return sendError(res, 404, "会话不存在");
+        return sendError(res, 400, message);
+      }
+    }
   }
 
   // ── 微信桥（2026-09-27）：iLink 扫码绑定四路由 ──────────
@@ -988,10 +1002,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const conversations: ExportConversation[] = (await deps.conversations.list(uid)).map((entry) => ({
       cid: entry.id,
       title: entry.title,
+      scene: entry.scene,
       createdTs: entry.createdTs,
       events: deps.conversations.readEvents(entry.id), // 不带 options = 全量升序
     }));
-    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations };
+    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations, ...(deps.widgets ? { widgets: deps.widgets.list(uid) } : {}) };
     const dateTag = new Date(input.exportedAt).toISOString().slice(0, 10).replace(/-/g, "");
     if (format === "json") {
       res.writeHead(200, {
@@ -1304,6 +1319,40 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const period = (["today", "week", "month", "year"] as const).find((p) => p === periodParam) ?? "week";
     const ledger = await deps.ledgerFor(uid);
     return sendJson(res, 200, categoryView(ledger.readAll(), { category: name, period, now: deps.env.now(), tzOffsetMinutes: -new Date().getTimezoneOffset() }));
+  }
+
+  // ── 今天页自定义卡片（2026-10-12 工作台化一期）：Agent/用户共用 CRUD，uid 严格隔离 ──
+  if (deps.widgets) {
+    if (path === "/api/widgets" && method === "GET") {
+      return sendJson(res, 200, deps.widgets.list(uid));
+    }
+    if (path === "/api/widgets" && method === "POST") {
+      const body = (await readBody(req)) as { kind?: string; title?: string; payload?: unknown };
+      try {
+        return sendJson(res, 200, deps.widgets.create(uid, { kind: String(body.kind ?? ""), title: String(body.title ?? ""), payload: body.payload }));
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+    }
+    const widgetMatch = /^\/api\/widgets\/([^/]+)$/.exec(path);
+    if (widgetMatch && method === "PUT") {
+      const body = (await readBody(req)) as { title?: string; payload?: unknown };
+      try {
+        return sendJson(res, 200, deps.widgets.update(uid, decodeURIComponent(widgetMatch[1]!), body));
+      } catch (error) {
+        const message = String((error as Error).message);
+        if (message.includes("不存在")) return sendError(res, 404, message);
+        return sendError(res, 400, message);
+      }
+    }
+    if (widgetMatch && method === "DELETE") {
+      try {
+        deps.widgets.remove(uid, decodeURIComponent(widgetMatch[1]!));
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendError(res, 404, String((error as Error).message));
+      }
+    }
   }
 
   sendError(res, 404, "not found");
