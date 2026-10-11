@@ -11,6 +11,7 @@ import { SkillStore } from "../src/app/skills";
 import { McpRegistry } from "../src/app/mcp";
 import { TaskStore } from "../src/app/tasks";
 import { MemoryStore } from "../src/app/memory";
+import { WidgetStore } from "../src/app/widgets";
 import { SqliteSessionLog } from "../src/app/session-log";
 import { addModelProvider, readModelConfig, readModelProviderConfig } from "../src/app/secretbox";
 import { createMockLlmAdapter, llmFailure, type LlmAdapter } from "../src/harness/index";
@@ -187,7 +188,7 @@ describe("ConversationStore（批次1 回归）", () => {
 });
 
 describe("ConversationStore（批次2：伙伴与装配）", () => {
-  it("默认助手：system 含默认身份；无绑定 → 四工具 + save_preference + 任务四件套，无 load_skill；goal 三件随目标层级下线（2026-09-30）", async () => {
+  it("默认助手：system 含默认身份；无绑定 → 四工具 + save_preference + 任务四件套 + 场景工具，无 load_skill；goal 三件随目标层级下线（2026-09-30）", async () => {
     const db = testDb();
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(db, mock.adapter as LlmAdapter);
@@ -198,8 +199,44 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "update_plan", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "void_flow",
     ]);
+  });
+
+  it("场景标签与卡片工具（2026-10-12 工作台化一期）：提供 widgets → 装配 18 工具；Turn 内 set_conversation_scene 落库、回执入日志", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([
+      { kind: "tool-calls", calls: [{ name: "set_conversation_scene", arguments: { scene: "装修" } }] },
+      { kind: "text", text: "归好了。" },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const widgets = new WidgetStore(db, { now: () => 1, randomUUID: () => `wid-${Math.random().toString(36).slice(2, 8)}` });
+    const store = new ConversationStore({ ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, widgets }, db);
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "把这个会话归到装修场景");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect((mock.requests[0]!.tools ?? []).map((t) => t.name).sort()).toEqual([
+      "cancel_plan", "checkin_plan", "create_plan", "create_task", "create_widget", "delete_task", "delete_widget", "list_widgets", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "update_widget", "void_flow",
+    ]);
+    // 工具作用于当前会话：落库 + 回执入会话日志（model-visible means logged）
+    expect((await store.list(UID)).find((c) => c.id === entry.id)?.scene).toBe("装修");
+    const events = (await store.agent(UID, entry.id)).sessionLog.readAll();
+    expect(JSON.stringify(events)).toContain("已把本会话归到「装修」场景");
+  });
+
+  it("setScene 存储（2026-10-12 工作台化一期）：打标 trim/清空/超长拒/不存在与越权按不存在拒", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.setScene(UID, entry.id, " 读书 ");
+    expect((await store.list(UID))[0]!.scene).toBe("读书");
+    await store.setScene(UID, entry.id, null);
+    expect((await store.list(UID))[0]!.scene).toBeNull();
+    await expect(store.setScene(UID, entry.id, "x".repeat(33))).rejects.toThrow("场景名过长");
+    await expect(store.setScene(UID, entry.id, "   ")).rejects.toThrow("空白");
+    await expect(store.setScene(UID, "no-such", "x")).rejects.toThrow("不存在");
+    await expect(store.setScene("u-other", entry.id, "x")).rejects.toThrow("不存在");
   });
 
   it("切换伙伴：systemPrompt 换人设下一步生效；切换历史落 meta；账本 actor 随当前伙伴", async () => {

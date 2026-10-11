@@ -4,6 +4,7 @@
 // 路由只做 IO（server.ts），分组与渲染在此单测。
 
 import type { LedgerRecord, PlanRecord } from "./ledger";
+import type { Widget } from "./widgets";
 import type { SessionEvent } from "../harness/index";
 
 export interface ExportConversation {
@@ -11,6 +12,8 @@ export interface ExportConversation {
   title: string;
   agentId?: string;
   createdTs: number;
+  /** 场景标签（2026-10-12 工作台化一期）：null = 未打标 */
+  scene?: string | null;
   events: SessionEvent[];
 }
 
@@ -18,6 +21,8 @@ export interface ExportInput {
   exportedAt: number;
   ledger: LedgerRecord[];
   conversations: ExportConversation[];
+  /** 今天页自定义卡片（2026-10-12）：JSON 全量备份收录；缺省 = 服务端未装配 widgets */
+  widgets?: Widget[];
 }
 
 export function buildExportJson(input: ExportInput): string {
@@ -29,9 +34,11 @@ export function buildExportJson(input: ExportInput): string {
         cid: c.cid,
         title: c.title,
         ...(c.agentId !== undefined ? { agentId: c.agentId } : {}),
+        ...(c.scene !== undefined && c.scene !== null ? { scene: c.scene } : {}),
         createdTs: c.createdTs,
         events: c.events,
       })),
+      ...(input.widgets !== undefined ? { widgets: input.widgets } : {}),
     },
     null,
     2,

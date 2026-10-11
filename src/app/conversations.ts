@@ -13,6 +13,7 @@ import { composeAssistantPrompt } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
 import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
+import { createWidgetTools } from "./widgets";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
 
@@ -52,6 +53,8 @@ export interface ConversationDeps {
   memoryVector?: MemoryVectorLike;
   /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
   tasks?: TaskStoreLike;
+  /** 今天页自定义卡片（2026-10-12 工作台化一期）：create_widget 等四工具的存储；缺省不装配 */
+  widgets?: import("./widgets").WidgetStore;
   /** 微信绑定状态源（A4，2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报绑定真相；缺省不回报 */
   wechatStatus?(uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
   /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
@@ -90,10 +93,56 @@ export interface ConversationEntry {
   title: string;
   pinned: boolean;
   createdTs: number;
+  /** 场景标签（2026-10-12 工作台化一期）：可选；侧栏按场景过滤，目录从已打标会话动态长出（零预设） */
+  scene?: string | null;
 }
 
 const DEFAULT_TITLE = "新对话";
 const TITLE_MAX_RUNES = 24;
+/** 场景标签长度上限（rune 计，中英文一致） */
+const SCENE_MAX_RUNES = 32;
+
+/** 场景标签工具（2026-10-12 工作台化一期）：作用于当前会话——侧栏按场景过滤的语境切换 */
+export interface SceneToolsDeps {
+  uid: string;
+  cid: string;
+  setScene(uid: string, cid: string, scene: string | null): Promise<unknown>;
+}
+
+export function createSceneTools(deps: SceneToolsDeps): ToolDefinition[] {
+  const setConversationScene: ToolDefinition = {
+    name: "set_conversation_scene",
+    description:
+      "给当前会话设置或清除场景标签（如「装修」「读书」）——侧栏可按场景过滤，打开一个场景只见相关工作。用户明确要求归类、或会话主题与用户已说过的场景明显吻合时设置；改名、清除同样以用户的话为准，不要擅自批量改。",
+    parameters: {
+      type: "object",
+      required: ["scene"],
+      properties: {
+        scene: { type: "string", description: "场景名（≤32 字）；空字符串 = 清除场景标签" },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        required: ["cid", "scene"],
+        properties: { cid: { type: "string" }, scene: { type: "string" } },
+      },
+      render: (_args, value) => {
+        const v = value as { scene: string };
+        return [{ type: "text", text: v.scene === "" ? "已清除本会话的场景标签" : `已把本会话归到「${v.scene}」场景` }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { scene?: string };
+      if (typeof input.scene !== "string") throw new Error("scene 必须是字符串（清除传空字符串）");
+      const normalized = input.scene.trim();
+      await deps.setScene(deps.uid, deps.cid, normalized === "" ? null : normalized);
+      return { cid: deps.cid, scene: normalized };
+    },
+    isConcurrencySafe: () => false,
+  };
+  return [setConversationScene];
+}
 
 const TITLE_PROMPT = `根据用户的提问生成一个简短的会话标题。
 要求：
@@ -131,10 +180,11 @@ interface ConversationRow {
   pinned: number;
   switches_json: string;
   created_ts: number;
+  scene: string | null;
 }
 
 function rowToEntry(row: ConversationRow): ConversationEntry {
-  return { id: row.cid, title: row.title, pinned: row.pinned === 1, createdTs: row.created_ts };
+  return { id: row.cid, title: row.title, pinned: row.pinned === 1, createdTs: row.created_ts, scene: row.scene };
 }
 
 export class ConversationStore {
@@ -151,7 +201,7 @@ export class ConversationStore {
   async list(uid: string): Promise<ConversationEntry[]> {
     // 置顶（定时提醒会话）在前，其余按创建时间倒序
     const rows = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE uid = ? ORDER BY pinned DESC, created_ts DESC, cid")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE uid = ? ORDER BY pinned DESC, created_ts DESC, cid")
       .all(uid) as unknown as ConversationRow[];
     return rows.map(rowToEntry);
   }
@@ -164,7 +214,7 @@ export class ConversationStore {
   async ensureTaskFeed(uid: string, agentId: string | undefined): Promise<ConversationEntry> {
     const cid = `${TASK_FEED_CID_PREFIX}${uid}:${agentId ?? "default"}`;
     const found = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     if (found) return rowToEntry(found);
     let title = "定时提醒";
@@ -176,7 +226,7 @@ export class ConversationStore {
       .prepare("INSERT OR IGNORE INTO conversations (cid, uid, title, agent_id, pinned, created_ts) VALUES (?, ?, ?, ?, 1, ?)")
       .run(cid, uid, title, agentId ?? null, this.deps.now());
     const created = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow;
     return rowToEntry(created);
   }
@@ -216,7 +266,7 @@ export class ConversationStore {
 
   async metaFor(uid: string, cid: string): Promise<ConversationMeta> {
     const row = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     if (!row) return { switches: [] };
     return this.rowToMeta(row);
@@ -258,6 +308,22 @@ export class ConversationStore {
     this.db
       .prepare("UPDATE conversations SET agent_id = ?, switches_json = ? WHERE cid = ? AND uid = ?")
       .run(agentId, JSON.stringify(meta.switches), cid, uid);
+  }
+
+  /**
+   * 场景标签（2026-10-12 工作台化一期）：给会话打/改/清可选场景（如「装修」「读书」）。
+   * 纯展示维度，不参与装配——无需弃池。scene = null 或空白 = 清除；目录由侧栏从已打标会话动态折叠。
+   */
+  async setScene(uid: string, cid: string, scene: string | null): Promise<ConversationEntry> {
+    const normalized = scene === null ? null : scene.trim();
+    if (normalized === "") throw new Error("场景名不能为空白（清除请传 null）");
+    if (normalized !== null && [...normalized].length > SCENE_MAX_RUNES) throw new Error(`场景名过长（≤${SCENE_MAX_RUNES} 字）`);
+    const result = this.db.prepare("UPDATE conversations SET scene = ? WHERE cid = ? AND uid = ?").run(normalized, cid, uid);
+    if (result.changes === 0) throw new Error(`conversation "${cid}" 不存在`);
+    const row = this.db
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
+      .get(cid, uid) as unknown as ConversationRow;
+    return rowToEntry(row);
   }
 
   /** 会话绑定模型（2026-09-07）：null = 跟随全局激活；切换即弃池，下一回合按新模型重新装配（日志全量在库，装配无损） */
@@ -402,7 +468,7 @@ export class ConversationStore {
   /** 池化装配用的同步 meta（聊天会话）：list/create 走异步，这里同步读单行 */
   private dbMetaSync(uid: string, cid: string): ConversationMeta {
     const row = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     return row ? this.rowToMeta(row) : { switches: [] };
   }
@@ -461,6 +527,8 @@ export class ConversationStore {
         return { conversationId, agentName: agentNow.name };
       },
     }).filter((tool) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name));
+    // 能力绑定的工具开关对场景/卡片工具同样生效（写类工具可被伙伴白名单关掉）
+    const allowByBinding = (tool: ToolDefinition) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name);
 
     const tools: ToolDefinition[] = [...ledgerTools];
     if (binding.skills.length > 0) {
@@ -489,6 +557,15 @@ export class ConversationStore {
           ...(this.deps.wechatStatus ? { wechatStatus: (uidRun: string) => this.deps.wechatStatus!(uidRun) } : {}),
         }),
       );
+    }
+    // 场景标签工具（2026-10-12 工作台化一期）：只给聊天会话——任务会话的 conversationId 是 taskId，不是会话 cid，
+    // 池化装配里聊天 = sessionKey 与 conversationId 同为 cid
+    if (sessionKey === conversationId) {
+      tools.push(...createSceneTools({ uid, cid: conversationId, setScene: (sceneUid, sceneCid, scene) => this.setScene(sceneUid, sceneCid, scene) }).filter(allowByBinding));
+    }
+    // 今天页自定义卡片工具：任务会话同权（简报任务也能推进度卡）
+    if (this.deps.widgets) {
+      tools.push(...createWidgetTools({ store: this.deps.widgets, uid }).filter(allowByBinding));
     }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));

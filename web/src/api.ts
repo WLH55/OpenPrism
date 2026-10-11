@@ -34,6 +34,8 @@ export interface ConversationEntry {
   /** 置顶（定时提醒会话） */
   pinned: boolean;
   createdTs: number;
+  /** 场景标签（2026-10-12 工作台化一期）：null = 未打标；侧栏按场景过滤 */
+  scene?: string | null;
 }
 
 export interface TodayPlanView {
@@ -355,6 +357,36 @@ export const api2 = {
     request<{ ok: boolean }>(`/api/conversations/${cid}/model`, { method: "PUT", body: JSON.stringify({ providerId }) }),
   switchAgent: (cid: string, agentId: string) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/agent`, { method: "PUT", body: JSON.stringify({ agentId }) }),
+  /** 场景标签（2026-10-12 工作台化一期）：scene = null 清除 */
+  setConversationScene: (cid: string, scene: string | null) =>
+    request<ConversationEntry>(`/api/conversations/${cid}/scene`, { method: "PUT", body: JSON.stringify({ scene }) }),
+};
+
+// ── 今天页自定义卡片（2026-10-12 工作台化一期：note 便签 | progress 进度） ──
+export interface NotePayloadLoose {
+  text: string;
+}
+export interface ProgressPayloadLoose {
+  value: number;
+  target: number;
+  unit?: string;
+}
+export interface WidgetLoose {
+  id: string;
+  kind: "note" | "progress";
+  title: string;
+  payload: NotePayloadLoose | ProgressPayloadLoose;
+  sort: number;
+  createdTs: number;
+}
+
+export const apiW = {
+  listWidgets: () => request<WidgetLoose[]>("/api/widgets"),
+  createWidget: (input: { kind: string; title: string; payload: unknown }) =>
+    request<WidgetLoose>("/api/widgets", { method: "POST", body: JSON.stringify(input) }),
+  updateWidget: (id: string, patch: { title?: string; payload?: unknown }) =>
+    request<WidgetLoose>(`/api/widgets/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteWidget: (id: string) => request<{ ok: boolean }>(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 
 // ── 批次 3：定时任务 / 通知 ──────────────────────────────

@@ -18,6 +18,7 @@ import { MemoryStore } from "../src/app/memory";
 import { MemoryExtractor } from "../src/app/memory-extract";
 import { TaskStore } from "../src/app/tasks";
 import { NotificationStore } from "../src/app/notify";
+import { WidgetStore } from "../src/app/widgets";
 import { SqliteSessionLog } from "../src/app/session-log";
 import type { TaskDef, TaskRunTrigger } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
@@ -87,6 +88,7 @@ beforeAll(async () => {
   const tasksStore = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
   tasks = tasksStore;
   const notifications = new NotificationStore({ db, now: () => 5000 });
+  const widgetsStore = new WidgetStore(db, { now: () => 5000, randomUUID: () => `wid-${Math.random().toString(36).slice(2, 8)}` });
   const memoryExtractor = new MemoryExtractor({
     db,
     now: () => 5000,
@@ -128,6 +130,7 @@ beforeAll(async () => {
     memoryExtractor,
     tasks,
     notifications,
+    widgets: widgetsStore,
     taskRunner: async (uidRun: string, task: TaskDef, run: TaskRunTrigger) => {
       await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（${run.kind}）${task.instruction}` });
     },
@@ -1340,5 +1343,96 @@ describe("模型连接测试（表单草稿 /api/models/test + 挂起端点超�
     } finally {
       await instance.close();
     }
+  });
+});
+
+describe("HTTP API 工作台化一期（2026-10-12：场景标签 + 自定义卡片）", () => {
+  it("场景标签：PUT scene 打标 → list 带 scene；null 清空；空白 400；他人 cid 404", async () => {
+    const created = await fetch(`${baseUrl}/api/conversations`, { ...json({}), headers: { "Content-Type": "application/json", cookie } });
+    const conv = (await created.json()) as { id: string };
+
+    const put = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: "装修" }),
+    });
+    expect(put.status).toBe(200);
+    expect(((await put.json()) as { scene?: string }).scene).toBe("装修");
+
+    const list = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as { id: string; scene?: string | null }[];
+    expect(list.find((c) => c.id === conv.id)?.scene).toBe("装修");
+
+    const blank = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: "   " }),
+    });
+    expect(blank.status).toBe(400);
+
+    const clear = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: null }),
+    });
+    expect(clear.status).toBe(200);
+    const after = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as { id: string; scene?: string | null }[];
+    expect(after.find((c) => c.id === conv.id)?.scene).toBeNull();
+
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "sceneother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const trespass = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie: otherCookie },
+      body: JSON.stringify({ scene: "偷标" }),
+    });
+    expect(trespass.status).toBe(404);
+  });
+
+  it("自定义卡片 CRUD：建 note/progress → list → 改进度 → 删；u1/u2 隔离；非法 kind 400", async () => {
+    const note = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "note", title: "本周聚焦", payload: { text: "搞定发票报销" } }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(note.status).toBe(200);
+    const noteCard = (await note.json()) as { id: string; kind: string };
+
+    const progress = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "progress", title: "读书", payload: { value: 120, target: 300, unit: "页" } }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    const progressCard = (await progress.json()) as { id: string; payload: { value: number; target: number; unit?: string } };
+    expect(progressCard.payload).toEqual({ value: 120, target: 300, unit: "页" });
+
+    const updated = await fetch(`${baseUrl}/api/widgets/${progressCard.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ payload: { value: 150 } }),
+    });
+    expect(updated.status).toBe(200);
+    expect(((await updated.json()) as { payload: { value: number; target: number } }).payload).toEqual({ value: 150, target: 300, unit: "页" });
+
+    const badKind = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "chart", title: "x", payload: {} }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(badKind.status).toBe(400);
+
+    // uid 隔离：他人看不到、改不了
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "widgetother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const otherList = (await (await fetch(`${baseUrl}/api/widgets`, { headers: { cookie: otherCookie } })).json()) as unknown[];
+    expect(otherList).toHaveLength(0);
+    const otherPut = await fetch(`${baseUrl}/api/widgets/${noteCard.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie: otherCookie },
+      body: JSON.stringify({ title: "偷改" }),
+    });
+    expect(otherPut.status).toBe(404);
+
+    const removed = await fetch(`${baseUrl}/api/widgets/${noteCard.id}`, { method: "DELETE", headers: { cookie } });
+    expect(removed.status).toBe(200);
+    const mine = (await (await fetch(`${baseUrl}/api/widgets`, { headers: { cookie } })).json()) as { id: string }[];
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.id).toBe(progressCard.id);
   });
 });
