@@ -737,6 +737,7 @@ describe("档案时区装配（2026-09-29 SDD 用户档案时区）", () => {
     const expectDate = `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
     expect(mock.requests[0]!.system).toContain(expectDate); // NOW=UTC 9-3 12:00 → 东八区 9-3 20:00，日期行 9-3（UTC 口径同为 9-3 时不断言差，故下面再断周几按东八钟面）
     const shiftedDay = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][shifted.getUTCDay()]!;
-    expect(mock.requests[0]!.system).toContain(`今天是 ${expectDate} ${shiftedDay}`);
+    const shiftedClock = `${String(shifted.getUTCHours()).padStart(2, "0")}:${String(shifted.getUTCMinutes()).padStart(2, "0")}`;
+    expect(mock.requests[0]!.system).toContain(`今天是 ${expectDate} ${shiftedDay}，用户当地时间 ${shiftedClock}`);
   });
 });

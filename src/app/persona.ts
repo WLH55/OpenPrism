@@ -9,7 +9,9 @@ const DEFAULT_IDENTITY = "你是 OpenPrism 的生活记录助理，陪用户记�
 function dateLine(now: number, tzOffsetMinutes: number): string {
   const shifted = new Date(now + tzOffsetMinutes * 60000);
   const date = `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
-  return `今天是 ${date} ${WEEKDAYS[shifted.getUTCDay()]}（用户当地时间）。`;
+  const clock = `${String(shifted.getUTCHours()).padStart(2, "0")}:${String(shifted.getUTCMinutes()).padStart(2, "0")}`;
+  // 带上钟面：只给日期时模型无法区分"中午眯一会"和"晚上正式睡"（systemPrompt 每步重取，钟面随回合刷新）
+  return `今天是 ${date} ${WEEKDAYS[shifted.getUTCDay()]}，用户当地时间 ${clock}。`;
 }
 
 const DISCIPLINE = `守则：
