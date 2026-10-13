@@ -307,6 +307,7 @@ describe("defaultAssistantPrompt", () => {
     const prompt = defaultAssistantPrompt({ now: () => NOW, tzOffsetMinutes: 480 });
     expect(prompt).toContain("2026-09-03");
     expect(prompt).toContain("周四");
+    expect(prompt).toContain("用户当地时间 20:00"); // UTC 12:00 + 480min → 东八区钟面一并注入
     expect(prompt).toContain("record_flow");
     expect(prompt).toContain("query_ledger");
     expect(prompt).toContain("timesPerPeriod"); // 习惯化新口径（2026-09-30）：教学必须教配额
