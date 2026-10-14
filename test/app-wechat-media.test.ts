@@ -308,7 +308,8 @@ describe("微信桥媒体闭环", () => {
     // LLM 收到 image 块（base64 = 解密后的 PNG）
     const lastRequest = fixture.mock.requests.at(-1)!;
     const userMessage = lastRequest.messages.filter((m) => m.role === "user").at(-1)!;
-    expect(userMessage.content).toEqual([{ type: "image", mediaType: "image/png", data: PNG_BYTES.toString("base64") }]);
+    expect(userMessage.content[0]!.type === "text" && userMessage.content[0]!.text.includes("〔系统上下文〕")).toBe(true); // 回合上下文注入块（2026-10-14）
+    expect(userMessage.content.slice(1)).toEqual([{ type: "image", mediaType: "image/png", data: PNG_BYTES.toString("base64") }]);
 
     // 会话日志落 ImageBlock（model-visible 不变量：web 同会话可见）
     const events = fixture.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ?").all(WECHAT_FEED_CID(UID)) as unknown as { event_json: string }[];
@@ -330,7 +331,8 @@ describe("微信桥媒体闭环", () => {
 
     expect(fixture.mock.requests.length).toBe(1);
     const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
-    expect(userMessage.content).toEqual([
+    expect(userMessage.content[0]!.type === "text" && userMessage.content[0]!.text.includes("〔系统上下文〕")).toBe(true);
+    expect(userMessage.content.slice(1)).toEqual([
       { type: "text", text: "看这张图" },
       { type: "image", mediaType: "image/jpeg", data: JPEG_BYTES.toString("base64") },
     ]);
@@ -348,7 +350,8 @@ describe("微信桥媒体闭环", () => {
     await fixture.bridge.pollOnce(UID);
 
     const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
-    expect(userMessage.content).toEqual([{ type: "file", name: "笔记.md", mediaType: "text/markdown", text: "# 标题\n正文内容" }]);
+    expect(userMessage.content[0]!.type === "text" && userMessage.content[0]!.text.includes("〔系统上下文〕")).toBe(true);
+    expect(userMessage.content.slice(1)).toEqual([{ type: "file", name: "笔记.md", mediaType: "text/markdown", text: "# 标题\n正文内容" }]);
   });
 
   it("AC2b 二进制文件：不跑回合，push「只支持文本类文件」说明（LLM 零调用）", async () => {
@@ -378,7 +381,8 @@ describe("微信桥媒体闭环", () => {
 
     expect(fixture.iLink.calls.some((c) => c.url.startsWith("https://novac2c"))).toBe(false);
     const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
-    expect(userMessage.content).toEqual([{ type: "text", text: "今天跑步五公里" }]);
+    expect(userMessage.content[0]!.type === "text" && userMessage.content[0]!.text.includes("〔系统上下文〕")).toBe(true);
+    expect(userMessage.content.slice(1)).toEqual([{ type: "text", text: "今天跑步五公里" }]);
     expect(sentTexts(fixture).at(-1)).toBe("语音收到。");
   });
 
