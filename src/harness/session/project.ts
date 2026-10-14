@@ -54,10 +54,15 @@ export function summaryCheckpointMessage(summary: string): UserMessage {
 /** 从日志投影模型可见历史：跳过遮蔽区间、应用裁剪规则 */
 export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFAULT_PRUNE): SurfaceItem[] {
   let items: SurfaceItem[] = [];
+  // 回合上下文注入（2026-10-14 前缀缓存稳定化）：只并入最后一条带 context 的用户消息——
+  // 历史注入剥离使 wire 至多一个注入块（历史不膨胀），缓存失配点被压在历史尾部（system 与深历史持续命中）。
+  // 按 seq 记位（压缩会重建 items，下标不稳）；该消息若被压缩区间吞掉则自然放弃注入。
+  let lastContext: { seq: number; text: string } | undefined;
   for (const event of events) {
     switch (event.type) {
       case "user/message":
         items.push({ seq: event.seq, message: event.message });
+        if (event.context !== undefined && event.context !== "") lastContext = { seq: event.seq, text: event.context };
         break;
       case "assistant/message":
         items.push({ seq: event.seq, message: event.message });
@@ -97,8 +102,20 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
         break;
     }
   }
+  if (lastContext !== undefined) {
+    const target = items.find((it) => it.seq === lastContext!.seq);
+    if (target && target.message.role === "user") {
+      target.message = {
+        ...target.message,
+        content: [{ type: "text", text: `${TURN_CONTEXT_LABEL}\n${lastContext.text}` }, ...target.message.content],
+      };
+    }
+  }
   return items;
 }
+
+/** 注入块的固定前缀标签：与用户消息正文区分（正文内出现同串也无妨——按 content 首块结构并入，不依赖标签做解析） */
+export const TURN_CONTEXT_LABEL = "〔系统上下文〕";
 
 export function deriveMessages(events: SessionEvent[], prune: PruneConfig = DEFAULT_PRUNE): Message[] {
   return projectSurface(events, prune).map((it) => it.message);

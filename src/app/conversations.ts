@@ -9,7 +9,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
 import { createLedgerTools } from "./tools";
-import { composeAssistantPrompt } from "./persona";
+import { composeAssistantPrompt, dateLine } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
 import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
@@ -190,8 +190,6 @@ function rowToEntry(row: ConversationRow): ConversationEntry {
 export class ConversationStore {
   private pool = new Map<string, Agent>();
   private assembling = new Map<string, Promise<Agent>>();
-  /** 本回合注入用的向量命中（send() 预查写入，systemPrompt 闭包同步读；key = uid:cid） */
-  private turnVectorHits = new Map<string, MemoryVectorHit[]>();
   /** 本回合思考开关（send() 写入、onRequest 闭包读；缺省 = 端点方言各自决定，智谱 coding 缺省关） */
   private turnThinking = new Map<string, boolean>();
 
@@ -598,45 +596,38 @@ export class ConversationStore {
     });
   }
 
-  /** 情境召回的 query = 会话最近一条用户消息（首轮空 → 仅常驻块）；同步读（systemPrompt 闭包是同步的） */
-  private lastUserTextSync(cid: string): string {
-    const row = this.db
-      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND type = 'user/message' ORDER BY seq DESC LIMIT 1")
-      .get(cid) as { event_json: string } | undefined;
-    if (!row) return "";
-    try {
-      const event = JSON.parse(row.event_json) as { message?: UserMessage };
-      return (event.message ? flattenText(event.message) : "").slice(0, 500);
-    } catch {
-      return "";
-    }
+  /** 回合上下文（2026-10-14 前缀缓存稳定化）：钟面 + 记忆召回块（query = 本回合触发消息文本，向量命中可选） */
+  private turnContextFor(uid: string, query: string, vectorHits?: MemoryVectorHit[]): string {
+    const tz = this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset();
+    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
+      uid,
+      query,
+      vectorHits,
+    );
+    return [dateLine(this.deps.now(), tz), memoryBlock].filter((part) => part !== "").join("\n\n");
+  }
+
+  /** 任务触发回合的上下文（main.ts taskRunner 直投 followup 时携带）：钟面 + 记忆召回（query = 触发消息文本） */
+  taskFeedContext(uid: string, query: string): string {
+    return this.turnContextFor(uid, query);
   }
 
   private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
     const current = this.syncCurrentAgent(uid, meta);
-    const vectorHits = this.turnVectorHits.get(`${uid}:${cid}`);
-    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
-      uid,
-      this.lastUserTextSync(cid),
-      vectorHits,
-    );
     const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
-    const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
     return composeAssistantPrompt({
       persona: current.persona,
       ...(current.identity ? { identity: { name: current.name, description: current.identity.description, language: current.identity.language } } : {}),
-      ...(merged !== "" ? { memoryBlock: merged } : {}),
+      ...(catalog !== "" ? { skillCatalog: catalog } : {}),
       taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
-      now: this.deps.now,
-      tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
     });
   }
 
   /**
    * 发送一条用户消息（文本 + 附件块）：附件里的图片要求当前有效模型是多模态，否则就地拒绝（不消耗回合）。
    * 归属校验（2026-09-27 越权补齐）：会话不属于该用户时按不存在拒绝，一个字节都不写。
-   * 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
-   * query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
+   * 向量预查（2026-09-18）：语义命中在回合开始前算好，随回合上下文注入（query = 本回合用户消息）；
+   * 回合上下文（2026-10-14 前缀缓存稳定化）= 钟面 + 记忆召回，随 user/message 事件落日志、只对本回合 wire 生效。
    */
   async send(
     uid: string,
@@ -657,14 +648,12 @@ export class ConversationStore {
     const agent = await this.agent(uid, cid);
     const content: ContentBlock[] = [...(text !== "" ? [{ type: "text" as const, text }] : []), ...attachments];
     const query = flattenText({ role: "user", content });
-    // null（未配置/超时/失败/纯图片消息）→ 清掉旧命中，本回合退纯词法
+    // null（未配置/超时/失败/纯图片消息）→ 本回合退纯词法召回
     const hits =
       this.deps.memoryVector && query.trim() !== ""
         ? await this.deps.memoryVector.recallHits(uid, query, { scope: "situational" })
         : null;
-    if (hits === null) this.turnVectorHits.delete(`${uid}:${cid}`);
-    else this.turnVectorHits.set(`${uid}:${cid}`, hits);
-    agent.followup(content);
+    agent.followup(content, this.turnContextFor(uid, query, hits ?? undefined));
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
   }

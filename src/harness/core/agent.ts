@@ -48,8 +48,8 @@ export interface AgentConfig {
 export interface Agent {
   readonly status: "idle" | "running";
   readonly sessionLog: SessionLog;
-  /** 唤醒并开新 Turn；text 走纯文本，块序列走多模态输入（图片/附件） */
-  followup(input: UserContent): void;
+  /** 唤醒并开新 Turn；text 走纯文本，块序列走多模态输入（图片/附件）；context = 回合级注入（钟面/记忆），随 user/message 落日志 */
+  followup(input: UserContent, context?: string): void;
   steer(text: string): void;
   inject(text: string): void;
   /** 中止当前 Turn；默认清 Inbox */
@@ -62,6 +62,8 @@ export interface Agent {
 
 interface InboxItem {
   content: ContentBlock[];
+  /** 回合级注入上下文：仅 followup 携带（steer/inject 不带），runTurn 落 opener 事件时透传 */
+  context?: string;
 }
 
 function userContent(input: UserContent): ContentBlock[] {
@@ -182,7 +184,12 @@ export function createAgent(config: AgentConfig): Agent {
     const turnNo = countTurns(log.readAll()) + 1;
     await log.append({ type: "turn/start", turn: turnNo });
     const openerChannel: InputChannel = fromSteer ? "steer" : "followup";
-    await log.append({ type: "user/message", channel: openerChannel, message: userMessage(opener.content) });
+    await log.append({
+      type: "user/message",
+      channel: openerChannel,
+      message: userMessage(opener.content),
+      ...(opener.context !== undefined ? { context: opener.context } : {}),
+    });
 
     let reason: TurnEndReason | null = null;
     let stickyMaxTokens = false;
@@ -410,8 +417,8 @@ export function createAgent(config: AgentConfig): Agent {
       return status;
     },
     sessionLog: log,
-    followup(input: UserContent): void {
-      inbox.followup.push({ content: userContent(input) });
+    followup(input: UserContent, context?: string): void {
+      inbox.followup.push({ content: userContent(input), ...(context !== undefined && context !== "" ? { context } : {}) });
       wake();
     },
     steer(text: string): void {

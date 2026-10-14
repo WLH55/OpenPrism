@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { AgentStore, validateIdentityPatch } from "../src/app/agents";
-import { composeAssistantPrompt } from "../src/app/persona";
+import { composeAssistantPrompt, dateLine } from "../src/app/persona";
 import { testDb } from "./helpers-db";
 
 let aidSeq = 0; // 同一 db 内多次 create 需唯一主键
@@ -13,53 +13,51 @@ const store = () =>
 describe("composeAssistantPrompt", () => {
   const NOW = () => Date.UTC(2026, 8, 3, 12, 0, 0);
 
-  it("人设 + 记忆块 + 日期 + 纪律四件齐全；默认身份在人设缺省时兜底", () => {
+  it("人设 + 纪律齐全且全稳定（无日期/记忆——2026-10-14 起走回合上下文注入）；默认身份在人设缺省时兜底", () => {
     const withPersona = composeAssistantPrompt({
       persona: "# 学姐\n温柔毒舌，盯你作息。",
-      memoryBlock: "## 关于用户\n喜欢清淡饮食",
-      now: NOW,
-      tzOffsetMinutes: 480,
     });
     expect(withPersona).toContain("温柔毒舌");
-    expect(withPersona).toContain("喜欢清淡饮食");
-    expect(withPersona).toContain("2026-09-03");
-    expect(withPersona).toContain("周四");
     expect(withPersona).toContain("record_flow");
-    const fallback = composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480 });
+    expect(withPersona).not.toContain("2026-09-03"); // 钟面不在 system（回合上下文注入）
+    expect(withPersona).not.toContain("<user_memory>"); // 记忆不在 system（回合上下文注入）
+    const fallback = composeAssistantPrompt({});
     expect(fallback).toContain("OpenPrism");
     expect(fallback).not.toContain("undefined");
   });
 
+  it("dateLine 导出：钟面行按档案时区口径（回合上下文组装用）", () => {
+    expect(dateLine(NOW(), 480)).toBe("今天是 2026-09-03 周四，用户当地时间 20:00。");
+  });
+
   it("save_preference 纪律随偏好工具出现（显式偏好才记）", () => {
-    const prompt = composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480 });
+    const prompt = composeAssistantPrompt({});
     expect(prompt).toContain("save_preference");
     expect(prompt).toContain("不要猜");
   });
 
   it("提醒会话：taskFeed 时附加自动触发规则，普通会话不带", () => {
-    const feed = composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480, taskFeed: true });
+    const feed = composeAssistantPrompt({ taskFeed: true });
     expect(feed).toContain("定时提醒会话");
     expect(feed).toContain("不是用户此刻打的字");
     expect(feed).toContain("不要拿这些反问用户");
-    expect(composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480 })).not.toContain("定时提醒会话");
+    expect(composeAssistantPrompt({})).not.toContain("定时提醒会话");
   });
 
   it("身份块：伙伴名字+描述进 prompt；灵魂优先级声明；无身份退默认助手", () => {
     const withIdentity = composeAssistantPrompt({
       persona: "## 语气\n像老朋友。",
       identity: { name: "小伴", description: "陪我聊日常", language: "" },
-      now: NOW,
-      tzOffsetMinutes: 480,
     });
     expect(withIdentity).toContain("伙伴「小伴」");
     expect(withIdentity).toContain("陪我聊日常");
     expect(withIdentity).toContain("优先服从灵魂");
     expect(withIdentity).not.toContain("OpenPrism 的生活记录助理"); // 默认身份被身份块替代
     // 语言指令三态
-    expect(composeAssistantPrompt({ identity: { name: "A", language: "zh" }, now: NOW })).toContain("简体中文");
-    expect(composeAssistantPrompt({ identity: { name: "A", language: "en" }, now: NOW })).toContain("always reply in English");
-    expect(composeAssistantPrompt({ identity: { name: "A", language: "" }, now: NOW })).not.toContain("语言要求");
-    const plain = composeAssistantPrompt({ now: NOW, tzOffsetMinutes: 480 });
+    expect(composeAssistantPrompt({ identity: { name: "A", language: "zh" } })).toContain("简体中文");
+    expect(composeAssistantPrompt({ identity: { name: "A", language: "en" } })).toContain("always reply in English");
+    expect(composeAssistantPrompt({ identity: { name: "A", language: "" } })).not.toContain("语言要求");
+    const plain = composeAssistantPrompt({});
     expect(plain).not.toContain("伙伴「");
   });
 });

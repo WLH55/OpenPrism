@@ -1,16 +1,17 @@
-// 人设与 system prompt 合成（批次 2：D4 三段配置——人设卡 + 记忆注入 + 纪律）。
-// 人设 = 纯自由 markdown（名字等固定身份只在表单字段，不从文本结构推导，2026-09-28 起）；
-// 记忆块由 MemoryStore.recallBlockSync 提供（条目化召回 + <user_memory> 信封，2026-09-10）。
+// 人设与 system prompt 合成（批次 2：D4 三段配置——人设卡 + 纪律）。
+// 人设 = 纯自由 markdown（名字等固定身份只在表单字段，不从文本结构推导，2026-09-28 起）。
+// 2026-10-14 前缀缓存稳定化：system 只留稳定块（跨回合字节不变，保厂商前缀缓存命中深历史）；
+// 钟面与记忆召回块改为回合级上下文，随 user/message 事件的 context 字段注入（见 conversations.ts turnContextFor）。
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
 const DEFAULT_IDENTITY = "你是 OpenPrism 的生活记录助理，陪用户记录生活、管理计划、看见自己的进步。";
 
-function dateLine(now: number, tzOffsetMinutes: number): string {
+/** 钟面行（回合上下文用）：日期 + 星期 + 用户当地时刻，按档案时区口径 */
+export function dateLine(now: number, tzOffsetMinutes: number): string {
   const shifted = new Date(now + tzOffsetMinutes * 60000);
   const date = `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
   const clock = `${String(shifted.getUTCHours()).padStart(2, "0")}:${String(shifted.getUTCMinutes()).padStart(2, "0")}`;
-  // 带上钟面：只给日期时模型无法区分"中午眯一会"和"晚上正式睡"（systemPrompt 每步重取，钟面随回合刷新）
   return `今天是 ${date} ${WEEKDAYS[shifted.getUTCDay()]}，用户当地时间 ${clock}。`;
 }
 
@@ -42,12 +43,10 @@ export interface ComposePromptInput {
   persona?: string;
   /** 绑定伙伴时的身份块（向导第①步）；缺省 = 默认助手身份 */
   identity?: AgentIdentityPrompt;
-  /** MemoryStore.injectionBlock 产物（已剥脚注）；缺省 = 无记忆注入 */
-  memoryBlock?: string;
+  /** 稳定的技能目录块（装配期绑定快照）；缺省 = 无 */
+  skillCatalog?: string;
   /** true = 定时提醒会话（cid 前缀 feed:）：附加自动触发的回合规则 */
   taskFeed?: boolean;
-  now(): number;
-  tzOffsetMinutes?: number;
 }
 
 const languageDirective = (language?: string): string => {
@@ -56,7 +55,8 @@ const languageDirective = (language?: string): string => {
   return "";
 };
 
-/** 运行时合成 system prompt：身份（伙伴）→ 灵魂/人设 → 日期 → 记忆 → 纪律 → 语言指令。systemPrompt() 每步重取，改动下一步生效。 */
+/** 运行时合成 system prompt（全稳定块）：身份（伙伴）→ 灵魂/人设 → 任务规则 → 技能目录 → 纪律 → 语言指令。
+ *  systemPrompt() 每步重取，人设热编辑下一步生效；钟面/记忆召回不在此（回合上下文注入）。 */
 export function composeAssistantPrompt(input: ComposePromptInput): string {
   const identity = input.identity;
   const identityBlock =
@@ -64,19 +64,16 @@ export function composeAssistantPrompt(input: ComposePromptInput): string {
       ? `你是由用户创造的伙伴「${identity.name}」${identity.description ? `，用户的描述：${identity.description}` : ""}。下面的灵魂定义你的性格、价值观与说话方式，与通用守则冲突时优先服从灵魂。`
       : "";
   const persona = input.persona?.trim() || DEFAULT_IDENTITY;
-  const parts = [[identityBlock, persona].filter((p) => p !== "").join("\n\n"), dateLine(input.now(), input.tzOffsetMinutes ?? 0)];
+  const parts = [[identityBlock, persona].filter((p) => p !== "").join("\n\n")];
   if (input.taskFeed) parts.push(TASK_FEED_RULES);
-  if (input.memoryBlock && input.memoryBlock.trim() !== "") {
-    // 记忆块自带 <user_memory> 信封（背景资料非指令、冲突以用户当前说法为准），此处直接拼入
-    parts.push(input.memoryBlock.trim());
-  }
+  if (input.skillCatalog && input.skillCatalog.trim() !== "") parts.push(input.skillCatalog.trim());
   parts.push(DISCIPLINE);
   const directive = languageDirective(identity?.language);
   if (directive !== "") parts.push(directive);
   return parts.join("\n\n");
 }
 
-/** 批次 1 兼容出口：默认助手（无人设、无记忆） */
-export function defaultAssistantPrompt(deps: { now: () => number; tzOffsetMinutes?: number }): string {
-  return composeAssistantPrompt(deps);
+/** 批次 1 兼容出口：默认助手（无人设、无目录） */
+export function defaultAssistantPrompt(): string {
+  return composeAssistantPrompt({});
 }

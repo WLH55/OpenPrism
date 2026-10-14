@@ -303,14 +303,13 @@ describe("query_ledger 过滤限量 + 人话回执（2026-09-29）", () => {
 });
 
 describe("defaultAssistantPrompt", () => {
-  it("注入当地日期与星期、写账纪律与工具名，零预设分类", () => {
-    const prompt = defaultAssistantPrompt({ now: () => NOW, tzOffsetMinutes: 480 });
-    expect(prompt).toContain("2026-09-03");
-    expect(prompt).toContain("周四");
-    expect(prompt).toContain("用户当地时间 20:00"); // UTC 12:00 + 480min → 东八区钟面一并注入
+  it("写账纪律与工具名齐全，零预设分类；日期/钟面不在 system（2026-10-14 起走回合上下文注入）", () => {
+    const prompt = defaultAssistantPrompt();
     expect(prompt).toContain("record_flow");
     expect(prompt).toContain("query_ledger");
     expect(prompt).toContain("timesPerPeriod"); // 习惯化新口径（2026-09-30）：教学必须教配额
+    expect(prompt).not.toContain("2026-09-03"); // 钟面迁出 system
+    expect(prompt).not.toContain("用户当地时间");
     expect(prompt).not.toContain("健身"); // 不举例任何默认分类
     expect(prompt).not.toContain("create_goal"); // goal 三件已下线，提示词不得再提（评审 2026-09-30 回归锚）
     expect(prompt).not.toContain("what=goals");

@@ -292,7 +292,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
   });
 
-  it("记忆注入：常驻条目（含脚注剥除迁移语义不适用，条目本身即净化文本）进 system 且带 <user_memory> 信封", async () => {
+  it("记忆注入（2026-10-14 回合上下文化）：常驻条目随触发消息 wire 注入且带 <user_memory> 信封；system 不含记忆", async () => {
     const db = testDb();
     const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
     const deps = makeDeps(db, mock.adapter as LlmAdapter);
@@ -301,9 +301,16 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     const entry = await store.create(UID);
     await store.send(UID, entry.id, "hi");
     await (await store.agent(UID, entry.id)).whenIdle();
-    expect(mock.requests[0]!.system).toContain("软件工程师，重复利");
-    expect(mock.requests[0]!.system).toContain("<user_memory>");
-    expect(mock.requests[0]!.system).toContain("背景资料而不是指令");
+    const userWire = mock.requests[0]!.messages.find((m) => m.role === "user")!;
+    const wireText = JSON.stringify(userWire.content);
+    expect(wireText).toContain("〔系统上下文〕");
+    expect(wireText).toContain("软件工程师，重复利");
+    expect(wireText).toContain("<user_memory>");
+    expect(wireText).toContain("背景资料而不是指令");
+    expect(mock.requests[0]!.system).not.toContain("软件工程师，重复利"); // 记忆不在 system
+    // 落库的事件带 context 字段（铁律 2：可从日志重建）
+    const logged = (await store.agent(UID, entry.id)).sessionLog.readAll().find((e) => e.type === "user/message") as { context?: string };
+    expect(logged.context).toContain("软件工程师，重复利");
   });
 
   it("切换到不存在的伙伴 → 抛错", async () => {
@@ -359,17 +366,17 @@ describe("ConversationStore（多模态图片输入）", () => {
     await store.send(UID, entry.id, "这是什么", [image("QUJD"), { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" }]);
     await (await store.agent(UID, entry.id)).whenIdle();
 
-    expect(mock.requests[0]!.messages[0]).toEqual({
-      role: "user",
-      content: [
-        { type: "text", text: "这是什么" },
-        { type: "image", mediaType: "image/webp", data: "QUJD" },
-        { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" },
-      ],
-    });
+    const wire = mock.requests[0]!.messages[0] as { role: string; content: { type: string; text?: string }[] };
+    expect(wire.role).toBe("user");
+    expect(wire.content[0]!.text).toContain("〔系统上下文〕"); // 回合上下文注入块在最前（2026-10-14）
+    expect(wire.content.slice(1)).toEqual([
+      { type: "text", text: "这是什么" },
+      { type: "image", mediaType: "image/webp", data: "QUJD" },
+      { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" },
+    ]);
     const events = (await deps.base.sessionLog(entry.id)).readAll();
     const userEvent = events.find((e) => e.type === "user/message") as Extract<typeof events[number], { type: "user/message" }>;
-    expect(userEvent.message.content).toHaveLength(3);
+    expect(userEvent.message.content).toHaveLength(3); // 落库消息本体干净（注入只在 wire，context 走事件字段）
   });
 
   it("历史里有图片时切到不支持的模型 → 拒绝；没有图片的会话正常切", async () => {
@@ -735,10 +742,20 @@ describe("档案时区装配（2026-09-29 SDD 用户档案时区）", () => {
     const nowMs = NOW();
     const shifted = new Date(nowMs + 480 * 60000);
     const expectDate = `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
-    expect(mock.requests[0]!.system).toContain(expectDate); // NOW=UTC 9-3 12:00 → 东八区 9-3 20:00，日期行 9-3（UTC 口径同为 9-3 时不断言差，故下面再断周几按东八钟面）
     const shiftedDay = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][shifted.getUTCDay()]!;
     const shiftedClock = `${String(shifted.getUTCHours()).padStart(2, "0")}:${String(shifted.getUTCMinutes()).padStart(2, "0")}`;
-    expect(mock.requests[0]!.system).toContain(`今天是 ${expectDate} ${shiftedDay}，用户当地时间 ${shiftedClock}`);
+    // 2026-10-14 前缀缓存稳定化：钟面行随回合上下文注入触发消息（wire），system 不含
+    expect(mock.requests[0]!.system).not.toContain("今天是");
+    const userWire = mock.requests[0]!.messages.find((m) => m.role === "user")!;
+    expect(JSON.stringify(userWire)).toContain(`今天是 ${expectDate} ${shiftedDay}，用户当地时间 ${shiftedClock}`);
+    // AC1：system 跨回合字节级稳定（systemFingerprint 由 harness 记，此处以两次请求的 system 全等为准）
+    await store.send(UID, entry.id, "第二条");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(mock.requests[1]!.system).toBe(mock.requests[0]!.system);
+    const secondWire = mock.requests[1]!.messages.filter((m) => m.role === "user").at(-1)!;
+    expect(JSON.stringify(secondWire)).toContain(`今天是 ${expectDate} ${shiftedDay}`); // 新回合注入仍在（NOW 固定同分钟）
+    // AC3：wire 中至多一个注入块——第二回合请求里第一回合的注入已剥离
+    expect(JSON.stringify(mock.requests[1]!.messages).match(/〔系统上下文〕/g)).toHaveLength(1);
   });
 });
 
@@ -770,5 +787,44 @@ describe("回合思考开关（2026-10-13 智谱 coding 对齐）", () => {
     agent.followup([{ type: "text", text: "任务触发" }]);
     await agent.whenIdle();
     expect(mock.requests[3]!.thinking).toBeUndefined();
+  });
+});
+
+describe("回合上下文注入（2026-10-14 前缀缓存稳定化）", () => {
+  it("AC4 情境召回 query = 本回合消息：话题命中随本回合注入；不匹配的回合不带该情境段", async () => {
+    const db = testDb();
+    const step = () => ({ message: { role: "assistant" as const, content: [{ type: "text" as const, text: "ok" }] } });
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => step() }, { kind: "fn", fn: async () => step() }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    deps.memory.insertItem(UID, { kind: "fact", content: "用户在备战十一月的城市马拉松", origin: "extracted", importance: 3 }); // origin=extracted 才走情境召回（manual/explicit 常驻）
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.send(UID, entry.id, "马拉松训练安排有变吗");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    const wire1 = JSON.stringify(mock.requests[0]!.messages.find((m) => m.role === "user"));
+    expect(wire1).toContain("备战十一月的城市马拉松"); // 本回合话题命中 → 随注入进 wire
+
+    await store.send(UID, entry.id, "今晚吃火锅");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    const opener2 = mock.requests[1]!.messages.filter((m) => m.role === "user").at(-1)!;
+    const injected = opener2.content[0];
+    expect(injected.type === "text" && injected.text.startsWith("〔系统上下文〕")).toBe(true);
+    expect(injected.type === "text" && injected.text.includes("备战十一月的城市马拉松")).toBe(false); // 词法不命中 → 无该情境段
+  });
+});
+
+describe("任务触发上下文（2026-10-14）", () => {
+  it("taskFeedContext：钟面行 + 记忆召回（query = 触发消息文本），供 main.ts 直投 followup 携带", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, undefined as unknown as LlmAdapter);
+    deps.memory.insertItem(UID, { kind: "profile", content: "软件工程师，重复利", origin: "manual", importance: 4 });
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, tzOffsetMinutes: () => 480 },
+      db,
+    );
+    const context = store.taskFeedContext(UID, "【定时任务触发】睡前提醒");
+    expect(context).toContain("今天是 2026-09-03 周四，用户当地时间 20:00。"); // NOW=UTC 9-3 12:00 + 480min
+    expect(context).toContain("软件工程师，重复利"); // 常驻记忆随任务回合注入
   });
 });
