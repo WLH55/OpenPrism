@@ -132,6 +132,9 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
   const idleTimeoutMs = config.idleTimeoutMs ?? 120_000;
   const url = config.baseURL.replace(/\/+$/, "") + "/chat/completions";
   const embeddingsUrl = config.baseURL.replace(/\/+$/, "") + "/embeddings";
+  // 智谱 coding 端点方言（bigmodel.cn / z.ai 的 /api/coding/paas/v4，dsh 的 zai-coding-cn 同源）：
+  // thinking 参数三态——开 = enabled 且保留思维链回传，关/缺省 = disabled（对齐 pi-ai 的 zai thinkingFormat 缺省）
+  const zaiCoding = /\/api\/coding\//.test(config.baseURL);
 
   return {
     name: "openai-compat",
@@ -197,6 +200,9 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
           }));
         }
         if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
+        if (zaiCoding) {
+          body.thinking = request.thinking ? { type: "enabled", clear_thinking: false } : { type: "disabled" };
+        }
         if (useStream) {
           body.stream = true;
           body.stream_options = { include_usage: true };

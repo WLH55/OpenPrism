@@ -192,6 +192,8 @@ export class ConversationStore {
   private assembling = new Map<string, Promise<Agent>>();
   /** 本回合注入用的向量命中（send() 预查写入，systemPrompt 闭包同步读；key = uid:cid） */
   private turnVectorHits = new Map<string, MemoryVectorHit[]>();
+  /** 本回合思考开关（send() 写入、onRequest 闭包读；缺省 = 端点方言各自决定，智谱 coding 缺省关） */
+  private turnThinking = new Map<string, boolean>();
 
   constructor(
     private deps: ConversationDeps,
@@ -588,7 +590,8 @@ export class ConversationStore {
         if (!config.multimodal && request.messages.some((message) => hasImageBlocks(message))) {
           throw new ModelNotMultimodalError();
         }
-        return request;
+        const thinking = this.turnThinking.get(`${uid}:${conversationId}`);
+        return thinking === undefined ? request : { ...request, thinking };
       },
       tools,
       maxStepsPerTurn: 24,
@@ -635,13 +638,22 @@ export class ConversationStore {
    * 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
    * query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
    */
-  async send(uid: string, cid: string, text: string, attachments: ContentBlock[] = []): Promise<void> {
+  async send(
+    uid: string,
+    cid: string,
+    text: string,
+    attachments: ContentBlock[] = [],
+    opts?: { thinking?: boolean },
+  ): Promise<void> {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     if (attachments.some((block) => block.type === "image")) {
       const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
       if (!config) throw new ModelNotConfiguredError();
       if (!config.multimodal) throw new ModelNotMultimodalError();
     }
+    // 回合级思考开关：只在本条消息显式给了才注入；没给就清掉（微信桥走 send() 不带 opts → 用端点缺省）
+    if (opts?.thinking === undefined) this.turnThinking.delete(`${uid}:${cid}`);
+    else this.turnThinking.set(`${uid}:${cid}`, opts.thinking);
     const agent = await this.agent(uid, cid);
     const content: ContentBlock[] = [...(text !== "" ? [{ type: "text" as const, text }] : []), ...attachments];
     const query = flattenText({ role: "user", content });
@@ -666,6 +678,11 @@ export class ConversationStore {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     const agent = await this.agent(uid, cid);
     agent.cancel();
+  }
+
+  /** 任务触发回合不经 send()（main.ts 直投 followup）：投递前清回合思考标志，避免吃到用户在 web 端同会话留下的残留 */
+  clearTurnThinking(uid: string, cid: string): void {
+    this.turnThinking.delete(`${uid}:${cid}`);
   }
 
   /** 凝练原料：该用户全部会话的 user/assistant 文本（SQL 取代逐文件全扫） */
