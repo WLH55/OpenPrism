@@ -576,7 +576,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
 
     if (sub === "/messages" && method === "POST") {
-      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown };
+      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown; thinking?: unknown };
       const text = String(body.text ?? "").trim();
       let attachments;
       try {
@@ -586,7 +586,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       }
       if (text === "" && attachments.length === 0) return sendError(res, 400, "text 或 attachments 必填");
       try {
-        await deps.conversations.send(uid, cid, text, attachments);
+        await deps.conversations.send(uid, cid, text, attachments, typeof body.thinking === "boolean" ? { thinking: body.thinking } : {});
         return sendJson(res, 202, { ok: true });
       } catch (error) {
         if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");

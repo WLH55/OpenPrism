@@ -206,10 +206,14 @@ export const api = {
     const query = params.toString();
     return request<SessionEventLoose[]>(`/api/conversations/${cid}/events${query ? `?${query}` : ""}`);
   },
-  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = []) =>
+  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = [], thinking?: boolean) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, {
       method: "POST",
-      body: JSON.stringify(attachments.length > 0 ? { text, attachments } : { text }),
+      body: JSON.stringify({
+        text,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(thinking !== undefined ? { thinking } : {}),
+      }),
     }),
   /** 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息 */
   stopConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}/stop`, { method: "POST" }),

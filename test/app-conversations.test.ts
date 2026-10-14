@@ -741,3 +741,34 @@ describe("档案时区装配（2026-09-29 SDD 用户档案时区）", () => {
     expect(mock.requests[0]!.system).toContain(`今天是 ${expectDate} ${shiftedDay}，用户当地时间 ${shiftedClock}`);
   });
 });
+
+describe("回合思考开关（2026-10-13 智谱 coding 对齐）", () => {
+  it("send 带 thinking 注入请求；不带不注入；任务直投路径先清标志防残留", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks },
+      db,
+    );
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "开思考", [], { thinking: true });
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(mock.requests[0]!.thinking).toBe(true);
+
+    // 没带 opts 的普通消息（微信桥同款路径）：清掉本会话回合标志，请求不带 thinking
+    await store.send(UID, entry.id, "普通消息");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(mock.requests[1]!.thinking).toBeUndefined();
+
+    // 任务路径：send 设了 thinking 后直投 followup——不清会吃到残留（先证明残留存在，再证 clear 掉）
+    await store.send(UID, entry.id, "再开一次", [], { thinking: true });
+    const agent = await store.agent(UID, entry.id);
+    await agent.whenIdle();
+    expect(mock.requests[2]!.thinking).toBe(true);
+    store.clearTurnThinking(UID, entry.id);
+    agent.followup([{ type: "text", text: "任务触发" }]);
+    await agent.whenIdle();
+    expect(mock.requests[3]!.thinking).toBeUndefined();
+  });
+});
