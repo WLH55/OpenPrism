@@ -71,6 +71,9 @@ describe("platformFromBaseURL", () => {
   it("常见平台自动识别；未知回退 hostname；非法返回空串", () => {
     expect(platformFromBaseURL("https://api.deepseek.com")).toBe("DeepSeek");
     expect(platformFromBaseURL("https://open.bigmodel.cn/api/paas/v4")).toBe("智谱 GLM");
+    // coding 端点优先于通用 bigmodel：编程套餐与标准 API 两个额度池要区分（2026-10-13）
+    expect(platformFromBaseURL("https://open.bigmodel.cn/api/coding/paas/v4")).toBe("智谱 Coding");
+    expect(platformFromBaseURL("https://api.z.ai/api/coding/paas/v4")).toBe("智谱 Coding");
     expect(platformFromBaseURL("https://dashscope.aliyuncs.com/compatible-mode/v1")).toBe("通义千问 Qwen");
     expect(platformFromBaseURL("http://127.0.0.1:8000/v1")).toBe("本地服务");
     expect(platformFromBaseURL("https://example.unknowndomain.io/v1")).toBe("example.unknowndomain.io");
