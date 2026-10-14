@@ -70,6 +70,8 @@ export interface ModelProviderView {
 
 const PLATFORM_PATTERNS: [RegExp, string][] = [
   [/deepseek/i, "DeepSeek"],
+  // coding 端点先于通用 bigmodel 匹配：编程套餐与标准 API 是两把 Key、两个额度池，列表里要能区分
+  [/bigmodel\.cn\/api\/coding|z\.ai\/api\/coding/i, "智谱 Coding"],
   [/bigmodel\.cn|zhipu/i, "智谱 GLM"],
   [/dashscope|aliyuncs/i, "通义千问 Qwen"],
   [/moonshot/i, "Moonshot Kimi"],

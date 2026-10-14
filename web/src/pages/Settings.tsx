@@ -8,6 +8,7 @@ const inputCls =
 /** baseURL → 平台显示名（与服务端 platformFromBaseURL 同表的本地预览；落库以服务端推导为准） */
 const PLATFORM_PATTERNS: [RegExp, string][] = [
   [/deepseek/i, "DeepSeek"],
+  [/bigmodel\.cn\/api\/coding|z\.ai\/api\/coding/i, "智谱 Coding"],
   [/bigmodel\.cn|zhipu/i, "智谱 GLM"],
   [/dashscope|aliyuncs/i, "通义千问 Qwen"],
   [/moonshot/i, "Moonshot Kimi"],
@@ -53,6 +54,9 @@ interface ModelPreset {
 const MODEL_PRESETS: ModelPreset[] = [
   { id: "deepseek", label: "DeepSeek", baseURL: "https://api.deepseek.com", model: "deepseek-chat", contextWindow: 128000, desc: "deepseek-chat / deepseek-reasoner" },
   { id: "zhipu", label: "智谱 GLM", baseURL: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.7", contextWindow: 200000, desc: "glm-4.7 / glm-4.6 / glm-4.5-air" },
+  // 智谱 Coding Plan（GLM 编程套餐专用端点，dsh/pi-ai 的 zai-coding-cn 同款）：OpenAI 兼容协议 + 套餐 Key；
+  // 模型名以套餐页清单为准；国际站对应 https://api.z.ai/api/coding/paas/v4；官方口径套餐额度仅限指定编程工具使用
+  { id: "zhipu-coding", label: "智谱 Coding Plan", baseURL: "https://open.bigmodel.cn/api/coding/paas/v4", model: "glm-5.1", contextWindow: 200000, desc: "glm-5.2 / glm-5.1 / glm-5-turbo；glm-5v-turbo 识图（勾多模态）；Key 在编程套餐页新建" },
   { id: "aliyun", label: "通义千问", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus", contextWindow: 131072, desc: "qwen-plus / qwen-max / qwen3 系列" },
   { id: "moonshot", label: "Moonshot Kimi", baseURL: "https://api.moonshot.cn/v1", model: "kimi-k2.5", contextWindow: 256000, desc: "kimi-k2.5 / kimi-k2 系列" },
   { id: "openai", label: "OpenAI", baseURL: "https://api.openai.com/v1", model: "gpt-5.2", contextWindow: 400000, desc: "gpt-5.2 / gpt-5-mini（按具体型号核对窗口）" },
