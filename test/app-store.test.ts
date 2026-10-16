@@ -70,9 +70,13 @@ describe("openDb", () => {
     for (const expected of [
       "users", "sessions", "ledger_entries", "conversations", "conversation_events",
       "agents", "skills", "mcps", "tasks", "task_runs", "notifications",
-      "memory_slots", "memory_meta", "model_config", "archives", "meta",
+      "memory_meta", "archives", "meta",
     ]) {
       expect(names).toContain(expected);
+    }
+    // 遗留七表已删（2026-10-01，schema v2）：新库不再建
+    for (const legacy of ["l1_entities", "l1_changes", "l2_entries", "l2_meta", "l3_meta", "memory_slots", "model_config"]) {
+      expect(names).not.toContain(legacy);
     }
   });
 

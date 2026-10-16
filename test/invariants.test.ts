@@ -42,19 +42,24 @@ describe("不变量：请求可从日志重建", () => {
       systemPrompt: () => "SYS",
       tools: [echoTool],
     });
-    agent.followup("一");
+    agent.followup("一", "回合上下文甲");
     agent.inject("静默背景");
     agent.steer("补充要求");
     await agent.whenIdle();
-    agent.followup("二");
+    agent.followup("二", "回合上下文乙");
     await sleep(5);
     await agent.whenIdle();
 
     expect(captured.length).toBeGreaterThanOrEqual(4);
     for (const { messages, logLength } of captured) {
       const rebuilt = deriveMessages(log.readAll().slice(0, logLength));
-      expect(messages).toEqual(rebuilt); // 每条发出的请求都能从日志重建
+      expect(messages).toEqual(rebuilt); // 每条发出的请求都能从日志重建（context 字段在投影内合并，同样可重建）
     }
+    // 回合上下文注入（2026-10-14）：最终请求 wire 中至多一个注入块，且是最新回合的
+    const finalWire = JSON.stringify(captured.at(-1)!.messages);
+    expect(finalWire.match(/〔系统上下文〕/g)).toHaveLength(1);
+    expect(finalWire).toContain("回合上下文乙");
+    expect(finalWire).not.toContain("回合上下文甲"); // 上一回合注入已剥离（历史不膨胀）
     // 会话确实覆盖了各事件类型
     const types = new Set(log.readAll().map((event) => event.type));
     for (const expected of ["turn/start", "turn/end", "user/message", "assistant/message", "tool/call", "tool/result", "llm/retry", "request/header"]) {
@@ -100,7 +105,9 @@ function generateStream(seed: number, turnCount: number): SessionEvent[] {
         role: "user",
         content: [{ type: "text", text: `u${turn}-${u}-${"字".repeat(1 + Math.floor(random() * 200))}` }],
       };
-      pushMessage(state, message, { type: "user/message", channel, message });
+      // followup 概率携带回合上下文（2026-10-14）：检验「仅最新未遮蔽者并入 wire」
+      const context = channel === "followup" && random() < 0.6 ? `c${turn}-${u}` : undefined;
+      pushMessage(state, message, { type: "user/message", channel, message, ...(context !== undefined ? { context } : {}) });
     }
     const stepCount = 1 + Math.floor(random() * 3);
     for (let s = 0; s < stepCount; s++) {
@@ -233,6 +240,23 @@ describe("不变量：随机事件流投影", () => {
         for (const block of message.content) {
           if (block.type === "text") expect([...block.text].length).toBeLessThan(8193 + 100);
         }
+      }
+      // 回合上下文（2026-10-14）：wire 至多一个注入块；有则必为最后一条未被遮蔽的 context 事件
+      const label = "〔系统上下文〕";
+      const mergedUsers = first.filter(
+        (m) => m.role === "user" && m.content[0]?.type === "text" && m.content[0].text.startsWith(label),
+      );
+      const shadowRanges = events.filter((e) => e.type === "compaction/summary") as Extract<SessionEvent, { type: "compaction/summary" }>[];
+      const inShadow = (seq: number) => shadowRanges.some((e) => seq >= e.shadowed[0] && seq <= e.shadowed[1]);
+      const lastVisibleCtx = [...events].reverse().find(
+        (e) => e.type === "user/message" && (e as { context?: string }).context !== undefined && !inShadow(e.seq),
+      ) as { context?: string } | undefined;
+      if (mergedUsers.length > 0) {
+        expect(mergedUsers).toHaveLength(1);
+        expect(lastVisibleCtx?.context).toBeDefined();
+        expect((mergedUsers[0]!.content[0] as { text: string }).text).toContain(lastVisibleCtx!.context!);
+      } else {
+        expect(lastVisibleCtx).toBeUndefined();
       }
     }
   });

@@ -372,6 +372,33 @@ describe("错误码表映射", () => {
   });
 });
 
+describe("智谱 coding 端点 thinking 方言（2026-10-13 dsh 对齐）", () => {
+  const thinkingOf = async (baseURL: string, thinking?: boolean): Promise<unknown> => {
+    let sentBody: Record<string, unknown> | undefined;
+    const adapter = createOpenAICompatAdapter(
+      envWith(async (_url, init) => {
+        sentBody = JSON.parse(init!.body as string);
+        return jsonResponse({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+      }),
+      { baseURL, apiKey: "k", stream: false },
+    );
+    await adapter.complete(thinking === undefined ? baseRequest : { ...baseRequest, thinking });
+    return sentBody!.thinking;
+  };
+
+  it("coding 端点三态：开 = enabled 且保留思维链；关/缺省 = disabled（pi-ai 的 zai thinkingFormat 缺省）", async () => {
+    expect(await thinkingOf("https://open.bigmodel.cn/api/coding/paas/v4", true)).toEqual({ type: "enabled", clear_thinking: false });
+    expect(await thinkingOf("https://open.bigmodel.cn/api/coding/paas/v4", false)).toEqual({ type: "disabled" });
+    expect(await thinkingOf("https://open.bigmodel.cn/api/coding/paas/v4")).toEqual({ type: "disabled" });
+  });
+
+  it("国际 coding 端点同方言；标准 API / 其他端点不发 thinking（不动既有行为的边界）", async () => {
+    expect(await thinkingOf("https://api.z.ai/api/coding/paas/v4", true)).toEqual({ type: "enabled", clear_thinking: false });
+    expect(await thinkingOf("https://open.bigmodel.cn/api/paas/v4", true)).toBeUndefined();
+    expect(await thinkingOf("https://api.deepseek.com", true)).toBeUndefined();
+  });
+});
+
 describe("embed（embedding 端点，2026-09-18）", () => {
   const embedAdapter = (responder: (url: string, init?: EnvFetchRequest) => Promise<EnvFetchResponse>) =>
     createOpenAICompatAdapter(envWith(responder), { baseURL: "https://x/v1", apiKey: "k", stream: false });

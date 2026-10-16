@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type TodayPlanView, type TodayView, type TopItemLoose } from "../api";
+import { api, apiW, type NotePayloadLoose, type ProgressPayloadLoose, type TodayPlanView, type TodayView, type TopItemLoose, type WidgetLoose } from "../api";
 import { catColor } from "../catcolor";
 import { daysUntil } from "../days";
 import { CheckSolidIcon } from "../icons";
@@ -31,7 +31,7 @@ function localYmd(ts: number): string {
 }
 
 /** 计划行（2026-09-29 提取为组件以承载行内交互）：打卡/撤销 + 编辑（标题/due，planId 稳定）+ 周期补卡（date ≤ 今天） */
-function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate: string; onChanged: () => void }) {
+function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate: string; onChanged: () => void | Promise<void> }) {
   const state = plan.state ?? (plan.done ? "done" : "todo");
   const daysTo = plan.due !== undefined ? daysUntil(plan.due, viewDate) : null;
   // 撤销降级（评审 2026-09-29 簇 A）：无 seq（旧服务端）时完成态不可交互，不给"可取消"的假象——与计划页 MilestoneRow 同规
@@ -42,13 +42,18 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   const [backfilling, setBackfilling] = useState(false);
   const [backfillDate, setBackfillDate] = useState("");
   const [busy, setBusy] = useState(false);
-  const canBackfill = plan.scope !== "deadline" && !plan.done;
+  // 打卡即显（2026-10-01）：点击先乐观翻转到 done，请求+刷新落地前 toggling 锁吃掉二击——
+  // 慢网下旧行为要等「打卡往返 + today 整页重拉」才变样，用户以为没点上再点一次就会误发撤销/重复打卡
+  const [toggling, setToggling] = useState(false);
+  const [optimisticDone, setOptimisticDone] = useState<boolean | null>(null);
+  const done = optimisticDone ?? plan.done; // 显示口径（勾选圈/划线/徽标全走它）；点击分支判断仍用 plan.done 真值
+  const canBackfill = plan.scope !== "deadline" && !done;
   // 习惯计划（2026-09-30 习惯化）：进度芯片 + 按天计数（week/month/year）的同日二击防护
   const habit = plan.timesPerPeriod !== undefined;
   const progressText = habit ? `${SCOPE_LABEL[plan.scope] ?? "本期"} ${plan.periodCount ?? 0}/${plan.timesPerPeriod}` : null;
 
   const stateLabel =
-    state === "done"
+    done
       ? "已完成"
       : state === "overdue"
         ? daysTo !== null && daysTo < 0
@@ -65,7 +70,7 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
                   ? `${daysTo} 天后`
                   : (plan.due ?? "未开始")
               : "待做";
-  const stateCls = state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : "text-ink3";
+  const stateCls = done ? "text-ink3" : state === "overdue" ? "text-warm" : state === "dueToday" ? "text-accent" : "text-ink3";
   const skip = async () => {
     if (plan.seq === undefined || !window.confirm(`跳过「${plan.title}」？= 作废这条计划（留痕可审计）。`)) return;
     try {
@@ -151,30 +156,36 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   return (
     <div
       className={`flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition ${
-        undoable || !plan.done ? "cursor-pointer hover:bg-surface2/60" : "opacity-90"
+        undoable || !done ? "cursor-pointer hover:bg-surface2/60" : "opacity-90"
       }`}
       onClick={async () => {
-        if (plan.done && !undoable) return;
+        if (toggling || (plan.done && !undoable)) return; // 请求在途的二击 = 在旧数据上误发撤销/重复打卡，直接忽略
+        setToggling(true);
         try {
           if (plan.done) {
+            setOptimisticDone(false);
             // 撤销 = 作废打卡（deadline=全部存活 done 打卡；周期/习惯=今日打卡），追加 done:false 对两者都无效
             for (const seq of plan.doneSeqs!) await api.voidRecord(seq);
           } else if (habit && plan.scope !== "day" && plan.checkinTs !== undefined) {
-            // 按天计数的习惯（每周/月/年 N 天）今天已计入：第二击 = 撤销今天的卡（不新增一天）
+            // 按天计数的习惯（每周/月/年 N 天）今天已计入：第二击 = 撤销今天的卡（不新增一天）——confirm 弹窗即反馈，不乐观翻转
             const seqs = (plan.checkins ?? []).filter((c) => localYmd(c.at) === viewDate).map((c) => c.seq);
-            if (seqs.length > 0 && window.confirm(`今天这一卡已经算进${progressText}了。撤销今天的打卡吗？`)) {
-              for (const seq of seqs) await api.voidRecord(seq);
-            }
+            if (seqs.length === 0 || !window.confirm(`今天这一卡已经算进${progressText}了。撤销今天的打卡吗？`)) return;
+            for (const seq of seqs) await api.voidRecord(seq);
           } else {
+            setOptimisticDone(true);
             await api.checkin(plan.planId, true);
           }
+          await onChanged(); // 等新数据落地再解锁：解锁时组件已持有新 props，后续点击才落在真状态上
         } catch (e) {
           window.alert(String((e as Error).message));
+          await onChanged(); // 撤销是逐条作废的循环，可能部分成功——失败也重拉一次对齐服务器真相
+        } finally {
+          setOptimisticDone(null);
+          setToggling(false);
         }
-        onChanged();
       }}
       title={
-        plan.done
+        done
           ? undoable
             ? "点击撤销打卡（作废该打卡记录，历史留痕）"
             : "已完成"
@@ -183,7 +194,7 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
             : "点击打卡（逾期项 = 现在补做）"
       }
     >
-      {plan.done ? (
+      {done ? (
         <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent2 text-white">
           <CheckSolidIcon className="h-3.5 w-3.5" />
         </span>
@@ -191,11 +202,11 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
         <span className="h-5 w-5 shrink-0 rounded-full border-2 border-line" />
       )}
       <span className="min-w-0 flex-1">
-        <span className={`block truncate text-[15px] ${plan.done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
+        <span className={`block truncate text-[15px] ${done ? "text-ink3 line-through" : "text-ink"}`}>{plan.title}</span>
       </span>
-      {plan.due !== undefined && !plan.done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
-      {habit && <span className={`num shrink-0 text-xs ${plan.done ? "text-accent" : "text-ink3"}`}>{progressText}</span>}
-      {(!habit || plan.done) && <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>}
+      {plan.due !== undefined && !done && <span className="num shrink-0 text-xs text-ink3">{plan.due.slice(5)}</span>}
+      {habit && <span className={`num shrink-0 text-xs ${done ? "text-accent" : "text-ink3"}`}>{progressText}</span>}
+      {(!habit || done) && <span className={`num shrink-0 text-xs ${stateCls}`}>{stateLabel}</span>}
       {canBackfill && (
         <button
           className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-accent/10 hover:text-accent"
@@ -234,8 +245,8 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   );
 }
 
-/** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新（习惯项带进度、按天计数做同日防护） */
-function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: (item: TopItemLoose) => void }) {
+/** 今日必做（B3）：确定性折叠的 Top3；可点项打卡后刷新（习惯项带进度、按天计数做同日防护；打卡在途降透明度防二击） */
+function Top3Card({ items, pendingPlanId, onCheckin }: { items: TopItemLoose[]; pendingPlanId: string | null; onCheckin: (item: TopItemLoose) => void }) {
   if (items.length === 0) {
     return (
       <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3.5 text-sm text-ink3">
@@ -250,7 +261,9 @@ function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: (ite
         {items.map((item, index) => (
           <button
             key={`${item.kind}-${item.planId ?? item.title}-${index}`}
-            className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60"
+            className={`flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition hover:bg-surface2/60 ${
+              item.planId !== undefined && item.planId === pendingPlanId ? "opacity-60" : ""
+            }}`}
             onClick={() => onCheckin(item)}
             title="点击打卡"
           >
@@ -277,7 +290,164 @@ function Top3Card({ items, onCheckin }: { items: TopItemLoose[]; onCheckin: (ite
   );
 }
 
-/** 今天页：Top3 + 快速记录 + 三统计卡 + 计划四段范围切换（今天/本周/全部/已完成；计划管理唯一入口，2026-09-30 目标层级下线） */
+/** 我的卡片（2026-10-12 工作台化一期）：Agent/对话里建的配置驱动小卡——note 便签 | progress 进度。
+ *  就地编辑/删除（Agent 工具之外的另一更新通道，手机 web 上不必开对话就能推进度）。 */
+function WidgetCard({ widget, onChanged }: { widget: WidgetLoose; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await fn();
+      onChanged();
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const actions = (
+    <div className="flex shrink-0 items-center gap-2 text-xs text-ink3">
+      <button className="transition hover:text-accent" onClick={() => setEditing(!editing)}>
+        {editing ? "收起" : "编辑"}
+      </button>
+      <button
+        className="transition hover:text-warm"
+        onClick={() => {
+          if (window.confirm(`删除卡片「${widget.title}」？`)) void run(() => apiW.deleteWidget(widget.id));
+        }}
+      >
+        删除
+      </button>
+    </div>
+  );
+
+  if (widget.kind === "note") {
+    const payload = widget.payload as NotePayloadLoose;
+    return (
+      <div className="rounded-xl border border-line bg-surface px-4 py-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0 truncate text-sm font-medium text-ink">{widget.title}</div>
+          {actions}
+        </div>
+        {editing ? (
+          <NoteEdit
+            initial={payload.text}
+            busy={busy}
+            onSave={(text) => void run(async () => {
+              await apiW.updateWidget(widget.id, { payload: { text } });
+              setEditing(false);
+            })}
+          />
+        ) : (
+          <p className="mt-1.5 whitespace-pre-wrap break-words text-[15px] text-ink2">{payload.text}</p>
+        )}
+      </div>
+    );
+  }
+
+  const payload = widget.payload as ProgressPayloadLoose;
+  const pct = Math.max(0, Math.min(100, Math.round((payload.value / payload.target) * 100)));
+  // 大目标给大步长（300 页的书 ±1 太磨人）；改具体数值走编辑
+  const step = payload.target >= 100 ? 5 : 1;
+  return (
+    <div className="rounded-xl border border-line bg-surface px-4 py-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 truncate text-sm font-medium text-ink">{widget.title}</div>
+        {actions}
+      </div>
+      <div className="mt-2 flex items-center gap-3">
+        <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-surface2">
+          <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="num shrink-0 text-sm font-medium text-ink">
+          {payload.value}
+          <span className="text-ink3">
+            /{payload.target}
+            {payload.unit ?? ""}
+          </span>
+        </span>
+      </div>
+      {!editing && (
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            disabled={busy}
+            className="num h-7 w-7 rounded-full border border-line text-sm text-ink transition hover:border-accent hover:text-accent disabled:opacity-50"
+            onClick={() => void run(() => apiW.updateWidget(widget.id, { payload: { value: Math.max(0, payload.value - step) } }))}
+          >
+            −
+          </button>
+          <button
+            disabled={busy}
+            className="num h-7 w-7 rounded-full border border-line text-sm text-ink transition hover:border-accent hover:text-accent disabled:opacity-50"
+            onClick={() => void run(() => apiW.updateWidget(widget.id, { payload: { value: payload.value + step } }))}
+          >
+            ＋
+          </button>
+          <span className="num text-xs text-ink3">{pct}%</span>
+        </div>
+      )}
+      {editing && (
+        <ProgressEdit
+          initial={payload}
+          busy={busy}
+          onSave={(patch) => void run(async () => {
+            await apiW.updateWidget(widget.id, { payload: patch });
+            setEditing(false);
+          })}
+        />
+      )}
+    </div>
+  );
+}
+
+function NoteEdit({ initial, busy, onSave }: { initial: string; busy: boolean; onSave: (text: string) => void }) {
+  const [text, setText] = useState(initial);
+  return (
+    <div className="mt-2">
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        maxLength={2000}
+        className="w-full rounded-lg border border-line bg-surface2 px-3 py-2 text-sm text-ink outline-none focus:border-accent"
+      />
+      <button
+        disabled={busy || text.trim() === ""}
+        className="mt-1.5 rounded-md bg-accent px-3 py-1.5 text-xs text-white transition hover:bg-accent2 disabled:opacity-50"
+        onClick={() => onSave(text.trim())}
+      >
+        保存
+      </button>
+    </div>
+  );
+}
+
+function ProgressEdit({ initial, busy, onSave }: { initial: ProgressPayloadLoose; busy: boolean; onSave: (patch: { value?: number; target?: number; unit?: string }) => void }) {
+  const [value, setValue] = useState(String(initial.value));
+  const [target, setTarget] = useState(String(initial.target));
+  const [unit, setUnit] = useState(initial.unit ?? "");
+  const valid = Number.isFinite(Number(value)) && Number(value) >= 0 && Number.isFinite(Number(target)) && Number(target) > 0;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-2">
+      <input value={value} onChange={(e) => setValue(e.target.value)} className="num w-20 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <span className="text-sm text-ink3">/</span>
+      <input value={target} onChange={(e) => setTarget(e.target.value)} className="num w-20 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="单位" maxLength={20} className="w-16 rounded-md border border-line bg-surface2 px-2 py-1 text-sm text-ink outline-none focus:border-accent" />
+      <button
+        disabled={busy || !valid}
+        className="rounded-md bg-accent px-3 py-1.5 text-xs text-white transition hover:bg-accent2 disabled:opacity-50"
+        onClick={() => onSave({ value: Number(value), target: Number(target), unit: unit.trim() })}
+      >
+        保存
+      </button>
+    </div>
+  );
+}
+
+/** 今天页：Top3 + 快速记录 + 三统计卡 + 我的卡片 + 计划四段范围切换（今天/本周/全部/已完成；计划管理唯一入口，2026-09-30 目标层级下线） */
 export function Today() {
   const [view, setView] = useState<TodayView | null>(null);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -287,15 +457,32 @@ export function Today() {
   const [unit, setUnit] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [planTab, setPlanTab] = useState<"today" | "week" | "all" | "done">("today");
+  const [pendingTop, setPendingTop] = useState<string | null>(null); // Top3 打卡在途的 planId（防二击重复落账）
+  const [widgets, setWidgets] = useState<WidgetLoose[]>([]);
+  const [widgetsError, setWidgetsError] = useState(false);
 
-  const reload = useCallback(() => {
-    api
-      .today()
-      .then(setView)
-      .catch((e) => setError(String((e as Error).message)));
+  // 返回 Promise（2026-10-01 打卡即显）：行内乐观翻转后要等新数据落地再解锁，避免解锁瞬间仍在旧 props 上吃到二击
+  const reload = useCallback(async () => {
+    try {
+      setView(await api.today());
+    } catch (e) {
+      setError(String((e as Error).message));
+    }
   }, []);
 
-  useEffect(() => reload(), [reload]);
+  const reloadWidgets = useCallback(() => {
+    // 失败不覆盖已有卡片、也不伪装成空态引导（评审 P2）：单独的失败行，下次挂载/操作自然重试
+    void apiW
+      .listWidgets()
+      .then((list) => {
+        setWidgets(list);
+        setWidgetsError(false);
+      })
+      .catch(() => setWidgetsError(true));
+  }, []);
+
+  useEffect(() => void reload(), [reload]);
+  useEffect(reloadWidgets, [reloadWidgets]);
 
   const quickRecord = async () => {
     if (category.trim() === "") {
@@ -353,15 +540,22 @@ export function Today() {
       : view.plans.filter(TAB_PRED[planTab]);
   const todayPlans = view.plans.filter(TAB_PRED.today); // 统计卡口径 = 今天视图（全量收编后不宜直接用 view.plans）
   const doneCount = todayPlans.filter((p) => p.done).length;
-  // Top3 打卡（2026-09-30 习惯化）：按天计数的习惯今天已计入 → 不再记账（行内可撤销/明天再来）
-  const top3Checkin = (item: TopItemLoose) => {
-    if (item.planId === undefined) return;
+  // Top3 打卡（2026-09-30 习惯化）：按天计数的习惯今天已计入 → 不再记账（行内可撤销/明天再来）；在途锁防二击重复落账
+  const top3Checkin = async (item: TopItemLoose) => {
+    if (item.planId === undefined || pendingTop !== null) return;
     const plan = view.plans.find((p) => p.planId === item.planId);
     if (plan !== undefined && plan.timesPerPeriod !== undefined && plan.scope !== "day" && plan.checkinTs !== undefined) {
       window.alert("今天这一卡已经算进进度了（按天计数）——明天再来，或在下面计划行里撤销今天的卡");
       return;
     }
-    void api.checkin(item.planId).then(reload);
+    setPendingTop(item.planId);
+    try {
+      await api.checkin(item.planId);
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    }
+    await reload();
+    setPendingTop(null);
   };
   const PLAN_TABS = (
     [
@@ -437,7 +631,7 @@ export function Today() {
       )}
 
       {/* 今日必做：先看要做什么，再看记了什么 */}
-      <Top3Card items={view.top3 ?? []} onCheckin={top3Checkin} />
+      <Top3Card items={view.top3 ?? []} pendingPlanId={pendingTop} onCheckin={top3Checkin} />
 
       {/* 三统计卡（窄屏两列，第三张跨满行） */}
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-3">
@@ -457,6 +651,25 @@ export function Today() {
           <div className="num mt-1 text-xl font-semibold text-warm">{view.streakDays} 天</div>
         </div>
       </div>
+
+      {/* 我的卡片（2026-10-12 工作台化一期）：Agent/对话里建的配置驱动卡片——note 便签 | progress 进度；
+          空态给一行行动引导（空态行动入口原则） */}
+      {widgetsError ? (
+        <div className="mb-5 rounded-xl border border-line bg-surface px-4 py-3 text-sm text-ink3">卡片加载失败，稍后重试</div>
+      ) : widgets.length > 0 ? (
+        <section className="mb-5">
+          <h2 className="mb-2 text-sm font-semibold text-ink">我的卡片</h2>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            {widgets.map((w) => (
+              <WidgetCard key={w.id} widget={w} onChanged={reloadWidgets} />
+            ))}
+          </div>
+        </section>
+      ) : (
+        <div className="mb-5 rounded-xl border border-dashed border-line bg-surface px-4 py-3 text-sm text-ink3">
+          还没有自定义卡片——在对话里说一句（如「帮我建张读书进度卡，目标 300 页」），它就会出现在这里
+        </div>
+      )}
 
       {/* 计划四段范围切换（2026-09-29 B4）：今天=今日应做（未来项移出）｜本周=+截止≤周日｜全部=+远期｜已完成=近 30 天存档 */}
       <section className="mb-6">

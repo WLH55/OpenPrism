@@ -28,6 +28,9 @@ export interface UserMessageEvent {
   type: "user/message";
   channel: InputChannel;
   message: UserMessage;
+  /** 回合级注入上下文（钟面/记忆召回，2026-10-14 前缀缓存稳定化）：随事件落日志满足铁律 2；
+   *  投影只并入最后一条带 context 的用户消息（历史注入剥离），故 wire 中至多一个注入块 */
+  context?: string;
 }
 
 export interface AssistantMessageEvent {

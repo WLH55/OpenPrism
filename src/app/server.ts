@@ -39,6 +39,7 @@ import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type M
 import type { MemoryExtractor } from "./memory-extract";
 import { forgetTopic, listUnpromotedTopics, promoteTopicManually, restoreTopic } from "./memory-topics";
 import type { WechatBridge } from "./wechat-bridge";
+import { gatewayExtraHeaders, timeoutSignal, MODEL_TEST_TIMEOUT_MS } from "./provider-gateways";
 
 export interface ServerDeps {
   env: PlatformEnv;
@@ -47,6 +48,8 @@ export interface ServerDeps {
   masterKey: Buffer;
   /** 启动时载入、注册时追加的共享用户表（键 = username） */
   users: Map<string, UserRecord>;
+  /** 注册用户数上限（2026-10-01 公开自部署防滥用）：达到即拒新注册（403 引导自部署/联系作者）；缺省 = 不限制 */
+  maxUsers?: number;
   /** uid 二级索引（可选；认证查询免线性扫描） */
   usersByUid?: Map<string, UserRecord>;
   sessions: SessionStore;
@@ -55,6 +58,10 @@ export interface ServerDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** 连接测试：默认用当前配置发一次 1-token 非流式请求；测试注入 fake（零网络） */
   modelTester?(uid: string, config: ModelConfig | null): Promise<void>;
+  /** 连接测试总时长（挂起端点到点中断，报「连接超时」）；缺省 45s；测试注入小值 */
+  modelTestTimeoutMs?: number;
+  /** embedding 连接测试（按配置直测，不落库）：已保存行与表单草稿共用；测试注入 fake（零网络） */
+  embeddingConfigTester?(config: ModelConfig, timeoutMs: number): Promise<void>;
   /** 记忆提取/整理用的 adapter（读用户当前 BYOK 配置）；缺省 = 未配置（extract 返回 409）；测试注入 mock */
   adapterFor?(uid: string): Promise<{ adapter: LlmAdapter; model: string } | null>;
   /** embedding 提供方连接测试（发一次最小 embed 请求）；测试注入 fake（零网络） */
@@ -73,6 +80,8 @@ export interface ServerDeps {
   taskRunner(uid: string, task: import("./tasks").TaskDef, run: import("./tasks").TaskRunTrigger): Promise<void>;
   /** 微信桥（2026-09-27）：IM 绑定路由用；缺省 = 未装配（相关路由 404）；测试注入 fake fetch 驱动的桥 */
   wechat?: WechatBridge;
+  /** 今天页自定义卡片（2026-10-12 工作台化一期）：REST CRUD；缺省 = 未装配（相关路由 404） */
+  widgets?: import("./widgets").WidgetStore;
   staticDir?: string;
 }
 
@@ -195,13 +204,26 @@ async function defaultModelTester(deps: ServerDeps, uid: string, config: ModelCo
     baseURL: config.baseURL,
     apiKey: config.keyEnc ? open(deps.masterKey, config.keyEnc) : "",
     stream: false,
+    extraHeaders: gatewayExtraHeaders(config.baseURL, `openprism:test:${uid}`),
   });
-  await adapter.complete({
-    provider: "byok",
-    model: config.model,
-    system: "",
-    messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "ping" }] }],
-  });
+  // 挂起端点（连不上/黑洞/代理不放行）到点中断，别让前端干等到浏览器自己断
+  const guard = timeoutSignal(deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS);
+  try {
+    await adapter.complete(
+      {
+        provider: "byok",
+        model: config.model,
+        system: "",
+        messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "ping" }] }],
+      },
+      { signal: guard.signal },
+    );
+  } catch (error) {
+    if (guard.timedOut()) throw new Error(`连接超时（${Math.round((deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS) / 1000)}s 无响应）`);
+    throw error;
+  } finally {
+    guard.cleanup();
+  }
 }
 
 function setSecurityHeaders(res: ServerResponse): void {
@@ -261,6 +283,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
     if (password.length < 6) return sendError(res, 400, "password 至少 6 位");
     if (deps.users.has(username)) return sendError(res, 409, "username already taken");
+    if (deps.maxUsers !== undefined && deps.users.size >= deps.maxUsers) {
+      return sendError(res, 403, "注册用户已达上限，暂时无法注册新账号。如需体验：可到 GitHub 下载源码本地部署使用（https://github.com/WLH55/OpenPrism ），或联系作者为你开放注册。");
+    }
     const uid = deps.env.randomUUID();
     const user: UserRecord = { uid, username, password: await hashPassword(password), createdTs: deps.env.now() };
     appendUser(deps.db, user);
@@ -386,6 +411,32 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return sendJson(res, 200, { id: created.id });
     } catch (error) {
       return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  // 表单草稿连接测试（2026-10-01）：填一半就能测，不落库；Key 留空且在编辑已有行时沿用已存 Key
+  if (path === "/api/models/test" && method === "POST") {
+    const body = (await readBody(req)) as { baseURL?: string; apiKey?: string; model?: string; kind?: unknown; editingId?: string };
+    try {
+      const baseURL = String(body.baseURL ?? "").trim().replace(/\/+$/, "");
+      validateBaseURL(baseURL);
+      const model = String(body.model ?? "").trim();
+      if (model === "") throw new Error("model 必填");
+      const kind = parseProviderKind(body.kind) ?? "chat";
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+      let keyEnc: string | undefined;
+      if (apiKey !== "") keyEnc = seal(deps.masterKey, apiKey);
+      else if (body.editingId) keyEnc = readModelProviderConfig(deps.db, uid, body.editingId)?.keyEnc;
+      const config: ModelConfig = { baseURL, model, kind, ...(keyEnc !== undefined ? { keyEnc } : {}) };
+      if (kind === "embedding") {
+        if (!deps.embeddingConfigTester) return sendError(res, 409, "embedding_tester_unavailable");
+        await deps.embeddingConfigTester(config, deps.modelTestTimeoutMs ?? MODEL_TEST_TIMEOUT_MS);
+      } else {
+        const tester = deps.modelTester ?? ((u, c) => defaultModelTester(deps, u, c));
+        await tester(uid, config);
+      }
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      return sendJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error).slice(0, 300) });
     }
   }
   const modelsMatch = /^\/api\/models\/([^/]+)(\/[^/]*)?$/.exec(path);
@@ -525,7 +576,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
 
     if (sub === "/messages" && method === "POST") {
-      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown };
+      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown; thinking?: unknown };
       const text = String(body.text ?? "").trim();
       let attachments;
       try {
@@ -535,7 +586,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       }
       if (text === "" && attachments.length === 0) return sendError(res, 400, "text 或 attachments 必填");
       try {
-        await deps.conversations.send(uid, cid, text, attachments);
+        await deps.conversations.send(uid, cid, text, attachments, typeof body.thinking === "boolean" ? { thinking: body.thinking } : {});
         return sendJson(res, 202, { ok: true });
       } catch (error) {
         if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
@@ -617,6 +668,18 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       } catch (error) {
         if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         return sendError(res, 404, String((error as Error).message));
+      }
+    }
+    // 场景标签（2026-10-12 工作台化一期）：scene = null 清除；返回更新后的会话条目
+    if (sub === "/scene" && method === "PUT") {
+      const body = (await readBody(req)) as { scene?: string | null };
+      try {
+        const entry = await deps.conversations.setScene(uid, cid, body.scene === null ? null : String(body.scene ?? ""));
+        return sendJson(res, 200, entry);
+      } catch (error) {
+        const message = String((error as Error).message);
+        if (message.includes("不存在")) return sendError(res, 404, "会话不存在");
+        return sendError(res, 400, message);
       }
     }
   }
@@ -939,10 +1002,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const conversations: ExportConversation[] = (await deps.conversations.list(uid)).map((entry) => ({
       cid: entry.id,
       title: entry.title,
+      scene: entry.scene,
       createdTs: entry.createdTs,
       events: deps.conversations.readEvents(entry.id), // 不带 options = 全量升序
     }));
-    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations };
+    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations, ...(deps.widgets ? { widgets: deps.widgets.list(uid) } : {}) };
     const dateTag = new Date(input.exportedAt).toISOString().slice(0, 10).replace(/-/g, "");
     if (format === "json") {
       res.writeHead(200, {
@@ -1255,6 +1319,40 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const period = (["today", "week", "month", "year"] as const).find((p) => p === periodParam) ?? "week";
     const ledger = await deps.ledgerFor(uid);
     return sendJson(res, 200, categoryView(ledger.readAll(), { category: name, period, now: deps.env.now(), tzOffsetMinutes: -new Date().getTimezoneOffset() }));
+  }
+
+  // ── 今天页自定义卡片（2026-10-12 工作台化一期）：Agent/用户共用 CRUD，uid 严格隔离 ──
+  if (deps.widgets) {
+    if (path === "/api/widgets" && method === "GET") {
+      return sendJson(res, 200, deps.widgets.list(uid));
+    }
+    if (path === "/api/widgets" && method === "POST") {
+      const body = (await readBody(req)) as { kind?: string; title?: string; payload?: unknown };
+      try {
+        return sendJson(res, 200, deps.widgets.create(uid, { kind: String(body.kind ?? ""), title: String(body.title ?? ""), payload: body.payload }));
+      } catch (error) {
+        return sendError(res, 400, String((error as Error).message));
+      }
+    }
+    const widgetMatch = /^\/api\/widgets\/([^/]+)$/.exec(path);
+    if (widgetMatch && method === "PUT") {
+      const body = (await readBody(req)) as { title?: string; payload?: unknown };
+      try {
+        return sendJson(res, 200, deps.widgets.update(uid, decodeURIComponent(widgetMatch[1]!), body));
+      } catch (error) {
+        const message = String((error as Error).message);
+        if (message.includes("不存在")) return sendError(res, 404, message);
+        return sendError(res, 400, message);
+      }
+    }
+    if (widgetMatch && method === "DELETE") {
+      try {
+        deps.widgets.remove(uid, decodeURIComponent(widgetMatch[1]!));
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendError(res, 404, String((error as Error).message));
+      }
+    }
   }
 
   sendError(res, 404, "not found");

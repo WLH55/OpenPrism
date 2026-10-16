@@ -18,9 +18,11 @@ import { MemoryStore } from "../src/app/memory";
 import { MemoryExtractor } from "../src/app/memory-extract";
 import { TaskStore } from "../src/app/tasks";
 import { NotificationStore } from "../src/app/notify";
+import { WidgetStore } from "../src/app/widgets";
 import { SqliteSessionLog } from "../src/app/session-log";
 import type { TaskDef, TaskRunTrigger } from "../src/app/tasks";
 import { createAppServer } from "../src/app/server";
+import { open } from "../src/app/secretbox";
 import { WechatBridge } from "../src/app/wechat-bridge";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
@@ -65,10 +67,12 @@ const isoAfter = (days: number): string => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
+// beforeAll 装配、用例复用（注册上限用例另起 maxUsers 实例共用同一份 deps）
+let serverDeps: Parameters<typeof createAppServer>[0];
+
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "op-app-server-"));
   const masterKey = Buffer.alloc(32, 3);
-
   const { adapter } = createMockLlmAdapter([
     {
       kind: "tool-calls",
@@ -90,6 +94,7 @@ beforeAll(async () => {
   const tasksStore = new TaskStore({ db, now: () => 1000, randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
   tasks = tasksStore;
   const notifications = new NotificationStore({ db, now: () => 5000 });
+  const widgetsStore = new WidgetStore(db, { now: () => 5000, randomUUID: () => `wid-${Math.random().toString(36).slice(2, 8)}` });
   const memoryExtractor = new MemoryExtractor({
     db,
     now: () => 5000,
@@ -114,7 +119,7 @@ beforeAll(async () => {
     db,
   );
 
-  const serverDeps = {
+  serverDeps = {
     env: nodeEnv,
     db,
     masterKey,
@@ -131,6 +136,7 @@ beforeAll(async () => {
     memoryExtractor,
     tasks,
     notifications,
+    widgets: widgetsStore,
     taskRunner: async (uidRun: string, task: TaskDef, run: TaskRunTrigger) => {
       await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: `（${run.kind}）${task.instruction}` });
     },
@@ -186,6 +192,29 @@ describe("HTTP API", () => {
     expect(dup.status).toBe(409);
     const bad = await fetch(`${baseUrl}/api/auth/login`, json({ username: "lathan", password: "wrong!!" }));
     expect(bad.status).toBe(401);
+  });
+
+  it("注册上限（maxUsers）：达到即 403 引导自部署/联系作者，老用户登录不受影响；未配置 = 不限制", async () => {
+    // 复用同一份 deps 起第二个实例：现有 1 个用户（lathan），maxUsers=1 → 已满
+    const capped = createAppServer({ ...serverDeps, maxUsers: 1 });
+    await new Promise<void>((resolve) => capped.listen(0, "127.0.0.1", resolve));
+    const cappedUrl = `http://127.0.0.1:${(capped.address() as { port: number }).port}`;
+    try {
+      const full = await fetch(`${cappedUrl}/api/auth/register`, json({ username: "newcomer", password: "hunter2" }));
+      expect(full.status).toBe(403);
+      const body = (await full.json()) as { error: string };
+      expect(body.error).toContain("注册用户已达上限");
+      expect(body.error).toContain("https://github.com/WLH55/OpenPrism");
+      expect(body.error).toContain("联系作者");
+      // 已有用户不受影响：登录照常
+      const still = await fetch(`${cappedUrl}/api/auth/login`, json({ username: "lathan", password: "hunter2" }));
+      expect(still.status).toBe(200);
+      // 未配置 maxUsers 的原实例 = 不限制
+      const open = await fetch(`${baseUrl}/api/auth/register`, json({ username: "spare-seat", password: "hunter2" }));
+      expect(open.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => capped.close(() => resolve()));
+    }
   });
 
   it("聊天闭环：建会话→发消息→Turn 完成→今天页出现该笔流水（折叠 0 token）", async () => {
@@ -718,16 +747,20 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
   });
 
   it("习惯计划 HTTP（2026-09-30 习惯化，AC1/AC3）：POST /api/plans 带配额落账、today 视图带进度；非法值与一次性 scope 400；PUT 修订配额", async () => {
-    const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie } });
+    // 独立新用户（2026-10-06 修日期敏感）：top3 按用户算且容量只有 3——共用用户的旧 deadline 计划
+    // （写死 10-04/10-05）过了日期变逾期后会把习惯挤出 top3，断言随日历漂移；新用户账本干净、永不受前序用例残留影响
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "habit-fresh", password: "hunter2" }));
+    const habitCookie = (reg.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const postPlan = (body: unknown) => fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie: habitCookie } });
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 0 })).status).toBe(400);
     expect((await postPlan({ title: "坏配额", scope: "week", timesPerPeriod: 1.5 })).status).toBe(400);
     expect((await postPlan({ title: "坏配额", scope: "deadline", due: isoAfter(7), timesPerPeriod: 3 })).status).toBe(400);
     const habit = (await (await postPlan({ title: "每周运动三天", scope: "week", timesPerPeriod: 3 })).json()) as { planId: string };
 
     // 打一次卡 → today 视图 1/3 进行中（tz=480 本地口径）
-    await fetch(`${baseUrl}/api/checkin`, { ...json({ planId: habit.planId, done: true }), headers: { "Content-Type": "application/json", cookie } });
+    await fetch(`${baseUrl}/api/checkin`, { ...json({ planId: habit.planId, done: true }), headers: { "Content-Type": "application/json", cookie: habitCookie } });
     const todayOf = async () =>
-      (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as {
+      (await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie: habitCookie } })).json()) as {
         plans: { planId: string; state: string; timesPerPeriod?: number; periodCount?: number }[];
         top3: { planId?: string; progress?: string }[];
       };
@@ -739,7 +772,7 @@ describe("HTTP API 批次3（定时任务/通知）", () => {
     const updated = await fetch(`${baseUrl}/api/plans/${habit.planId}`, {
       ...json({ timesPerPeriod: 4 }),
       method: "PUT",
-      headers: { "Content-Type": "application/json", cookie },
+      headers: { "Content-Type": "application/json", cookie: habitCookie },
     });
     expect(updated.status).toBe(200);
     const row2 = (await todayOf()).plans.find((p) => p.planId === habit.planId)!;
@@ -1220,5 +1253,192 @@ describe("微信桥路由（2026-09-27 iLink 绑定）", () => {
     expect(((await (await fetch(`${baseUrl}/api/wechat/bind/agent`, { headers: { cookie } })).json()) as { agentId: string | null }).agentId).toBeNull();
 
     expect((await put("aid-nope")).status).toBe(404);
+  });
+});
+
+describe("模型连接测试（表单草稿 /api/models/test + 挂起端点超时，2026-10-01）", () => {
+  /** 起一台按需改写 deps 的临时实例（同 db/会话，cookie 通用） */
+  const spin = async (patch: Record<string, unknown>): Promise<{ url: string; close: () => Promise<void> }> => {
+    const server = createAppServer({ ...serverDeps, ...patch } as Parameters<typeof createAppServer>[0]);
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    return {
+      url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+      close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
+    };
+  };
+  const post = (url: string, body: unknown) =>
+    fetch(`${url}/api/models/test`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(body) });
+
+  it("未保存草稿直测：配置与密封 Key 传给 tester（OpenCode Go 场景）；编辑留空沿用已存 Key", async () => {
+    const captured: { uid: string; config: import("../src/app/secretbox").ModelConfig | null }[] = [];
+    const instance = await spin({
+      modelTester: async (uid: string, config: import("../src/app/secretbox").ModelConfig | null) => {
+        captured.push({ uid, config });
+      },
+    });
+    try {
+      // 新草稿带 Key：baseURL/model 原样到达 tester，Key 以密封态传入、可解出明文
+      const draft = await post(instance.url, { baseURL: "https://opencode.ai/zen/go/v1", model: "kimi-k3", apiKey: "sk-draft" });
+      expect(((await draft.json()) as { ok: boolean }).ok).toBe(true);
+      expect(captured).toHaveLength(1);
+      const me = (await (await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })).json()) as { uid: string };
+      expect(captured[0]!.uid).toBe(me.uid);
+      expect(captured[0]!.config?.baseURL).toBe("https://opencode.ai/zen/go/v1");
+      expect(captured[0]!.config?.model).toBe("kimi-k3");
+      expect(open(serverDeps.masterKey, captured[0]!.config?.keyEnc ?? "")).toBe("sk-draft");
+
+      // 编辑已有行、Key 留空 → 沿用该行已存 Key（与保存语义一致）
+      const add = (await (await fetch(`${baseUrl}/api/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", cookie },
+        body: JSON.stringify({ baseURL: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "sk-stored" }),
+      })).json()) as { id: string };
+      const editDraft = await post(instance.url, { baseURL: "https://api.deepseek.com", model: "deepseek-chat", editingId: add.id });
+      expect(((await editDraft.json()) as { ok: boolean }).ok).toBe(true);
+      expect(captured).toHaveLength(2);
+      expect(open(serverDeps.masterKey, captured[1]!.config?.keyEnc ?? "")).toBe("sk-stored");
+
+      // 校验失败也回 200 + ok:false（连接测试端点的错误语义），不落库
+      const before = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { providers: unknown[] };
+      const badUrl = await post(instance.url, { baseURL: "ftp://bad", model: "x" });
+      expect(((await badUrl.json()) as { ok: boolean; error?: string }).error).toContain("baseURL");
+      const noModel = await post(instance.url, { baseURL: "https://ok.example.com/v1", model: "" });
+      expect(((await noModel.json()) as { ok: boolean; error?: string }).error).toContain("model");
+      const after = (await (await fetch(`${baseUrl}/api/models`, { headers: { cookie } })).json()) as { providers: unknown[] };
+      expect(after.providers).toHaveLength(before.providers.length);
+
+      await fetch(`${baseUrl}/api/models/${add.id}`, { method: "DELETE", headers: { cookie } });
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it("embedding 草稿：走 embeddingConfigTester（按配置直测），不碰 modelTester", async () => {
+    const embedCaptured: { baseURL: string; model: string }[] = [];
+    let chatCalls = 0;
+    const instance = await spin({
+      modelTester: async () => {
+        chatCalls += 1;
+      },
+      embeddingConfigTester: async (config: import("../src/app/secretbox").ModelConfig) => {
+        embedCaptured.push({ baseURL: config.baseURL, model: config.model });
+      },
+    });
+    try {
+      const res = await post(instance.url, { baseURL: "https://e.example.com/v1", model: "emb-1", kind: "embedding", apiKey: "sk-e" });
+      expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+      expect(embedCaptured).toEqual([{ baseURL: "https://e.example.com/v1", model: "emb-1" }]);
+      expect(chatCalls).toBe(0);
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it("挂起端点：总时长兜底到点中断，报「连接超时」而非让前端无限等", async () => {
+    // fetch 永不返回，仅在 abort 时拒绝（模拟连不上/黑洞端点）；超时注入 30ms（小真实延迟）
+    const hangingFetch = (_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })));
+      });
+    const instance = await spin({ modelTester: undefined, modelTestTimeoutMs: 30, env: { ...nodeEnv, fetch: hangingFetch as unknown as typeof nodeEnv.fetch } });
+    try {
+      const res = await post(instance.url, { baseURL: "https://hang.example.com/v1", model: "m" });
+      const body = (await res.json()) as { ok: boolean; error?: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toContain("连接超时");
+    } finally {
+      await instance.close();
+    }
+  });
+});
+
+describe("HTTP API 工作台化一期（2026-10-12：场景标签 + 自定义卡片）", () => {
+  it("场景标签：PUT scene 打标 → list 带 scene；null 清空；空白 400；他人 cid 404", async () => {
+    const created = await fetch(`${baseUrl}/api/conversations`, { ...json({}), headers: { "Content-Type": "application/json", cookie } });
+    const conv = (await created.json()) as { id: string };
+
+    const put = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: "装修" }),
+    });
+    expect(put.status).toBe(200);
+    expect(((await put.json()) as { scene?: string }).scene).toBe("装修");
+
+    const list = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as { id: string; scene?: string | null }[];
+    expect(list.find((c) => c.id === conv.id)?.scene).toBe("装修");
+
+    const blank = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: "   " }),
+    });
+    expect(blank.status).toBe(400);
+
+    const clear = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ scene: null }),
+    });
+    expect(clear.status).toBe(200);
+    const after = (await (await fetch(`${baseUrl}/api/conversations`, { headers: { cookie } })).json()) as { id: string; scene?: string | null }[];
+    expect(after.find((c) => c.id === conv.id)?.scene).toBeNull();
+
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "sceneother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const trespass = await fetch(`${baseUrl}/api/conversations/${conv.id}/scene`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie: otherCookie },
+      body: JSON.stringify({ scene: "偷标" }),
+    });
+    expect(trespass.status).toBe(404);
+  });
+
+  it("自定义卡片 CRUD：建 note/progress → list → 改进度 → 删；u1/u2 隔离；非法 kind 400", async () => {
+    const note = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "note", title: "本周聚焦", payload: { text: "搞定发票报销" } }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(note.status).toBe(200);
+    const noteCard = (await note.json()) as { id: string; kind: string };
+
+    const progress = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "progress", title: "读书", payload: { value: 120, target: 300, unit: "页" } }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    const progressCard = (await progress.json()) as { id: string; payload: { value: number; target: number; unit?: string } };
+    expect(progressCard.payload).toEqual({ value: 120, target: 300, unit: "页" });
+
+    const updated = await fetch(`${baseUrl}/api/widgets/${progressCard.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ payload: { value: 150 } }),
+    });
+    expect(updated.status).toBe(200);
+    expect(((await updated.json()) as { payload: { value: number; target: number } }).payload).toEqual({ value: 150, target: 300, unit: "页" });
+
+    const badKind = await fetch(`${baseUrl}/api/widgets`, {
+      ...json({ kind: "chart", title: "x", payload: {} }),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    expect(badKind.status).toBe(400);
+
+    // uid 隔离：他人看不到、改不了
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "widgetother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const otherList = (await (await fetch(`${baseUrl}/api/widgets`, { headers: { cookie: otherCookie } })).json()) as unknown[];
+    expect(otherList).toHaveLength(0);
+    const otherPut = await fetch(`${baseUrl}/api/widgets/${noteCard.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie: otherCookie },
+      body: JSON.stringify({ title: "偷改" }),
+    });
+    expect(otherPut.status).toBe(404);
+
+    const removed = await fetch(`${baseUrl}/api/widgets/${noteCard.id}`, { method: "DELETE", headers: { cookie } });
+    expect(removed.status).toBe(200);
+    const mine = (await (await fetch(`${baseUrl}/api/widgets`, { headers: { cookie } })).json()) as { id: string }[];
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.id).toBe(progressCard.id);
   });
 });

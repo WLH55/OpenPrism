@@ -21,8 +21,26 @@ pnpm start
 | `OP_PORT` | `8787` | HTTP 监听端口 |
 | `OP_DATA` | `./data` | 数据目录；主密钥 `secret.key` 落在这里 |
 | `OP_DB` | `{OP_DATA}/openprism.db` | SQLite 数据库文件路径 |
+| `OP_MAX_USERS` | `50` | 注册用户数上限；达到后新注册返回 403（提示自部署或联系站长）。自部署放开注册设 `0` |
 
 服务监听 `0.0.0.0`，同网段任何设备都能访问。长期运行建议配进程守护（`pm2 start "pnpm start" --name openprism`）或系统服务；改应用层代码后需要重启，前端改动重新 `pnpm build:web` 后刷新页面即可。
+
+### 出网代理（访问被墙的模型平台）
+
+直连 `api.jina.ai` 等境外端点时，DNS 可能被污染、TCP 直连超时，测试连接报 `embedding transport failure: fetch failed`。Node 22 内置 fetch 不认代理环境变量，应用层已用 undici `EnvHttpProxyAgent` 补齐（curl 同款语义）：设了任一变量才走代理，不设零影响。
+
+```bash
+# Git Bash / Linux：启动前设置，指向本机代理（Clash 默认混合端口 7890）
+HTTPS_PROXY=http://127.0.0.1:7890 pnpm start
+
+# PowerShell
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"; pnpm start
+
+# 局域网/本机地址不走代理
+NO_PROXY=localhost,127.0.0.1,192.168.0.0/16
+```
+
+代理只影响服务端出网请求（LLM、embedding、MCP 等）；浏览器访问 OpenPrism 页面本身不受影响。
 
 ## 手机接入（同一 Wi-Fi）
 

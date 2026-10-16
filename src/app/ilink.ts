@@ -21,11 +21,13 @@ export class ILinkTokenExpiredError extends Error {
   }
 }
 
-/** ret=-2：context_token 过期被拒（会话凭据失效，约 11-15h 无用户入站即发生；2026-10-09 生产实锤 prepare failed） */
-export class ILinkSessionStaleError extends Error {
-  constructor() {
-    super("wechat context token stale（ret=-2）");
-    this.name = "ILinkSessionStaleError";
+/** ret=-2（errmsg=prepare failed）：推送所挂的 context_token 已过期（约 12–14h 无用户入站即发生，2026-10-06/09 真机实证）——
+ * 用户在微信里发条消息即可刷新 context_token 恢复；类型化供上层 tokenless 降级重试与失败原因透传（一律按过期处理——
+ * 若实为限流，重试一次失败与现状持平，无额外伤害） */
+export class ILinkContextStaleError extends Error {
+  constructor(detail: string) {
+    super(`ilink context stale（ret=-2）: ${detail}`);
+    this.name = "ILinkContextStaleError";
   }
 }
 
@@ -35,13 +37,26 @@ export interface ILinkCredentials {
   ilinkUserId: string;
 }
 
-/** 收窄后的入站消息（首版只取文本面；图片/语音/文件留后续） */
+/** 入站媒体项（2026-10-11）：image/file 需 CDN 下载解密；voice 不下载音频，voiceText = 协议转写文本（空串 = 转写失败） */
+export interface ILinkMediaItem {
+  kind: "image" | "file" | "voice";
+  /** CDN 下载凭据（voice 可为空串——音频不下载） */
+  encryptQueryParam: string;
+  /** AES key 原样字符串（hex 或 base64，parseAesKey 探测；voice 可为空串） */
+  aesKeyRaw: string;
+  fileName?: string;
+  sizeBytes?: number;
+  voiceText?: string;
+}
+
+/** 收窄后的入站消息（媒体面 2026-10-11：text = 文本条目合并；media = 图片/文件/语音条目） */
 export interface ILinkInboundMessage {
   messageId: string;
   fromUserId: string;
   /** 1=用户消息 2=bot 消息（自己发的，跳过） */
   messageType: number;
   text: string;
+  media: ILinkMediaItem[];
   /** 回复时原样回传，iLink 靠它关联对话上下文 */
   contextToken: string;
 }
@@ -55,11 +70,21 @@ export interface ILinkClient {
   getBotQRCode(): Promise<{ qrcode: string; content: string }>;
   /** 扫码状态长轮询（~35s 一轮）；confirmed 时带凭据 */
   pollQRCodeStatus(qrcode: string): Promise<{ status: "wait" | "scaned" | "confirmed" | "expired"; creds?: ILinkCredentials }>;
-  /** 拉一轮消息（35s 长轮询由服务端保持；返回用户文本消息与下一轮游标） */
+  /** 拉一轮消息（35s 长轮询由服务端保持；返回用户消息（文本 + 媒体面）与下一轮游标） */
   getUpdates(botToken: string, cursor: string): Promise<{ msgs: ILinkInboundMessage[]; nextCursor: string }>;
   /** 发文本消息（contextToken 空串 = 请求体省略 context_token 键的 tokenless 发送——iLink 接受其为会话过期后的降级路径，hermes/OpenClaw/QwenPaw 同款） */
   sendMessage(botToken: string, toUserId: string, contextToken: string, text: string): Promise<void>;
+  /** 从 iLink CDN 下载媒体密文（裸 GET 无鉴权头，WeKnora DownloadFile 同款）；解密在调用侧 */
+  downloadMedia(url: string): Promise<Uint8Array>;
 }
+
+/** CDN 下载 URL 构造（WeKnora BuildCDNDownloadURL 同款） */
+export function buildCdnDownloadUrl(encryptQueryParam: string): string {
+  return `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+}
+
+/** CDN 下载超时（挂死防线；abort 由 AbortSignal.timeout 承担） */
+const DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkClient {
   /** 随机 X-WECHAT-UIN：uint32 → 十进制串 → base64（WeKnora 同款） */
@@ -150,18 +175,54 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
           message_id?: number | string;
           from_user_id?: string;
           message_type?: number;
-          item_list?: { type?: number; text_item?: { text?: string } }[];
+          item_list?: {
+            type?: number;
+            text_item?: { text?: string };
+            image_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; aeskey?: string };
+            voice_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; text?: string };
+            file_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; file_name?: string; len?: string };
+          }[];
           context_token?: string;
         };
         if (msg.message_type === 2) continue; // bot 自己发的
-        const textItem = msg.item_list?.find((i) => i.type === 1)?.text_item; // 首版只取文本
-        const text = (textItem?.text ?? "").trim();
-        if (text === "") continue;
+        const textParts: string[] = [];
+        const media: ILinkMediaItem[] = [];
+        for (const entry of msg.item_list ?? []) {
+          if (entry.type === 1) {
+            const t = (entry.text_item?.text ?? "").trim();
+            if (t !== "") textParts.push(t);
+          } else if (entry.type === 2) {
+            // 图片：顶层 aeskey（hex 字符串，json tag 是 "aeskey"）优先，缺则 media.aes_key（base64）——WeKnora 同款
+            const image = entry.image_item;
+            const eqp = image?.media?.encrypt_query_param ?? "";
+            if (image && eqp !== "") {
+              media.push({ kind: "image", encryptQueryParam: eqp, aesKeyRaw: image.aeskey ?? image.media?.aes_key ?? "" });
+            }
+          } else if (entry.type === 3) {
+            // 语音：音频不下载，转写文本随消息走（可能为空 = 转写失败；消息本身保留——保活锚靠它刷新）
+            const voice = entry.voice_item;
+            if (voice) {
+              media.push({ kind: "voice", encryptQueryParam: voice.media?.encrypt_query_param ?? "", aesKeyRaw: voice.media?.aes_key ?? "", voiceText: (voice.text ?? "").trim() });
+            }
+          } else if (entry.type === 4) {
+            const file = entry.file_item;
+            const eqp = file?.media?.encrypt_query_param ?? "";
+            if (file && eqp !== "") {
+              const size = Number(file.len);
+              media.push({ kind: "file", encryptQueryParam: eqp, aesKeyRaw: file.media?.aes_key ?? "", ...(file.file_name ? { fileName: file.file_name } : {}), ...(size > 0 ? { sizeBytes: size } : {}) });
+            }
+          } else if (entry.type === 5) {
+            console.warn("[wechat] 收到视频消息，暂不支持（已忽略）");
+          }
+        }
+        const text = textParts.join("\n");
+        if (text === "" && media.length === 0) continue;
         msgs.push({
           messageId: String(msg.message_id ?? ""),
           fromUserId: msg.from_user_id ?? "",
           messageType: msg.message_type ?? 1,
           text,
+          media,
           contextToken: msg.context_token ?? "",
         });
       }
@@ -190,12 +251,18 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
       };
       // 2026-09-28 真机排障：HTTP 200 不等于送达——业务码必须检查，否则静默丢单（WeKnora 原版也不查，属共同盲区）
       if (raw.errcode === -14) throw new ILinkTokenExpiredError();
-      // ret=-2 = context_token 过期（errcode=0，errmsg=prepare failed）：类型化供上层降级重试（一律按过期处理——
-      // 若实为限流，重试一次失败与现状持平，无额外伤害）
-      if (raw.ret === -2) throw new ILinkSessionStaleError();
+      // ret=-2 = context_token 过期（errcode=0，errmsg=prepare failed）：类型化供上层 tokenless 降级重试与失败原因透传
+      if (raw.ret === -2) throw new ILinkContextStaleError(String(raw.errmsg ?? ""));
       if ((raw.ret ?? 0) !== 0 || (raw.errcode ?? 0) !== 0) {
         throw new Error(`ilink sendmessage ret=${raw.ret} errcode=${raw.errcode}: ${String(raw.errmsg ?? "").slice(0, 200)}`);
       }
+    },
+
+    async downloadMedia(url) {
+      const res = await deps.fetch(url, { method: "GET", headers: {}, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`ilink cdn HTTP ${res.status}: ${url.slice(0, 120)}`);
+      if (!res.arrayBuffer) throw new Error("env.fetch 响应不支持 arrayBuffer（二进制媒体下载需要）");
+      return new Uint8Array(await res.arrayBuffer());
     },
   };
 }

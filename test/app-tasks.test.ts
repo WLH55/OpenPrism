@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
-import { createTaskTools, cronMatches, describeTrigger, nextDue, Scheduler, taskTriggerMessage, TaskStore, type TaskDef, type TaskRunTrigger, type TaskTrigger } from "../src/app/tasks";
+import { createTaskTools, builtinTaskTemplates, cronMatches, describeTrigger, nextDue, Scheduler, taskTriggerMessage, TaskStore, type TaskDef, type TaskRunTrigger, type TaskTrigger } from "../src/app/tasks";
 import { testDb } from "./helpers-db";
 
 const TZ = 480; // UTC+8
@@ -480,5 +480,65 @@ describe("TaskStore（任务级通知渠道，2026-09-27）", () => {
     expect(updated.notifyChannel).toBe("inapp");
     const cleared = await store.update("u1", task.id, {}); // 空 patch 原样保留
     expect(cleared.notifyChannel).toBe("inapp");
+  });
+});
+
+describe("微信绑定真相回报（A4，2026-10-06）+ 内置保活文案（C）", () => {
+  const NOW = Date.UTC(2026, 9, 6, 0, 0, 0);
+  const ctx = { signal: new AbortController().signal, env: nodeEnv };
+
+  it("create_task 设 wechat 渠道：结果回报 wechatBind（active 带 lastMsgMinutesAgo / unbound / expired）；未注入状态源不带字段；inapp 渠道不查", async () => {
+    const mk = (wechatStatus?: () => { bound: boolean; state: "active" | "expired"; lastMsgTs?: number }) => {
+      let seq = 0;
+      const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => `tid-wb-${++seq}` });
+      const tools = createTaskTools({ store, uid: "u-wb", now: () => NOW, ...(wechatStatus ? { wechatStatus } : {}) });
+      return { store, by: (name: string) => tools.find((t) => t.name === name)! };
+    };
+    const args = { title: "喝水", instruction: "x", trigger: { kind: "daily", time: "10:00" }, notifyChannel: "wechat" };
+    // 已绑定 + 2 小时前回过消息（NOW=10-6 00:00 UTC）
+    const ok = mk(() => ({ bound: true, state: "active" as const, lastMsgTs: NOW - 2 * 3600_000 }));
+    const r1 = (await ok.by("create_task").execute(args, ctx)) as { taskId: string; wechatBind?: { state: string; lastMsgMinutesAgo?: number; note: string } };
+    expect(r1.wechatBind).toMatchObject({ state: "active", lastMsgMinutesAgo: 120 });
+    expect(r1.wechatBind!.note).toContain("已绑定");
+    // 未绑定 → unbound + 引导扫码
+    const no = mk(() => ({ bound: false, state: "active" as const }));
+    const r2 = (await no.by("create_task").execute(args, ctx)) as { wechatBind?: { state: string; note: string } };
+    expect(r2.wechatBind).toMatchObject({ state: "unbound" });
+    expect(r2.wechatBind!.note).toContain("IM 通道");
+    // 绑定过期 → expired + 重新扫码
+    const ex = mk(() => ({ bound: true, state: "expired" as const }));
+    const r3 = (await ex.by("create_task").execute(args, ctx)) as { wechatBind?: { state: string } };
+    expect(r3.wechatBind).toMatchObject({ state: "expired" });
+    // 未注入状态源（旧装配/纯 store 测试）→ 不带字段（向后兼容）
+    const legacy = mk();
+    const r4 = (await legacy.by("create_task").execute(args, ctx)) as { wechatBind?: unknown };
+    expect(r4.wechatBind).toBeUndefined();
+    // inapp 渠道不查状态
+    const r5 = (await ok.by("create_task").execute({ ...args, notifyChannel: "inapp" }, ctx)) as { wechatBind?: unknown };
+    expect(r5.wechatBind).toBeUndefined();
+  });
+
+  it("update_task 改 wechat 渠道：同样回报 wechatBind（改 inapp / 其他字段不查）", async () => {
+    const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => "tid-wb2" });
+    const tools = createTaskTools({ store, uid: "u-wb2", now: () => NOW, wechatStatus: () => ({ bound: false, state: "active" }) });
+    const by = (name: string) => tools.find((t) => t.name === name)!;
+    const task = await store.create("u-wb2", { title: "T", instruction: "x", trigger: { kind: "daily", time: "09:00" } });
+    const r1 = (await by("update_task").execute({ taskId: task.id, notifyChannel: "wechat" }, ctx)) as { wechatBind?: { state: string } };
+    expect(r1.wechatBind).toMatchObject({ state: "unbound" });
+    const r2 = (await by("update_task").execute({ taskId: task.id, notifyChannel: "inapp" }, ctx)) as { wechatBind?: unknown };
+    expect(r2.wechatBind).toBeUndefined();
+    const r3 = (await by("update_task").execute({ taskId: task.id, enabled: false }, ctx)) as { wechatBind?: unknown };
+    expect(r3.wechatBind).toBeUndefined();
+  });
+
+  it("内置文案（C 2026-10-06）：简报/汇报指令含「约 12 小时」保活引导；周复盘不含（窗口按天计）", () => {
+    const tpls = builtinTaskTemplates();
+    const brief = tpls.find((t) => t.builtin === "daily-brief")!;
+    const report = tpls.find((t) => t.builtin === "daily-report")!;
+    const weekly = tpls.find((t) => t.builtin === "weekly-review")!;
+    expect(brief.instruction).toContain("12 小时");
+    expect(brief.instruction).toContain("回");
+    expect(report.instruction).toContain("12 小时");
+    expect(weekly.instruction).not.toContain("12 小时");
   });
 });

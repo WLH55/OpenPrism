@@ -372,14 +372,14 @@ const BUILTIN_TASK_DEFS: ReadonlyArray<{
     builtin: "daily-brief",
     title: "每日简报",
     instruction:
-      "生成今日简报：先用 query_ledger 查 what=today（含 top3），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 一个今日聚焦建议——从待做计划里挑最值得先动的一件。语气温和，最后提醒可以去 web 端「今天」页看完整视图。",
+      "生成今日简报：先用 query_ledger 查 what=today（含 top3），再给出：1) 今日必做三件事与一句话理由；2) 逾期与临近截止的风险；3) 一个今日聚焦建议——从待做计划里挑最值得先动的一件。语气温和，最后提醒可以去 web 端「今天」页看完整视图。收尾时用一句轻松自然的话请用户回一条哪怕一个字的消息（比如「回个‘早’就行」）——用户回复你，微信推送通道才保持畅通（微信限制：约 12 小时无用户回复，机器人无法主动推送）；这句邀请要像朋友顺口一提，不要像免责声明。",
     trigger: { kind: "daily", time: "08:30" },
   },
   {
     builtin: "daily-report",
     title: "每日晚间汇报",
     instruction:
-      "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。",
+      "晚间汇报时间。先用 query_ledger 查 what=today，看今天的计划完成情况（已完成/待做/逾期），然后像朋友一样向用户汇报今天的完成度：完成了的给一句具体的肯定；还没做的问一句——是打算今晚补上，还是今天就到这（要跳过哪条说一声，可以帮用户取消）；最后问一句今天有没有想记下来的事（心情、开销、进展都可以），用户回复后照常记入账本。语气平实，不说教。补充：如果用户最近一两天都没回过消息，温和地提一句「回我一条消息，之后我才能继续把提醒推给你」（微信限制：约 12 小时无回复后机器人无法主动推送）——只提一次，不重复说教。",
     trigger: { kind: "daily", time: "20:00" },
   },
   {
@@ -681,9 +681,34 @@ export interface TaskToolsDeps {
   now(): number;
   /** 用户本地时区偏置（评审 2026-09-29 #17）：agent 建任务的触发时刻按用户钟面解释，缺省取进程本地 */
   tzOffsetMinutes?: number;
+  /** 微信绑定状态源（A4，2026-10-06）：设 wechat 渠道时工具结果回报绑定真相，模型不再猜「绑没绑」；缺省不回报（测试/旧装配兼容） */
+  wechatStatus?: (uid: string) => { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
 }
 
 export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
+  /** 微信绑定真相（A4）：工具结果附加字段——模型可见、进会话日志（model-visible means logged） */
+  const wechatBindResult = ():
+    | { state: "active" | "expired" | "unbound"; lastMsgMinutesAgo?: number; note: string }
+    | undefined => {
+    if (deps.wechatStatus === undefined) return undefined;
+    const st = deps.wechatStatus(deps.uid);
+    if (!st.bound) {
+      return { state: "unbound", note: "用户尚未绑定微信机器人——提醒用户到 web「IM 通道」页扫码绑定；绑定前 wechat 渠道到点只落站内" };
+    }
+    if (st.state === "expired") {
+      return { state: "expired", note: "微信绑定已过期——提醒用户到「IM 通道」页重新扫码，否则推送收不到" };
+    }
+    if (st.lastMsgTs === undefined) {
+      return { state: "active", note: "已绑定，但用户从没在微信里发过消息——主动推送需要用户消息的上下文，引导用户先给机器人发一条" };
+    }
+    const minutesAgo = Math.round((deps.now() - st.lastMsgTs) / 60_000);
+    return {
+      state: "active",
+      lastMsgMinutesAgo: minutesAgo,
+      note: `已绑定微信（用户上次回消息在 ${minutesAgo} 分钟前；微信要求约 12 小时内有用户回复才允许机器人主动推送，超时后需用户回一句话恢复）`,
+    };
+  };
+
   const createTask: ToolDefinition = {
     name: "create_task",
     description: "为用户创建一个定时任务（提醒/定时检查）。触发时刻用结构化字段，解析不了就问用户，不要猜。",
@@ -693,7 +718,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       properties: {
         title: { type: "string" },
         instruction: { type: "string", description: "每次到点投给智能体的自然语言指令" },
-        notifyChannel: { type: "string", description: "通知渠道：inapp 站内（默认）| wechat 微信机器人（需用户已在 IM 通道页绑定）" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp 站内（默认）| wechat 微信机器人（绑定状态会在工具结果里回报，不要自行猜测绑没绑）" },
         trigger: {
           type: "object",
           description: '时刻按用户当地钟面解释（如用户说"明早 8 点"就填 08:00，系统按用户时区调度）。如 {"kind":"daily","time":"23:00"} / {"kind":"weekly","days":[1,3],"time":"08:00"} / {"kind":"interval","every":2,"unit":"day","time":"09:00","startTs":epoch毫秒}（自定义重复，unit: minute|hour|day|week|month|year，minute/hour 不带 time，可选 endTs） / {"kind":"once","at":epoch毫秒} / {"kind":"cron","expr":"0 9 * * *"}',
@@ -701,8 +726,23 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       },
     },
     output: {
-      schema: { type: "object", required: ["taskId"], properties: { taskId: { type: "string" } } },
-      render: (_args, value) => [{ type: "text", text: `已建定时任务（${(value as { taskId: string }).taskId}）` }],
+      schema: {
+        type: "object",
+        required: ["taskId"],
+        properties: { taskId: { type: "string" }, wechatBind: { type: "object" } },
+      },
+      render: (_args, value) => {
+        const v = value as { taskId: string; wechatBind?: { state: string } };
+        const bind =
+          v.wechatBind === undefined
+            ? ""
+            : v.wechatBind.state === "active"
+              ? "；微信渠道：已绑定"
+              : v.wechatBind.state === "expired"
+                ? "；微信渠道：绑定已过期，需重新扫码"
+                : "；微信渠道：用户尚未绑定微信机器人";
+        return [{ type: "text", text: `已建定时任务（${v.taskId}）${bind}` }];
+      },
     },
     async execute(args) {
       const input = (args ?? {}) as { title?: string; instruction?: string; trigger?: TaskTrigger; notifyChannel?: string };
@@ -714,7 +754,8 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         // 触发时刻按用户钟面解释（评审 #17）：会话注入 tz，不再落 UTC 缺省导致"明早 8 点"变 16:30
         tzOffsetMinutes: deps.tzOffsetMinutes ?? -new Date().getTimezoneOffset(),
       });
-      return { taskId: task.id };
+      const wechatBind = input.notifyChannel === "wechat" ? wechatBindResult() : undefined;
+      return { taskId: task.id, ...(wechatBind !== undefined ? { wechatBind } : {}) };
     },
     isConcurrencySafe: () => false,
   };
@@ -778,15 +819,27 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
         enabled: { type: "boolean" },
         title: { type: "string" },
         instruction: { type: "string" },
-        notifyChannel: { type: "string", description: "通知渠道：inapp（默认）| wechat" },
+        notifyChannel: { type: "string", description: "通知渠道：inapp（默认）| wechat（绑定状态会在工具结果里回报，不要自行猜测绑没绑）" },
         trigger: { type: "object", description: "与 create_task 同格式，整包替换" },
       },
     },
     output: {
-      schema: { type: "object", required: ["id", "title", "enabled"], properties: { id: { type: "string" }, title: { type: "string" }, enabled: { type: "boolean" } } },
+      schema: {
+        type: "object",
+        required: ["id", "title", "enabled"],
+        properties: { id: { type: "string" }, title: { type: "string" }, enabled: { type: "boolean" }, wechatBind: { type: "object" } },
+      },
       render: (_args, value) => {
-        const v = value as { title: string; enabled: boolean };
-        return [{ type: "text", text: `已更新任务「${v.title}」（${v.enabled ? "启用" : "停用"}）` }];
+        const v = value as { title: string; enabled: boolean; wechatBind?: { state: string } };
+        const bind =
+          v.wechatBind === undefined
+            ? ""
+            : v.wechatBind.state === "active"
+              ? "；微信渠道：已绑定"
+              : v.wechatBind.state === "expired"
+                ? "；微信渠道：绑定已过期，需重新扫码"
+                : "；微信渠道：用户尚未绑定微信机器人";
+        return [{ type: "text", text: `已更新任务「${v.title}」（${v.enabled ? "启用" : "停用"}）${bind}` }];
       },
     },
     async execute(args) {
@@ -803,7 +856,8 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
       }
       if (Object.keys(patch).length === 0) throw new Error("至少改一项：enabled / title / instruction / trigger / notifyChannel");
       const task = await deps.store.update(deps.uid, input.taskId, patch);
-      return { id: task.id, title: task.title, enabled: task.enabled };
+      const wechatBind = patch.notifyChannel === "wechat" ? wechatBindResult() : undefined;
+      return { id: task.id, title: task.title, enabled: task.enabled, ...(wechatBind !== undefined ? { wechatBind } : {}) };
     },
     isConcurrencySafe: () => false,
   };

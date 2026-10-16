@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, api3, type ConversationEntry, type MeLoose } from "./api";
+import { api, api2, api3, type ConversationEntry, type MeLoose } from "./api";
 import { Profile } from "./pages/Profile";
 import { FaceAvatar } from "./components/FaceEditor";
 import { LightboxHost } from "./lightbox";
@@ -14,17 +14,17 @@ import { Memory } from "./pages/Memory";
 import { Tasks } from "./pages/Tasks";
 import { Panels } from "./pages/Panels";
 import { Progress } from "./pages/Progress";
-import { NotifyChannels } from "./pages/NotifyChannels";
 import { IM } from "./pages/IM";
 import { BottomTabs, Drawer } from "./components/MobileNav";
+import { RepoLinkBar } from "./components/RepoLink";
 import {
   AgentsIcon, CategoryIcon, ChatIcon, ChevronDownIcon, ImIcon, LogoutIcon, MemoryIcon,
-  MenuIcon, ModelIcon, MoonIcon, NotifyIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
+  MenuIcon, ModelIcon, MoonIcon, Prism, ProgressIcon, SkillsIcon, SunIcon, TaskIcon, TodayIcon,
 } from "./icons";
 
 export type View =
   | "chat" | "today" | "category" | "progress"
-  | "agents" | "agent-edit" | "task" | "skills" | "memory" | "model" | "notify" | "im" | "profile";
+  | "agents" | "agent-edit" | "task" | "skills" | "memory" | "model" | "im" | "profile";
 
 function toggleTheme(): void {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -49,14 +49,13 @@ function viewTitle(view: View): string {
     case "skills": return "技能 / MCP";
     case "memory": return "长期记忆";
     case "model": return "模型接入";
-    case "notify": return "通知通道";
     case "im": return "IM 通道";
     case "profile": return "个人资料";
   }
 }
 
 /** 「更多」标签高亮条件：抽屉开着，或当前页是抽屉专属页 */
-const MORE_VIEWS: View[] = ["category", "agents", "agent-edit", "task", "skills", "memory", "model", "notify", "im", "profile"]; // 2026-09-28 B3：盘面从底部栏下架，归入更多
+const MORE_VIEWS: View[] = ["category", "agents", "agent-edit", "task", "skills", "memory", "model", "im", "profile"]; // 2026-09-28 B3：盘面从底部栏下架，归入更多
 
 interface SidebarProps {
   me: MeLoose;
@@ -66,11 +65,71 @@ interface SidebarProps {
   unread: number;
   convQuery: string;
   setConvQuery: (query: string) => void;
+  /** 场景过滤（2026-10-12 工作台化一期）："all" | "untagged" | 场景名 */
+  sceneFilter: string;
+  setSceneFilter: (scene: string) => void;
   onGo: (view: View) => void;
   onOpenConversation: (id: string) => void;
   onNewConversation: () => void;
   onRemoveConversation: (id: string) => void;
+  /** 打标/改标/清标（null = 清除）后刷新会话列表 */
+  onSetScene: (id: string, scene: string | null) => Promise<void>;
   onLogout: () => void;
+}
+
+/** 场景打标编辑器（2026-10-12 工作台化一期）：已有场景一键选 + 新场景输入 + 清除；点击内部不触发选会话 */
+function SceneEditor({ conv, scenes, onSet, onClose }: { conv: ConversationEntry; scenes: string[]; onSet: (scene: string | null) => Promise<void>; onClose: () => void }) {
+  const [value, setValue] = useState(conv.scene ?? "");
+  const [busy, setBusy] = useState(false);
+  const apply = async (scene: string | null) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onSet(scene);
+    } catch (e) {
+      window.alert(String((e as Error).message));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-1 rounded-lg border border-line bg-surface p-2" onClick={(e) => e.stopPropagation()}>
+      {scenes.filter((s) => s !== conv.scene).length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {scenes.filter((s) => s !== conv.scene).map((s) => (
+            <button
+              key={s}
+              disabled={busy}
+              onClick={() => void apply(s)}
+              className="rounded-full bg-accent3 px-2 py-0.5 text-[11px] text-accent transition hover:bg-accent hover:text-white disabled:opacity-50"
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="mt-1.5 flex items-center gap-1">
+        <input
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void apply(value.trim() === "" ? null : value.trim());
+            if (e.key === "Escape") onClose();
+          }}
+          placeholder="场景名（如：装修）…"
+          maxLength={32}
+          className="min-w-0 flex-1 rounded-md border border-line bg-surface2 px-2 py-1 text-xs text-ink outline-none focus:border-accent"
+        />
+        <button
+          disabled={busy}
+          onClick={() => void apply(value.trim() === "" ? null : value.trim())}
+          className="rounded-md bg-accent px-2 py-1 text-xs text-white transition hover:bg-accent2 disabled:opacity-50"
+        >
+          {value.trim() === "" ? "清除" : "设置"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -78,12 +137,16 @@ interface SidebarProps {
  * 头像下拉的开合状态自持——两处不会同时可见，各自持有互不串线。
  */
 function SidebarContent({
-  me, view, conversations, activeConvId, unread, convQuery, setConvQuery,
-  onGo, onOpenConversation, onNewConversation, onRemoveConversation, onLogout,
+  me, view, conversations, activeConvId, unread, convQuery, setConvQuery, sceneFilter, setSceneFilter,
+  onGo, onOpenConversation, onNewConversation, onRemoveConversation, onSetScene, onLogout,
 }: SidebarProps) {
   const username = me.username;
   const [menuOpen, setMenuOpen] = useState(false);
+  const [tagEditingId, setTagEditingId] = useState<string | null>(null);
   const avatarRef = useRef<HTMLDivElement>(null);
+
+  // 场景目录（零预设）：从已打标会话动态长出，最近打过的排前（列表本身置顶/时间倒序，这里保序去重）
+  const scenes = [...new Set(conversations.map((c) => c.scene).filter((s): s is string => typeof s === "string" && s !== ""))];
 
   useEffect(() => {
     const onDoc = (event: MouseEvent) => {
@@ -157,9 +220,29 @@ function SidebarContent({
           placeholder="搜索对话…"
           className="mb-1.5 w-full rounded-lg border border-line bg-surface px-3 py-1.5 text-xs text-ink outline-none transition placeholder:text-ink3 focus:border-accent"
         />
+        {/* 场景 chip 行（2026-10-12 工作台化一期）：全部/未打标/从会话动态长出的场景；横滑不换行（盘面同款） */}
+        {scenes.length > 0 && (
+          <div className="mb-1.5 flex gap-1 overflow-x-auto pb-0.5">
+            {(["all", "untagged", ...scenes] as const).map((scene) => {
+              const active = sceneFilter === scene;
+              return (
+                <button
+                  key={scene}
+                  onClick={() => setSceneFilter(scene)}
+                  className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] transition ${active ? "bg-accent text-white" : "bg-surface text-ink2 hover:bg-accent3 hover:text-accent"}`}
+                >
+                  {scene === "all" ? "全部" : scene === "untagged" ? "未打标" : scene}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2">
           {conversations
-            .filter((conv) => conv.title.toLowerCase().includes(convQuery.trim().toLowerCase()))
+            .filter((conv) => {
+              const byScene = sceneFilter === "all" ? true : sceneFilter === "untagged" ? !conv.scene : conv.scene === sceneFilter;
+              return byScene && conv.title.toLowerCase().includes(convQuery.trim().toLowerCase());
+            })
             .map((conv) => {
               const active = conv.id === activeConvId && view === "chat";
               return (
@@ -176,6 +259,16 @@ function SidebarContent({
                     {conv.pinned && (
                       <span className="shrink-0 rounded bg-accent3 px-1 py-0.5 text-[10px] text-accent">定时</span>
                     )}
+                    {conv.scene && (
+                      <span className="shrink-0 rounded bg-surface2 px-1.5 py-0.5 text-[10px] text-ink2">{conv.scene}</span>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setTagEditingId(tagEditingId === conv.id ? null : conv.id); }}
+                      title="场景标签"
+                      className="shrink-0 rounded p-0.5 text-ink3 transition hover:text-accent md:hidden md:group-hover:block"
+                    >
+                      <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M7 7h.01M7 3h5a1.99 1.99 0 0 1 1.41.59l7 7a2 2 0 0 1 0 2.82l-7 7a2 2 0 0 1-2.82 0l-7-7A1.99 1.99 0 0 1 3 12V7a4 4 0 0 1 4-4z" /></svg>
+                    </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); onRemoveConversation(conv.id); }}
                       title="删除对话"
@@ -187,17 +280,33 @@ function SidebarContent({
                   <p className="mt-0.5 truncate text-xs text-ink2">
                     {new Date(conv.createdTs).toLocaleDateString()} · {new Date(conv.createdTs).toTimeString().slice(0, 5)}
                   </p>
+                  {/* 打标编辑器（2026-10-12）：已有场景一键选 + 新场景输入 + 清除 */}
+                  {tagEditingId === conv.id && (
+                    <SceneEditor
+                      conv={conv}
+                      scenes={scenes}
+                      onSet={async (scene) => {
+                        await onSetScene(conv.id, scene);
+                        setTagEditingId(null);
+                      }}
+                      onClose={() => setTagEditingId(null)}
+                    />
+                  )}
                 </div>
               );
             })}
           {conversations.length === 0 && <p className="px-2 py-1 text-xs text-ink3">还没有对话</p>}
-          {conversations.length > 0 && conversations.every((conv) => !conv.title.toLowerCase().includes(convQuery.trim().toLowerCase())) && (
+          {conversations.length > 0 && conversations.every((conv) => {
+            const byScene = sceneFilter === "all" ? true : sceneFilter === "untagged" ? !conv.scene : conv.scene === sceneFilter;
+            return !byScene || !conv.title.toLowerCase().includes(convQuery.trim().toLowerCase());
+          }) && (
             <p className="px-2 py-1 text-xs text-ink3">没有匹配的对话</p>
           )}
         </div>
       </div>
 
-      {/* 左下角：个人头像下拉 */}
+      {/* 左下角：GitHub 开源入口 + 个人头像下拉 */}
+      <RepoLinkBar />
       <div className="relative px-3 pb-4" ref={avatarRef}>
         <button
           onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
@@ -219,7 +328,6 @@ function SidebarContent({
             {menuItem("skills", "技能 / MCP", SkillsIcon)}
             {menuItem("memory", "长期记忆", MemoryIcon)}
             {menuItem("model", "模型接入", ModelIcon)}
-            {menuItem("notify", "通知通道", NotifyIcon)}
             {menuItem("im", "IM 通道", ImIcon)}
             <div className="mx-3 my-1 border-t border-line" />
             <button
@@ -257,6 +365,7 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
   const [convQuery, setConvQuery] = useState("");
+  const [sceneFilter, setSceneFilter] = useState("all");
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   const reloadConversations = useCallback(async () => {
@@ -285,6 +394,14 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
     const timer = setInterval(poll, 15000);
     return () => clearInterval(timer);
   }, []);
+
+  // 场景过滤兜底（2026-10-12）：过滤中的场景被清到最后一个会话后目录自然消失——过滤名失效时回落"全部"，
+  // 否则侧栏卡在"没有匹配的对话"且 chip 行已隐藏、无可见出口（评审 P1）
+  useEffect(() => {
+    if (sceneFilter === "all" || sceneFilter === "untagged") return;
+    const live = conversations.some((c) => c.scene === sceneFilter);
+    if (!live) setSceneFilter("all");
+  }, [conversations, sceneFilter]);
 
   // 窄屏抽屉的安卓返回键：打开时压一条历史，返回键只关抽屉，不退出页面
   useEffect(() => {
@@ -326,6 +443,12 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
     setActiveConvId((cur) => (cur === id ? list[0]?.id ?? null : cur));
   };
 
+  // 场景打标（2026-10-12 工作台化一期）：落库后刷新列表；当前过滤场景被清空到无人使用时目录自然消失
+  const setConversationScene = async (id: string, scene: string | null) => {
+    await api2.setConversationScene(id, scene);
+    await reloadConversations();
+  };
+
   const sidebarProps = {
     me,
     view,
@@ -334,10 +457,13 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
     unread,
     convQuery,
     setConvQuery,
+    sceneFilter,
+    setSceneFilter,
     onGo: go,
     onOpenConversation: openConversation,
     onNewConversation: () => void newConversation(),
     onRemoveConversation: (id: string) => void removeConversation(id),
+    onSetScene: setConversationScene,
     onLogout,
   };
   const moreActive = drawerOpen || MORE_VIEWS.includes(view);
@@ -395,7 +521,6 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
               {view === "skills" && <Skills />}
               {view === "memory" && <Memory />}
               {view === "model" && <Settings />}
-              {view === "notify" && <NotifyChannels />}
               {view === "im" && <IM />}
               {view === "profile" && <Profile me={me} onSaved={onFaceSaved} />}
             </div>

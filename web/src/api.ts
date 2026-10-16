@@ -34,6 +34,8 @@ export interface ConversationEntry {
   /** 置顶（定时提醒会话） */
   pinned: boolean;
   createdTs: number;
+  /** 场景标签（2026-10-12 工作台化一期）：null = 未打标；侧栏按场景过滤 */
+  scene?: string | null;
 }
 
 export interface TodayPlanView {
@@ -185,7 +187,11 @@ export const api = {
     request<{ ok: boolean }>(`/api/models/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   deleteModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}`, { method: "DELETE" }),
   activateModel: (id: string) => request<{ ok: boolean }>(`/api/models/${id}/active`, { method: "PUT" }),
-  testModel: (id: string) => request<{ ok: boolean; error?: string }>(`/api/models/${id}/test`, { method: "POST" }),
+  // 连接测试客户端也设兜底超时（服务端 45s 中断之外，网络层挂起时浏览器侧 60s 必出结果，页面不再干等）
+  testModel: (id: string) => request<{ ok: boolean; error?: string }>(`/api/models/${id}/test`, { method: "POST", signal: AbortSignal.timeout(60_000) }),
+  /** 表单草稿测试（未保存也能测）：Key 留空且 editingId 有值时，服务端沿用该行已存 Key */
+  testModelDraft: (draft: { baseURL: string; model: string; apiKey?: string; kind?: string; editingId?: string | null }) =>
+    request<{ ok: boolean; error?: string }>("/api/models/test", { method: "POST", body: JSON.stringify(draft), signal: AbortSignal.timeout(60_000) }),
 
   listConversations: () => request<ConversationEntry[]>("/api/conversations"),
   createConversation: (title?: string) =>
@@ -200,10 +206,14 @@ export const api = {
     const query = params.toString();
     return request<SessionEventLoose[]>(`/api/conversations/${cid}/events${query ? `?${query}` : ""}`);
   },
-  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = []) =>
+  sendMessage: (cid: string, text: string, attachments: AttachmentInput[] = [], thinking?: boolean) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/messages`, {
       method: "POST",
-      body: JSON.stringify(attachments.length > 0 ? { text, attachments } : { text }),
+      body: JSON.stringify({
+        text,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(thinking !== undefined ? { thinking } : {}),
+      }),
     }),
   /** 手动中止当前回合（2026-09-27 打断）：部分输出保留为 interrupted 消息 */
   stopConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}/stop`, { method: "POST" }),
@@ -351,6 +361,36 @@ export const api2 = {
     request<{ ok: boolean }>(`/api/conversations/${cid}/model`, { method: "PUT", body: JSON.stringify({ providerId }) }),
   switchAgent: (cid: string, agentId: string) =>
     request<{ ok: boolean }>(`/api/conversations/${cid}/agent`, { method: "PUT", body: JSON.stringify({ agentId }) }),
+  /** 场景标签（2026-10-12 工作台化一期）：scene = null 清除 */
+  setConversationScene: (cid: string, scene: string | null) =>
+    request<ConversationEntry>(`/api/conversations/${cid}/scene`, { method: "PUT", body: JSON.stringify({ scene }) }),
+};
+
+// ── 今天页自定义卡片（2026-10-12 工作台化一期：note 便签 | progress 进度） ──
+export interface NotePayloadLoose {
+  text: string;
+}
+export interface ProgressPayloadLoose {
+  value: number;
+  target: number;
+  unit?: string;
+}
+export interface WidgetLoose {
+  id: string;
+  kind: "note" | "progress";
+  title: string;
+  payload: NotePayloadLoose | ProgressPayloadLoose;
+  sort: number;
+  createdTs: number;
+}
+
+export const apiW = {
+  listWidgets: () => request<WidgetLoose[]>("/api/widgets"),
+  createWidget: (input: { kind: string; title: string; payload: unknown }) =>
+    request<WidgetLoose>("/api/widgets", { method: "POST", body: JSON.stringify(input) }),
+  updateWidget: (id: string, patch: { title?: string; payload?: unknown }) =>
+    request<WidgetLoose>(`/api/widgets/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(patch) }),
+  deleteWidget: (id: string) => request<{ ok: boolean }>(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 
 // ── 批次 3：定时任务 / 通知 ──────────────────────────────
@@ -490,6 +530,8 @@ export interface WechatBindState {
   bound: boolean;
   state: "active" | "expired";
   ilinkBotId?: string;
+  /** 上次用户消息时刻（ms；2026-10-06 健康度）——缺省 = 绑定后从未对话，主动推送不可用 */
+  lastMsgTs?: number;
 }
 
 export const apiIm = {
