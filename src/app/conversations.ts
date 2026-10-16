@@ -9,10 +9,11 @@ import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
 import { createLedgerTools } from "./tools";
-import { composeAssistantPrompt } from "./persona";
+import { composeAssistantPrompt, dateLine } from "./persona";
 import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
 import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
 import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
+import { createWidgetTools } from "./widgets";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
 
@@ -38,8 +39,9 @@ export interface ConversationDeps {
   ledgerFor(uid: string): Promise<Ledger>;
   /** providerId 缺省/null = 跟随用户全局激活模型 */
   modelConfigFor(uid: string, providerId?: string | null): Promise<ModelConfig | null>;
-  /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行） */
-  adapterFactory(uid: string, providerId: string | null, config: ModelConfig): LlmAdapter;
+  /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行）。
+   *  sessionKey = 会话稳定标识（聊天 cid / `task:<taskId>`），OpenCode Go 等网关按它带 x-opencode-session 头 */
+  adapterFactory(uid: string, providerId: string | null, config: ModelConfig, sessionKey?: string): LlmAdapter;
   now(): number;
   /** 用户档案时区（分钟，UTC+local；2026-09-29 起按会话 uid 读——浏览器上报/个人资料页可改）；缺省按服务器本地时区 */
   tzOffsetMinutes?(uid: string): number;
@@ -51,6 +53,10 @@ export interface ConversationDeps {
   memoryVector?: MemoryVectorLike;
   /** 定时任务工具（create_task，D6.4 双入口之二）；缺省不装配 */
   tasks?: TaskStoreLike;
+  /** 今天页自定义卡片（2026-10-12 工作台化一期）：create_widget 等四工具的存储；缺省不装配 */
+  widgets?: import("./widgets").WidgetStore;
+  /** 微信绑定状态源（A4，2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报绑定真相；缺省不回报 */
+  wechatStatus?(uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
   /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
   onTurnDone?(uid: string): void;
 }
@@ -87,10 +93,56 @@ export interface ConversationEntry {
   title: string;
   pinned: boolean;
   createdTs: number;
+  /** 场景标签（2026-10-12 工作台化一期）：可选；侧栏按场景过滤，目录从已打标会话动态长出（零预设） */
+  scene?: string | null;
 }
 
 const DEFAULT_TITLE = "新对话";
 const TITLE_MAX_RUNES = 24;
+/** 场景标签长度上限（rune 计，中英文一致） */
+const SCENE_MAX_RUNES = 32;
+
+/** 场景标签工具（2026-10-12 工作台化一期）：作用于当前会话——侧栏按场景过滤的语境切换 */
+export interface SceneToolsDeps {
+  uid: string;
+  cid: string;
+  setScene(uid: string, cid: string, scene: string | null): Promise<unknown>;
+}
+
+export function createSceneTools(deps: SceneToolsDeps): ToolDefinition[] {
+  const setConversationScene: ToolDefinition = {
+    name: "set_conversation_scene",
+    description:
+      "给当前会话设置或清除场景标签（如「装修」「读书」）——侧栏可按场景过滤，打开一个场景只见相关工作。用户明确要求归类、或会话主题与用户已说过的场景明显吻合时设置；改名、清除同样以用户的话为准，不要擅自批量改。",
+    parameters: {
+      type: "object",
+      required: ["scene"],
+      properties: {
+        scene: { type: "string", description: "场景名（≤32 字）；空字符串 = 清除场景标签" },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        required: ["cid", "scene"],
+        properties: { cid: { type: "string" }, scene: { type: "string" } },
+      },
+      render: (_args, value) => {
+        const v = value as { scene: string };
+        return [{ type: "text", text: v.scene === "" ? "已清除本会话的场景标签" : `已把本会话归到「${v.scene}」场景` }];
+      },
+    },
+    async execute(args) {
+      const input = (args ?? {}) as { scene?: string };
+      if (typeof input.scene !== "string") throw new Error("scene 必须是字符串（清除传空字符串）");
+      const normalized = input.scene.trim();
+      await deps.setScene(deps.uid, deps.cid, normalized === "" ? null : normalized);
+      return { cid: deps.cid, scene: normalized };
+    },
+    isConcurrencySafe: () => false,
+  };
+  return [setConversationScene];
+}
 
 const TITLE_PROMPT = `根据用户的提问生成一个简短的会话标题。
 要求：
@@ -128,17 +180,18 @@ interface ConversationRow {
   pinned: number;
   switches_json: string;
   created_ts: number;
+  scene: string | null;
 }
 
 function rowToEntry(row: ConversationRow): ConversationEntry {
-  return { id: row.cid, title: row.title, pinned: row.pinned === 1, createdTs: row.created_ts };
+  return { id: row.cid, title: row.title, pinned: row.pinned === 1, createdTs: row.created_ts, scene: row.scene };
 }
 
 export class ConversationStore {
   private pool = new Map<string, Agent>();
   private assembling = new Map<string, Promise<Agent>>();
-  /** 本回合注入用的向量命中（send() 预查写入，systemPrompt 闭包同步读；key = uid:cid） */
-  private turnVectorHits = new Map<string, MemoryVectorHit[]>();
+  /** 本回合思考开关（send() 写入、onRequest 闭包读；缺省 = 端点方言各自决定，智谱 coding 缺省关） */
+  private turnThinking = new Map<string, boolean>();
 
   constructor(
     private deps: ConversationDeps,
@@ -148,7 +201,7 @@ export class ConversationStore {
   async list(uid: string): Promise<ConversationEntry[]> {
     // 置顶（定时提醒会话）在前，其余按创建时间倒序
     const rows = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE uid = ? ORDER BY pinned DESC, created_ts DESC, cid")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE uid = ? ORDER BY pinned DESC, created_ts DESC, cid")
       .all(uid) as unknown as ConversationRow[];
     return rows.map(rowToEntry);
   }
@@ -161,7 +214,7 @@ export class ConversationStore {
   async ensureTaskFeed(uid: string, agentId: string | undefined): Promise<ConversationEntry> {
     const cid = `${TASK_FEED_CID_PREFIX}${uid}:${agentId ?? "default"}`;
     const found = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     if (found) return rowToEntry(found);
     let title = "定时提醒";
@@ -173,7 +226,7 @@ export class ConversationStore {
       .prepare("INSERT OR IGNORE INTO conversations (cid, uid, title, agent_id, pinned, created_ts) VALUES (?, ?, ?, ?, 1, ?)")
       .run(cid, uid, title, agentId ?? null, this.deps.now());
     const created = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow;
     return rowToEntry(created);
   }
@@ -213,7 +266,7 @@ export class ConversationStore {
 
   async metaFor(uid: string, cid: string): Promise<ConversationMeta> {
     const row = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     if (!row) return { switches: [] };
     return this.rowToMeta(row);
@@ -255,6 +308,22 @@ export class ConversationStore {
     this.db
       .prepare("UPDATE conversations SET agent_id = ?, switches_json = ? WHERE cid = ? AND uid = ?")
       .run(agentId, JSON.stringify(meta.switches), cid, uid);
+  }
+
+  /**
+   * 场景标签（2026-10-12 工作台化一期）：给会话打/改/清可选场景（如「装修」「读书」）。
+   * 纯展示维度，不参与装配——无需弃池。scene = null 或空白 = 清除；目录由侧栏从已打标会话动态折叠。
+   */
+  async setScene(uid: string, cid: string, scene: string | null): Promise<ConversationEntry> {
+    const normalized = scene === null ? null : scene.trim();
+    if (normalized === "") throw new Error("场景名不能为空白（清除请传 null）");
+    if (normalized !== null && [...normalized].length > SCENE_MAX_RUNES) throw new Error(`场景名过长（≤${SCENE_MAX_RUNES} 字）`);
+    const result = this.db.prepare("UPDATE conversations SET scene = ? WHERE cid = ? AND uid = ?").run(normalized, cid, uid);
+    if (result.changes === 0) throw new Error(`conversation "${cid}" 不存在`);
+    const row = this.db
+      .prepare("SELECT cid, title, agent_id, model_provider_id, pinned, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
+      .get(cid, uid) as unknown as ConversationRow;
+    return rowToEntry(row);
   }
 
   /** 会话绑定模型（2026-09-07）：null = 跟随全局激活；切换即弃池，下一回合按新模型重新装配（日志全量在库，装配无损） */
@@ -347,7 +416,7 @@ export class ConversationStore {
     try {
       const config = await this.deps.modelConfigFor(uid, providerId);
       if (!config) throw new ModelNotConfiguredError();
-      const adapter = this.deps.adapterFactory(uid, providerId, config);
+      const adapter = this.deps.adapterFactory(uid, providerId, config, `title:${cid}`);
       const response = await adapter.complete({
         provider: "title",
         model: config.model,
@@ -399,7 +468,7 @@ export class ConversationStore {
   /** 池化装配用的同步 meta（聊天会话）：list/create 走异步，这里同步读单行 */
   private dbMetaSync(uid: string, cid: string): ConversationMeta {
     const row = this.db
-      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts FROM conversations WHERE cid = ? AND uid = ?")
+      .prepare("SELECT cid, title, agent_id, model_provider_id, switches_json, created_ts, scene FROM conversations WHERE cid = ? AND uid = ?")
       .get(cid, uid) as unknown as ConversationRow | undefined;
     return row ? this.rowToMeta(row) : { switches: [] };
   }
@@ -458,6 +527,8 @@ export class ConversationStore {
         return { conversationId, agentName: agentNow.name };
       },
     }).filter((tool) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name));
+    // 能力绑定的工具开关对场景/卡片工具同样生效（写类工具可被伙伴白名单关掉）
+    const allowByBinding = (tool: ToolDefinition) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name);
 
     const tools: ToolDefinition[] = [...ledgerTools];
     if (binding.skills.length > 0) {
@@ -482,8 +553,19 @@ export class ConversationStore {
           now,
           // 触发时刻按用户钟面解释（评审 2026-09-29 #17）
           tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
+          // 微信绑定真相（A4 2026-10-06）：模型不再猜「绑没绑」
+          ...(this.deps.wechatStatus ? { wechatStatus: (uidRun: string) => this.deps.wechatStatus!(uidRun) } : {}),
         }),
       );
+    }
+    // 场景标签工具（2026-10-12 工作台化一期）：只给聊天会话——任务会话的 conversationId 是 taskId，不是会话 cid，
+    // 池化装配里聊天 = sessionKey 与 conversationId 同为 cid
+    if (sessionKey === conversationId) {
+      tools.push(...createSceneTools({ uid, cid: conversationId, setScene: (sceneUid, sceneCid, scene) => this.setScene(sceneUid, sceneCid, scene) }).filter(allowByBinding));
+    }
+    // 今天页自定义卡片工具：任务会话同权（简报任务也能推进度卡）
+    if (this.deps.widgets) {
+      tools.push(...createWidgetTools({ store: this.deps.widgets, uid }).filter(allowByBinding));
     }
     for (const mcpId of binding.mcps) {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));
@@ -492,7 +574,7 @@ export class ConversationStore {
     return createAgent({
       env,
       sessionLog,
-      adapter: this.deps.adapterFactory(uid, providerId, config),
+      adapter: this.deps.adapterFactory(uid, providerId, config, conversationId),
       model: {
         provider: "byok",
         model: config.model,
@@ -506,71 +588,72 @@ export class ConversationStore {
         if (!config.multimodal && request.messages.some((message) => hasImageBlocks(message))) {
           throw new ModelNotMultimodalError();
         }
-        return request;
+        const thinking = this.turnThinking.get(`${uid}:${conversationId}`);
+        return thinking === undefined ? request : { ...request, thinking };
       },
       tools,
       maxStepsPerTurn: 24,
     });
   }
 
-  /** 情境召回的 query = 会话最近一条用户消息（首轮空 → 仅常驻块）；同步读（systemPrompt 闭包是同步的） */
-  private lastUserTextSync(cid: string): string {
-    const row = this.db
-      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND type = 'user/message' ORDER BY seq DESC LIMIT 1")
-      .get(cid) as { event_json: string } | undefined;
-    if (!row) return "";
-    try {
-      const event = JSON.parse(row.event_json) as { message?: UserMessage };
-      return (event.message ? flattenText(event.message) : "").slice(0, 500);
-    } catch {
-      return "";
-    }
+  /** 回合上下文（2026-10-14 前缀缓存稳定化）：钟面 + 记忆召回块（query = 本回合触发消息文本，向量命中可选） */
+  private turnContextFor(uid: string, query: string, vectorHits?: MemoryVectorHit[]): string {
+    const tz = this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset();
+    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
+      uid,
+      query,
+      vectorHits,
+    );
+    return [dateLine(this.deps.now(), tz), memoryBlock].filter((part) => part !== "").join("\n\n");
+  }
+
+  /** 任务触发回合的上下文（main.ts taskRunner 直投 followup 时携带）：钟面 + 记忆召回（query = 触发消息文本） */
+  taskFeedContext(uid: string, query: string): string {
+    return this.turnContextFor(uid, query);
   }
 
   private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
     const current = this.syncCurrentAgent(uid, meta);
-    const vectorHits = this.turnVectorHits.get(`${uid}:${cid}`);
-    const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
-      uid,
-      this.lastUserTextSync(cid),
-      vectorHits,
-    );
     const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
-    const merged = [memoryBlock, catalog].filter((block) => block !== "").join("\n\n");
     return composeAssistantPrompt({
       persona: current.persona,
       ...(current.identity ? { identity: { name: current.name, description: current.identity.description, language: current.identity.language } } : {}),
-      ...(merged !== "" ? { memoryBlock: merged } : {}),
+      ...(catalog !== "" ? { skillCatalog: catalog } : {}),
       taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
-      now: this.deps.now,
-      tzOffsetMinutes: this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
     });
   }
 
   /**
    * 发送一条用户消息（文本 + 附件块）：附件里的图片要求当前有效模型是多模态，否则就地拒绝（不消耗回合）。
    * 归属校验（2026-09-27 越权补齐）：会话不属于该用户时按不存在拒绝，一个字节都不写。
-   * 向量预查（2026-09-18）：systemPrompt 闭包是同步的，语义命中必须在回合开始前算好；
-   * query = 本回合用户消息（此刻尚未落库，lastUserTextSync 读到的还是上一条）。
+   * 向量预查（2026-09-18）：语义命中在回合开始前算好，随回合上下文注入（query = 本回合用户消息）；
+   * 回合上下文（2026-10-14 前缀缓存稳定化）= 钟面 + 记忆召回，随 user/message 事件落日志、只对本回合 wire 生效。
    */
-  async send(uid: string, cid: string, text: string, attachments: ContentBlock[] = []): Promise<void> {
+  async send(
+    uid: string,
+    cid: string,
+    text: string,
+    attachments: ContentBlock[] = [],
+    opts?: { thinking?: boolean },
+  ): Promise<void> {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     if (attachments.some((block) => block.type === "image")) {
       const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
       if (!config) throw new ModelNotConfiguredError();
       if (!config.multimodal) throw new ModelNotMultimodalError();
     }
+    // 回合级思考开关：只在本条消息显式给了才注入；没给就清掉（微信桥走 send() 不带 opts → 用端点缺省）
+    if (opts?.thinking === undefined) this.turnThinking.delete(`${uid}:${cid}`);
+    else this.turnThinking.set(`${uid}:${cid}`, opts.thinking);
     const agent = await this.agent(uid, cid);
     const content: ContentBlock[] = [...(text !== "" ? [{ type: "text" as const, text }] : []), ...attachments];
     const query = flattenText({ role: "user", content });
-    // null（未配置/超时/失败/纯图片消息）→ 清掉旧命中，本回合退纯词法
+    // null（未配置/超时/失败/纯图片消息）→ 本回合退纯词法召回
     const hits =
       this.deps.memoryVector && query.trim() !== ""
         ? await this.deps.memoryVector.recallHits(uid, query, { scope: "situational" })
         : null;
-    if (hits === null) this.turnVectorHits.delete(`${uid}:${cid}`);
-    else this.turnVectorHits.set(`${uid}:${cid}`, hits);
-    agent.followup(content);
+    agent.followup(content, this.turnContextFor(uid, query, hits ?? undefined));
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
   }
@@ -584,6 +667,11 @@ export class ConversationStore {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     const agent = await this.agent(uid, cid);
     agent.cancel();
+  }
+
+  /** 任务触发回合不经 send()（main.ts 直投 followup）：投递前清回合思考标志，避免吃到用户在 web 端同会话留下的残留 */
+  clearTurnThinking(uid: string, cid: string): void {
+    this.turnThinking.delete(`${uid}:${cid}`);
   }
 
   /** 凝练原料：该用户全部会话的 user/assistant 文本（SQL 取代逐文件全扫） */

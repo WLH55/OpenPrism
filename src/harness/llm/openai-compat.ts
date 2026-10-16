@@ -27,6 +27,13 @@ interface WireMessage {
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/** 网络层错误可读化：undici 的 TypeError 只报 "fetch failed"，真因（DNS/超时/TLS）在 cause 里 */
+function transportReason(error: unknown): string {
+  const message = String((error as Error)?.message ?? error);
+  const cause = (error as { cause?: { message?: unknown } })?.cause?.message;
+  return cause === undefined ? message : `${message} (${String(cause)})`;
+}
+
 /** 用户消息线上内容：纯文字走字符串，含图片走部件数组（图片以 data URL 传） */
 function toWireUserContent(message: Message): string | WireContentPart[] {
   const images = imageBlocksOf(message);
@@ -125,6 +132,9 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
   const idleTimeoutMs = config.idleTimeoutMs ?? 120_000;
   const url = config.baseURL.replace(/\/+$/, "") + "/chat/completions";
   const embeddingsUrl = config.baseURL.replace(/\/+$/, "") + "/embeddings";
+  // 智谱 coding 端点方言（bigmodel.cn / z.ai 的 /api/coding/paas/v4，dsh 的 zai-coding-cn 同源）：
+  // thinking 参数三态——开 = enabled 且保留思维链回传，关/缺省 = disabled（对齐 pi-ai 的 zai thinkingFormat 缺省）
+  const zaiCoding = /\/api\/coding\//.test(config.baseURL);
 
   return {
     name: "openai-compat",
@@ -154,7 +164,7 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
           if (callerSignal?.aborted || isAbortLike(error)) {
             throw llmFailure("ABORTED", "embedding request aborted");
           }
-          throw llmFailure("TRANSPORT", `embedding transport failure: ${String((error as Error)?.message ?? error)}`);
+          throw llmFailure("TRANSPORT", `embedding transport failure: ${transportReason(error)}`);
         }
         if (!response.ok) await mapHttpError(response);
         const json = (await response.json().catch(() => null)) as { data?: { embedding?: unknown }[]; model?: unknown } | null;
@@ -190,6 +200,9 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
           }));
         }
         if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
+        if (zaiCoding) {
+          body.thinking = request.thinking ? { type: "enabled", clear_thinking: false } : { type: "disabled" };
+        }
         if (useStream) {
           body.stream = true;
           body.stream_options = { include_usage: true };
@@ -210,7 +223,7 @@ export function createOpenAICompatAdapter(env: PlatformEnv, config: OpenAICompat
           if (callerSignal?.aborted || isAbortLike(error)) {
             throw llmFailure("ABORTED", "request aborted");
           }
-          throw llmFailure("TRANSPORT", `transport failure: ${String((error as Error)?.message ?? error)}`);
+          throw llmFailure("TRANSPORT", `transport failure: ${transportReason(error)}`);
         }
         if (!response.ok) await mapHttpError(response);
         if (!useStream) {
@@ -371,7 +384,7 @@ async function readStream(
     if (callerSignal?.aborted) throw llmFailure("ABORTED", "stream aborted");
     throw isLlmFailure(error)
       ? error
-      : llmFailure("TRANSPORT", `stream failure: ${String((error as Error)?.message ?? error)}`);
+      : llmFailure("TRANSPORT", `stream failure: ${transportReason(error)}`);
   } finally {
     controller.signal.removeEventListener("abort", onControllerAbort);
     if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);

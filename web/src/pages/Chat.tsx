@@ -105,7 +105,23 @@ export function Chat({
   // 等待队列：AI 输出期间发送的消息暂存于此，回复完成后按入队顺序自动发出
   const [queue, setQueue] = useState<QueuedMessage[]>([]);
   const openImage = useLightbox();
-  const [showReasoning, setShowReasoning] = useState(true);
+  // 思维链开关：显示 + 生成双语义——对支持思考参数的模型（智谱 coding 等）随消息下发 thinking，
+  // 档位持久化在本地（不写会话，跨设备各管各的）；默认开（沿用原显示开关的缺省）
+  const [showReasoning, setShowReasoning] = useState(() => {
+    try {
+      return localStorage.getItem("op-thinking") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleReasoning = (on: boolean) => {
+    setShowReasoning(on);
+    try {
+      localStorage.setItem("op-thinking", on ? "1" : "0");
+    } catch {
+      /* 无 localStorage 也无妨 */
+    }
+  };
   const [pickerOpen, setPickerOpen] = useState(false);
   // 窄屏「会话设置」面板（模型 / 思维链 / 切换伙伴收进来；桌面这三件在头部一行摆开）
   const [sessionPanel, setSessionPanel] = useState(false);
@@ -237,7 +253,7 @@ export function Chat({
       },
     ]);
     try {
-      await api.sendMessage(activeConvId, text, toAttachmentInputs(outgoing));
+      await api.sendMessage(activeConvId, text, toAttachmentInputs(outgoing), showReasoning);
       return true;
     } catch (e) {
       const error = e as Error & { status?: number; code?: string };
@@ -492,7 +508,7 @@ export function Chat({
             <label className="hidden cursor-pointer items-center gap-2 text-xs text-ink2 md:flex">
               <span>思维链</span>
               <span className="relative inline-block h-5 w-9">
-                <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
+                <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => toggleReasoning(e.target.checked)} />
                 <span className="absolute inset-0 rounded-full bg-ink3/40 transition peer-checked:bg-accent2" />
                 <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-surface shadow transition peer-checked:translate-x-4" />
               </span>
@@ -605,7 +621,7 @@ export function Chat({
               <label className="flex cursor-pointer items-center justify-between text-sm text-ink2">
                 <span>思维链</span>
                 <span className="relative inline-block h-5 w-9">
-                  <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => setShowReasoning(e.target.checked)} />
+                  <input type="checkbox" className="peer sr-only" checked={showReasoning} onChange={(e) => toggleReasoning(e.target.checked)} />
                   <span className="absolute inset-0 rounded-full bg-ink3/40 transition peer-checked:bg-accent2" />
                   <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-surface shadow transition peer-checked:translate-x-4" />
                 </span>

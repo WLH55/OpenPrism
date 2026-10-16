@@ -351,6 +351,9 @@ describe("consolidate", () => {
 describe("migrateLegacyMemory", () => {
   it("l2/槽 → 条目；水位线初始化=现状；幂等", () => {
     const db = testDb();
+    // 模拟 schema v1 老库（DDL 已不再建这两张表，2026-10-01 删）
+    db.exec("CREATE TABLE l2_entries (uid TEXT NOT NULL, surface TEXT NOT NULL, id TEXT NOT NULL, section TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, refs_json TEXT NOT NULL DEFAULT '[]', created_ts INTEGER NOT NULL, updated_ts INTEGER, PRIMARY KEY (uid, surface, id))");
+    db.exec("CREATE TABLE memory_slots (uid TEXT NOT NULL, slot TEXT NOT NULL, content_md TEXT NOT NULL DEFAULT '', updated_ts INTEGER, PRIMARY KEY (uid, slot))");
     db.prepare("INSERT INTO conversations (cid, uid, title, created_ts) VALUES ('c1', 'u1', '旧会话', 1)").run();
     db.prepare("INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES ('c1', 0, 'user/message', 1, 'user', ?)").run(
       JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "历史消息" }] } }),
@@ -375,6 +378,15 @@ describe("migrateLegacyMemory", () => {
     // 幂等：重跑不重复
     migrateLegacyMemory(db, { now: () => 2000, randomUUID: () => "r2" });
     expect(memory.listItems("u1", { kind: "fact" }).length).toBe(1);
+  });
+
+  it("无旧表的新库：不抛，直接落标记（schema v2 起不再建旧表）", () => {
+    const db = testDb();
+    expect(() => migrateLegacyMemory(db, { now: () => 1000, randomUUID: () => "r1" })).not.toThrow();
+    const flag = db.prepare("SELECT value FROM meta WHERE key = 'memory_v2_migrated'").get() as { value: string } | undefined;
+    expect(flag?.value).toBe("1000");
+    // 重跑：标记已存在，直接返回
+    expect(() => migrateLegacyMemory(db, { now: () => 2000, randomUUID: () => "r2" })).not.toThrow();
   });
 });
 

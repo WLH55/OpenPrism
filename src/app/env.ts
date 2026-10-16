@@ -4,10 +4,24 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import type { FileIO, PlatformEnv } from "../harness/index";
 
+/** 是否启用了出网代理（curl 同款变量集合）；导出供纯函数测试。 */
+export function proxyEnvEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return Boolean(env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy);
+}
+
+// Node 22 内置 fetch 不认 HTTP(S)_PROXY/NO_PROXY（NODE_USE_ENV_PROXY 要 Node 24+），
+// 直连被墙的端点（如 api.jina.ai）只会报 "fetch failed"；设了任一代理变量就换 undici
+// 的 EnvHttpProxyAgent 分发（NO_PROXY 例外表同样生效），一个没设则保持原生 fetch 零差异。
+const proxyDispatcher = proxyEnvEnabled() ? new EnvHttpProxyAgent() : undefined;
+
 export const nodeEnv: PlatformEnv = {
-  fetch: (input, init) => fetch(input, init),
+  fetch: (input, init) =>
+    proxyDispatcher
+      ? (undiciFetch(input, { ...init, dispatcher: proxyDispatcher }) as unknown as Promise<Response>)
+      : fetch(input, init),
   now: () => Date.now(),
   randomUUID: () => randomUUID(),
 };

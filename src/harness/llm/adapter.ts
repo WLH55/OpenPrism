@@ -17,6 +17,8 @@ export interface LlmRequest {
   maxTokens?: number;
   /** 提示 adapter 的窗口信息；不参与 request/header 指纹 */
   contextWindow?: number;
+  /** 思考开关（GLM/DeepSeek 系的 thinking 参数；adapter 按端点方言映射，不认识的协议忽略）。不参与指纹 */
+  thinking?: boolean;
 }
 
 export interface LlmResponse {

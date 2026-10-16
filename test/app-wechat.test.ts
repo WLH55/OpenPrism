@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { EnvFetchRequest, EnvFetchResponse, PlatformEnv } from "../src/harness/env";
-import { createILinkClient, ILinkSessionStaleError, ILinkTokenExpiredError, type ILinkCredentials } from "../src/app/ilink";
-import { WechatBridge, WECHAT_FEED_CID } from "../src/app/wechat-bridge";
+import { createILinkClient, ILinkContextStaleError, ILinkTokenExpiredError, type ILinkCredentials } from "../src/app/ilink";
+import { WechatBridge, WECHAT_FEED_CID, withContextNudge } from "../src/app/wechat-bridge";
 import { ConversationStore } from "../src/app/conversations";
 import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
@@ -111,7 +111,7 @@ const bindActive = async (fixture: ReturnType<typeof makeFixture>) => {
 const iLinkOk = { ret: 0, errcode: 0 };
 
 describe("iLink 客户端（协议面）", () => {
-  it("getUpdates：头协议（AuthorizationType/Bearer）+ 游标推进 + 用户文本提取（bot 消息与空文本跳过）", async () => {
+  it("getUpdates：头协议（AuthorizationType/Bearer）+ 游标推进 + 用户文本提取（bot 消息跳过；媒体消息保留 media 面）", async () => {
     const iLink = fakeILink();
     iLink.on(
       (url) => url.endsWith("/ilink/bot/getupdates"),
@@ -128,7 +128,10 @@ describe("iLink 客户端（协议面）", () => {
     );
     const client = createILinkClient({ fetch: iLink.fetch });
     const { msgs, nextCursor } = await client.getUpdates("tok-1", "cursor-1");
-    expect(msgs).toEqual([{ messageId: "11", fromUserId: "wxuser-1", messageType: 1, text: "记一下跑步 30 分钟", contextToken: "ctx-1" }]);
+    expect(msgs).toEqual([
+      { messageId: "11", fromUserId: "wxuser-1", messageType: 1, text: "记一下跑步 30 分钟", media: [], contextToken: "ctx-1" },
+      { messageId: "13", fromUserId: "wxuser-1", messageType: 1, text: "", media: [{ kind: "image", encryptQueryParam: "x", aesKeyRaw: "" }], contextToken: "" },
+    ]);
     expect(nextCursor).toBe("cursor-2");
     const call = iLink.calls.find((c) => c.url.endsWith("/ilink/bot/getupdates"))!;
     expect(call.init?.headers?.AuthorizationType).toBe("ilink_bot_token");
@@ -199,10 +202,28 @@ describe("iLink 客户端（协议面）", () => {
     expect(msg).not.toHaveProperty("context_token");
   });
 
-  it("sendMessage：ret=-2 → ILinkSessionStaleError（context_token 过期，errcode=0 prepare failed）", async () => {
+  it("sendMessage：ret=-2 → ILinkContextStaleError（context_token 过期，errcode=0 prepare failed）", async () => {
     const iLink = fakeILink();
     iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ ret: -2, errcode: 0, errmsg: "prepare failed" }));
-    await expect(createILinkClient({ fetch: iLink.fetch }).sendMessage("t", "u", "stale-token", "hi")).rejects.toBeInstanceOf(ILinkSessionStaleError);
+    await expect(createILinkClient({ fetch: iLink.fetch }).sendMessage("t", "u", "stale-token", "hi")).rejects.toBeInstanceOf(ILinkContextStaleError);
+  });
+});
+
+describe("withContextNudge（AC6 推送内嵌保活提醒，2026-10-06）", () => {
+  const NOW_MS = 1_000_000_000_000;
+  it("从未对话 / <11h：不追加（避免每条都唠叨）", () => {
+    expect(withContextNudge("早", undefined, NOW_MS)).toBe("早");
+    expect(withContextNudge("早", NOW_MS - 5 * 3600_000, NOW_MS)).toBe("早");
+    expect(withContextNudge("早", NOW_MS - 11 * 3600_000 + 1, NOW_MS)).toBe("早");
+  });
+  it("≥11h：末尾追加回复引导，且总长不超 500 防御上限", () => {
+    const nudged = withContextNudge("正文", NOW_MS - 12 * 3600_000, NOW_MS);
+    expect(nudged).toContain("回一个字");
+    expect(nudged.startsWith("正文")).toBe(true);
+    expect(nudged.length).toBeLessThanOrEqual(500);
+    const long = withContextNudge("字".repeat(600), NOW_MS - 13 * 3600_000, NOW_MS);
+    expect(long).toContain("回一个字");
+    expect(long.length).toBeLessThanOrEqual(500); // 超长正文被压缩，引导句完整保留
   });
 });
 
@@ -296,23 +317,30 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     const callsBefore = fixture.iLink.calls.length;
     await fixture.bridge.pollOnce(UID); // expired：直接返回，不再外呼
     expect(fixture.iLink.calls.length).toBe(callsBefore);
-    expect(await fixture.bridge.pushToWechat(UID, "推不动")).toBe(false); // 过期后主动推送也退站内
+    expect(await fixture.bridge.pushToWechat(UID, "推不动")).toMatchObject({ delivered: false, reason: "rebind" }); // 过期后主动推送：归 rebind（重新扫码），不再笼统 false
   });
 
-  it("pushToWechat：active 推送成功（无缓存 token = tokenless 单发）；未绑定/接口失败 → false 落待补投", async () => {
+  it("pushToWechat（失败可见化 + 待补投）：active → delivered（无缓存 token = 省略键）；未绑定 → unbound 不入队；HTTP 500 → error 落补投；ret=-2 → stale-context；-14 → rebind 且快速置过期", async () => {
     const fixture = makeFixture([{ kind: "text", text: "用不到" }]);
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
-    expect(await fixture.bridge.pushToWechat(UID, "先没绑定")).toBe(false);
+    expect(await fixture.bridge.pushToWechat(UID, "先没绑定")).toEqual({ delivered: false, reason: "unbound" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS n FROM wechat_pending WHERE uid = ?").get(UID)).toMatchObject({ n: 0 }); // 未绑定不入队
     await bindActive(fixture);
-    expect(await fixture.bridge.pushToWechat(UID, "【喝水】该喝水了")).toBe(true);
+    expect(await fixture.bridge.pushToWechat(UID, "【喝水】该喝水了")).toEqual({ delivered: true });
     const last = fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!;
     expect(JSON.parse(last.init?.body ?? "{}").msg).toMatchObject({ to_user_id: "wxuser-1" });
-    expect(JSON.parse(last.init?.body ?? "{}").msg).not.toHaveProperty("context_token"); // 无缓存 token = 省略键，非空串
-    // 接口报错 → false（任务不失败）且入待补投
+    expect(JSON.parse(last.init?.body ?? "{}").msg).not.toHaveProperty("context_token"); // 无缓存 token = 省略键，非空串（空串键被 iLink 拒）
+    // 接口级失败 → error（任务不失败）且入待补投
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ __status: 500 }));
-    expect(await fixture.bridge.pushToWechat(UID, "再推")).toBe(false);
+    expect(await fixture.bridge.pushToWechat(UID, "再推")).toMatchObject({ delivered: false, reason: "error" });
     expect(fixture.db.prepare("SELECT text FROM wechat_pending WHERE uid = ?").get(UID)).toMatchObject({ text: "再推" });
+    // 上下文过期（生产实锤形态：ret=-2 errmsg=prepare failed）→ stale-context；本就 tokenless，不做同形态重试
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ ret: -2, errmsg: "prepare failed" }));
+    expect(await fixture.bridge.pushToWechat(UID, "再推2")).toMatchObject({ delivered: false, reason: "stale-context", message: expect.stringContaining("prepare failed") });
+    // bot_token 失效 → rebind 且绑定快速置过期（置尾：过期后推送不再外呼）
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ errcode: -14 }));
+    expect(await fixture.bridge.pushToWechat(UID, "再推3")).toEqual({ delivered: false, reason: "rebind", message: expect.any(String) });
+    expect(fixture.bridge.status(UID)).toMatchObject({ state: "expired" });
   });
 
   it("pushToWechat：带最近入站消息的 contextToken（落库，重启不丢）——主动推送不再赌空串（2026-09-30 ret=-2 实锤）", async () => {
@@ -331,13 +359,16 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     await fixture.bridge.pollOnce(UID); // 入站一条 → contextToken 落库
     expect(fixture.db.prepare("SELECT last_context_token FROM wechat_binds WHERE uid = ?").get(UID)).toMatchObject({ last_context_token: "ctx-31" });
 
-    expect(await fixture.bridge.pushToWechat(UID, "【喝水】该喝水了")).toBe(true);
+    expect(await fixture.bridge.pushToWechat(UID, "【喝水】该喝水了")).toEqual({ delivered: true });
     const push = JSON.parse(fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!.init?.body ?? "{}").msg;
     expect(push.context_token).toBe("ctx-31"); // 任务推送挂上入站上下文，而非空串
 
+    // status 带 lastMsgTs（2026-10-06 健康度数据源）：随入站消息更新，重启后同库仍在
+    expect(fixture.bridge.status(UID)).toMatchObject({ bound: true, state: "active", lastMsgTs: NOW() });
+
     // 重启模拟：新桥实例同库——token 不丢，推送继续可用
     const reborn = new WechatBridge({ env: envOf(fixture.iLink.fetch), db: fixture.db, masterKey: fixture.masterKey, conversations: fixture.conversations, notifications: fixture.notifications, now: NOW });
-    expect(await reborn.pushToWechat(UID, "重启后")).toBe(true);
+    expect(await reborn.pushToWechat(UID, "重启后")).toEqual({ delivered: true });
     const push2 = JSON.parse(fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!.init?.body ?? "{}").msg;
     expect(push2.context_token).toBe("ctx-31");
   });
@@ -444,7 +475,7 @@ describe("WechatBridge 推送降级与待补投（2026-10-09）", () => {
       n += 1;
       return n === 1 ? staleResp : iLinkOk;
     });
-    expect(await fixture.bridge.pushToWechat(UID, "【日报】今天完成 3 件")).toBe(true);
+    expect(await fixture.bridge.pushToWechat(UID, "【日报】今天完成 3 件")).toEqual({ delivered: true });
     const bodies = sendBodies(fixture).slice(-2);
     expect(bodies[0]!.context_token).toBe("ctx-41"); // 第一次带缓存 token
     expect(bodies[1]).not.toHaveProperty("context_token"); // 降级重发省略键
@@ -457,8 +488,8 @@ describe("WechatBridge 推送降级与待补投（2026-10-09）", () => {
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
     await primeFreshToken(fixture, "ctx-41");
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => staleResp);
-    expect(await fixture.bridge.pushToWechat(UID, "第一条通知")).toBe(false);
-    expect(await fixture.bridge.pushToWechat(UID, "第二条通知")).toBe(false);
+    expect(await fixture.bridge.pushToWechat(UID, "第一条通知")).toMatchObject({ delivered: false, reason: "stale-context" });
+    expect(await fixture.bridge.pushToWechat(UID, "第二条通知")).toMatchObject({ delivered: false, reason: "stale-context" });
     const rows = fixture.db.prepare("SELECT text FROM wechat_pending WHERE uid = ? ORDER BY id ASC").all(UID) as unknown as { text: string }[];
     expect(rows).toEqual([{ text: "第一条通知" }, { text: "第二条通知" }]);
   });
@@ -468,7 +499,7 @@ describe("WechatBridge 推送降级与待补投（2026-10-09）", () => {
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => staleResp); // 欢迎语也会失败（不拦绑定）
     await bindActive(fixture);
     const before = sendBodies(fixture).length; // 欢迎语 1 次尝试
-    expect(await fixture.bridge.pushToWechat(UID, "从未对话的推送")).toBe(false);
+    expect(await fixture.bridge.pushToWechat(UID, "从未对话的推送")).toMatchObject({ delivered: false, reason: "stale-context" });
     expect(sendBodies(fixture).length).toBe(before + 1); // 只有一次尝试，无重试
     expect(fixture.db.prepare("SELECT text FROM wechat_pending WHERE uid = ?").get(UID)).toMatchObject({ text: "从未对话的推送" });
   });
@@ -478,7 +509,7 @@ describe("WechatBridge 推送降级与待补投（2026-10-09）", () => {
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
     await bindActive(fixture); // 欢迎语走 ok
     fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => ({ errcode: -14 }));
-    expect(await fixture.bridge.pushToWechat(UID, "过期绑定上的推送")).toBe(false);
+    expect(await fixture.bridge.pushToWechat(UID, "过期绑定上的推送")).toEqual({ delivered: false, reason: "rebind", message: expect.any(String) });
     expect(fixture.bridge.status(UID)).toEqual({ bound: true, state: "expired", ilinkBotId: "ib-1" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS n FROM wechat_pending WHERE uid = ?").get(UID)).toMatchObject({ n: 1 });
   });

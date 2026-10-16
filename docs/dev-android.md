@@ -7,7 +7,7 @@
 
 | 项 | 位置 |
 |---|---|
-| Android SDK | `C:\Users\Lathan\AppData\Local\Android\Sdk`（platform 36 + build-tools 36.1.0，许可已接受） |
+| Android SDK | `C:\Users\<本机用户名>\AppData\Local\Android\Sdk`（platform 36 + build-tools 36.1.0，许可已接受） |
 | Gradle 运行时 JDK 21 | `D:\software\Android Studio\jbr`（设为 JAVA_HOME） |
 | Java 17 工具链 | `D:\software\jdk-17.0.20.1+1`（Temurin，清华 Adoptium 镜像下载；另复制了一份到 `~/.gradle/jdks/`） |
 | Gradle 发行版镜像 | 华为云（写在 `android/gradle/wrapper/gradle-wrapper.properties`，`services.gradle.org` 国内超时） |
@@ -17,7 +17,7 @@
 
 ```sh
 npx expo prebuild -p android --no-install
-echo "sdk.dir=C:/Users/Lathan/AppData/Local/Android/Sdk" > android/local.properties
+echo "sdk.dir=C:/Users/<本机用户名>/AppData/Local/Android/Sdk" > android/local.properties
 # 并把 gradle-wrapper.properties 的 distributionUrl 改成华为云镜像（见上）
 ```
 
@@ -42,7 +42,7 @@ foojay 自动下载——否则它从 GitHub 拉 JDK 17，国内会挂死十分�
 ## 装进模拟器
 
 用安卓模拟器插件的 `android_install_app`（apkPath 指向上面 APK）+
-`android_launch_app`（applicationId `com.lathan.openprism`），或者直接
+`android_launch_app`（applicationId 以本地 prebuild 生成结果为准，形如 `com.example.openprism`），或者直接
 `adb install -r <apk>`。模拟器窗口在桌面可见，可直接上手操作。
 
 ## 已知限制
