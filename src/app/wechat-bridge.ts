@@ -1,7 +1,6 @@
 // 微信桥（2026-09-27）：iLink Bot 的绑定管理与消息路由。
 // 职责：扫码凭据落库（主密钥加密）/ 长轮询收消息 / 消息进固定「微信对话」会话跑回合 /
-// 回复推回微信 / token 过期（-14）停轮询并站内提醒 / 任务通知推送（pushToWechat：
-// ret=-2 降级 tokenless 重试 + 失败入待补投、下次入站时补发，2026-10-09）。
+// 回复推回微信 / token 过期（-14）停轮询并站内提醒 / 任务通知推送（pushToWechat）。
 // 会话模型：cid = wechat:<uid>（置顶固定会话，web 端同步可见同一份日志）；非绑定微信用户的消息忽略。
 
 import type { DatabaseSync } from "node:sqlite";
@@ -132,7 +131,6 @@ export class WechatBridge {
     this.runners.delete(uid);
     this.feedEnsured.delete(uid);
     this.deps.db.prepare("DELETE FROM wechat_binds WHERE uid = ?").run(uid);
-    this.deps.db.prepare("DELETE FROM wechat_pending WHERE uid = ?").run(uid);
   }
 
   status(uid: string): { bound: boolean; state: "active" | "expired"; ilinkBotId?: string; lastMsgTs?: number } {
@@ -243,8 +241,6 @@ export class WechatBridge {
     this.deps.db
       .prepare("UPDATE wechat_binds SET last_context_token = ?, last_msg_ts = ? WHERE uid = ?")
       .run(msg.contextToken, this.now(), uid);
-    // 待补投冲刷（2026-10-09）：此刻 token 必然新鲜，先补发积压通知再跑当轮回合
-    await this.flushPending(uid, bind, msg.contextToken);
     const text = [msg.text, ...msg.media.flatMap((m) => (m.kind === "voice" && (m.voiceText ?? "") !== "" ? [m.voiceText!] : []))]
       .filter((part) => part !== "")
       .join("\n");
@@ -393,77 +389,22 @@ export class WechatBridge {
 
   // ── 主动推送（任务通知） ────────────────────────────────
 
-  /** 待补投上限（防御：长期未对话用户积压封顶，正常一天几条远触不到） */
-  private static readonly PENDING_CAP = 50;
-
-  /** 推送最终失败 → 入待补投队列（按 uid 只留最近 PENDING_CAP 条） */
-  private enqueuePending(uid: string, text: string): void {
-    const db = this.deps.db;
-    db.prepare("INSERT INTO wechat_pending (uid, text, created_ts) VALUES (?, ?, ?)").run(uid, text, this.now());
-    db.prepare(
-      "DELETE FROM wechat_pending WHERE uid = ? AND id NOT IN (SELECT id FROM wechat_pending WHERE uid = ? ORDER BY id DESC LIMIT ?)",
-    ).run(uid, uid, WechatBridge.PENDING_CAP);
-  }
-
-  /**
-   * 推文本到绑定微信；失败 → 分类结局（调用方按 reason 给用户可操作提示）+ 入待补投。
+  /** 推文本到绑定微信；未绑定/失败 → 分类结局（调用方按 reason 给用户可操作提示）。
    * 上下文 = 最近入站消息的 contextToken（2026-09-30）：iLink 主动推送必须挂在用户消息的上下文上，
-   * 约 12–14h 无入站即过期（ret=-2）。降级策略（2026-10-09，hermes/OpenClaw 同款证据）：
-   * 第一次带了缓存 token 且被 ret=-2 拒 → 去 token（tokenless）重发一次，服务端通常仍投递；
-   * 无缓存 token 直发本就 tokenless，失败不重试（重试同形态无意义，hermes #35062 教训）。
-   * 最终失败入待补投，下次该用户任一入站消息时用新鲜 token 补发。
-   */
+   * 空串只在服务端恰好还有新鲜会话时侥幸放行——从不依赖运气，没存过就空串试一次，失败退站内。 */
   async pushToWechat(uid: string, text: string): Promise<WechatPushOutcome> {
     const bind = this.readBind(uid);
     if (!bind) return { delivered: false, reason: "unbound" };
     if (bind.state !== "active") return { delivered: false, reason: "rebind" }; // 绑过但已过期：重新扫码
-    const token = bind.last_context_token ?? "";
-    const body = text.slice(0, 500);
     try {
-      await this.client.sendMessage(bind.botToken, bind.ilink_user_id, token, body);
+      await this.client.sendMessage(bind.botToken, bind.ilink_user_id, bind.last_context_token ?? "", text.slice(0, 500));
       return { delivered: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (error instanceof ILinkTokenExpiredError) {
-        await this.expire(uid); // bot 凭据也死了：与轮询侧同语义快速置过期（幂等）
-        this.enqueuePending(uid, body);
-        return { delivered: false, reason: "rebind", message };
-      }
-      if (error instanceof ILinkContextStaleError && token !== "") {
-        // 带 token 被拒 → tokenless 降级重发一次
-        try {
-          await this.client.sendMessage(bind.botToken, bind.ilink_user_id, "", body);
-          return { delivered: true };
-        } catch (retryError) {
-          console.error("[wechat] 任务通知降级重试仍失败（落待补投）:", retryError instanceof Error ? retryError.message : retryError);
-          this.enqueuePending(uid, body);
-          return { delivered: false, reason: "stale-context", message };
-        }
-      }
-      // 其他错误，或本就 tokenless 发送失败：同形态重试无意义（hermes #35062 教训）
-      console.error("[wechat] 任务通知推送失败（落待补投）:", message);
-      this.enqueuePending(uid, body);
+      console.error("[wechat] 任务通知推送失败（分类退站内，调用方会给恢复指引）:", message);
+      if (error instanceof ILinkTokenExpiredError) return { delivered: false, reason: "rebind", message };
       if (error instanceof ILinkContextStaleError) return { delivered: false, reason: "stale-context", message };
       return { delivered: false, reason: "error", message };
-    }
-  }
-
-  /**
-   * 待补投冲刷：该用户刚有入站消息（token 必然新鲜）时，按入队顺序补发全部积压；
-   * 成功即删；单条失败即停（剩余保留，下次入站再试）。每条加【补投】前缀说明迟到原因。
-   */
-  private async flushPending(uid: string, bind: WechatBindRow & { botToken: string }, contextToken: string): Promise<void> {
-    const rows = this.deps.db
-      .prepare("SELECT id, text FROM wechat_pending WHERE uid = ? ORDER BY id ASC")
-      .all(uid) as unknown as { id: number; text: string }[];
-    for (const [index, row] of rows.entries()) {
-      try {
-        await this.client.sendMessage(bind.botToken, bind.ilink_user_id, contextToken, `【补投】${row.text}`.slice(0, 500));
-      } catch (error) {
-        console.error(`[wechat] 补投失败，剩余 ${rows.length - index} 条保留待下次入站:`, error instanceof Error ? error.message : error);
-        return;
-      }
-      this.deps.db.prepare("DELETE FROM wechat_pending WHERE id = ?").run(row.id);
     }
   }
 }

@@ -172,10 +172,10 @@ async function main(): Promise<void> {
         if (now - (wechatPushWarnedAt.get(uidRun) ?? 0) >= 12 * 3600_000) {
           const hint =
             outcome.reason === "stale-context"
-              ? `⚠️ 微信推送失败（对话窗口过期）：「${task.title}」暂落站内。在微信里给机器人随便回一句话，之后的推送就会恢复，这条也会随后补达。`
+              ? `⚠️ 微信推送失败（对话窗口过期）：「${task.title}」只落了站内。在微信里给机器人随便回一句话，之后的推送就会恢复。`
               : outcome.reason === "rebind"
-                ? "⚠️ 微信推送失败：微信绑定已过期——到「IM 通道」页重新扫码，绑定后错过的提醒会自动补达。"
-                : `⚠️ 微信推送失败（${outcome.message ?? "未知原因"}）——这条提醒已落站内，微信恢复对话后会自动补达。`;
+                ? "⚠️ 微信推送失败：微信绑定已过期——到「IM 通道」页重新扫码即可恢复。"
+                : `⚠️ 微信推送失败（${outcome.message ?? "未知原因"}）——这条提醒已落站内。`;
           try {
             await notifications.push(uidRun, { kind: "wechat_push_failed", text: hint });
             wechatPushWarnedAt.set(uidRun, now); // 发送成功才占用 12h 去重名额——失败不禁声下一次
