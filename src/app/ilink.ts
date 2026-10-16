@@ -21,9 +21,7 @@ export class ILinkTokenExpiredError extends Error {
   }
 }
 
-/** ret=-2（errmsg=prepare failed）：推送所挂的 context_token 已过期（约 12–14h 无用户入站即发生，2026-10-06/09 真机实证）——
- * 用户在微信里发条消息即可刷新 context_token 恢复；类型化供上层 tokenless 降级重试与失败原因透传（一律按过期处理——
- * 若实为限流，重试一次失败与现状持平，无额外伤害） */
+/** ret=-2（errmsg=prepare failed）：推送所挂的上下文已过期（2026-10-06 真机实证）——用户在微信里发条消息即可刷新 context_token 恢复 */
 export class ILinkContextStaleError extends Error {
   constructor(detail: string) {
     super(`ilink context stale（ret=-2）: ${detail}`);
@@ -72,7 +70,7 @@ export interface ILinkClient {
   pollQRCodeStatus(qrcode: string): Promise<{ status: "wait" | "scaned" | "confirmed" | "expired"; creds?: ILinkCredentials }>;
   /** 拉一轮消息（35s 长轮询由服务端保持；返回用户消息（文本 + 媒体面）与下一轮游标） */
   getUpdates(botToken: string, cursor: string): Promise<{ msgs: ILinkInboundMessage[]; nextCursor: string }>;
-  /** 发文本消息（contextToken 空串 = 请求体省略 context_token 键的 tokenless 发送——iLink 接受其为会话过期后的降级路径，hermes/OpenClaw/QwenPaw 同款） */
+  /** 发文本消息（contextToken 可空 = 主动推送，如欢迎语/定时通知——可用性以真机实测为准） */
   sendMessage(botToken: string, toUserId: string, contextToken: string, text: string): Promise<void>;
   /** 从 iLink CDN 下载媒体密文（裸 GET 无鉴权头，WeKnora DownloadFile 同款）；解密在调用侧 */
   downloadMedia(url: string): Promise<Uint8Array>;
@@ -238,9 +236,7 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
           message_type: 2, // BOT
           message_state: 2, // FINISH
           item_list: [{ type: 1, text_item: { text } }], // TEXT
-          // 空串必须整个省略键：恒发空串键会被 iLink 拒（ret=-2 prepare failed，2026-09-30 实锤）；
-          // 无键 = tokenless 降级路径，服务端通常仍投递（hermes 实测，2026-10-09）
-          ...(contextToken !== "" ? { context_token: contextToken } : {}),
+          context_token: contextToken,
         },
         base_info: { channel_version: CHANNEL_VERSION },
       });
@@ -251,7 +247,7 @@ export function createILinkClient(deps: { fetch: PlatformEnv["fetch"] }): ILinkC
       };
       // 2026-09-28 真机排障：HTTP 200 不等于送达——业务码必须检查，否则静默丢单（WeKnora 原版也不查，属共同盲区）
       if (raw.errcode === -14) throw new ILinkTokenExpiredError();
-      // ret=-2 = context_token 过期（errcode=0，errmsg=prepare failed）：类型化供上层 tokenless 降级重试与失败原因透传
+      // ret=-2 = 上下文过期（2026-10-06）：主动推送必须挂在用户最近消息的 context_token 上，窗口约 12–14h（社区逆向口径）
       if (raw.ret === -2) throw new ILinkContextStaleError(String(raw.errmsg ?? ""));
       if ((raw.ret ?? 0) !== 0 || (raw.errcode ?? 0) !== 0) {
         throw new Error(`ilink sendmessage ret=${raw.ret} errcode=${raw.errcode}: ${String(raw.errmsg ?? "").slice(0, 200)}`);
