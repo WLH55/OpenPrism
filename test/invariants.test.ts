@@ -9,7 +9,7 @@ import { llmFailure } from "../src/harness/llm/errors";
 import { createMockLlmAdapter } from "../src/harness/llm/mock";
 import type { SessionEvent, SessionEventPayload } from "../src/harness/session/events";
 import { InMemorySessionLog } from "../src/harness/session/log";
-import { deriveMessages, projectSurface } from "../src/harness/session/project";
+import { DEFAULT_PRUNE, deriveMessages, projectSurface } from "../src/harness/session/project";
 import { selectShadowInterval } from "../src/harness/context/compact";
 import type { AssistantMessage, Message, UserMessage } from "../src/harness/types";
 import { echoTool, fakeEnv, sleep } from "./helpers";
@@ -259,5 +259,57 @@ describe("不变量：随机事件流投影", () => {
         expect(lastVisibleCtx).toBeUndefined();
       }
     }
+  });
+});
+
+// ── 图片回合窗口（2026-10-17 媒体膨胀治理）──
+// 确定性投影规则：仅最近 N 个回合内的图片进模型上下文，更早的替换占位文本。
+// 内联（data）与引用（blobRef）两种形态同样适用；规则是日志的纯函数（铁律 2：wire 可从日志+规则重建）。
+
+describe("不变量：图片回合窗口投影", () => {
+  const imageTurn = (seq: number, mediaType = "image/png", extra: Record<string, unknown> = {}) =>
+    ({
+      type: "user/message",
+      channel: "followup",
+      seq,
+      ts: 0,
+      message: { role: "user", content: [{ type: "image", mediaType, ...extra }] },
+    }) as SessionEvent;
+  const turnStart = (seq: number) => ({ type: "turn/start", seq, ts: 0 }) as SessionEvent;
+
+  it("窗口 2：最近两个回合的图保留，更早的换占位（内联与引用形态同规则）", () => {
+    const events: SessionEvent[] = [
+      turnStart(0),
+      imageTurn(1, "image/png", { data: "AAAABBBB" }), // 回合1（窗口外）
+      turnStart(2),
+      imageTurn(3, "image/jpeg", { blobRef: "r3".padEnd(64, "0") }), // 回合2（窗口外）
+      turnStart(4),
+      imageTurn(5, "image/png", { data: "CCCC" }), // 回合3（窗口内）
+      turnStart(6),
+      imageTurn(7, "image/gif", { data: "DDDD" }), // 回合4（窗口内）
+    ];
+    const surface = projectSurface(events);
+    const images = surface.map((it) => it.message).flatMap((m) => m.content.filter((b) => b.type === "image"));
+    expect(images).toHaveLength(2); // 窗口外两张被替换
+    const texts = surface.map((it) => it.message).flatMap((m) => m.content.filter((b) => b.type === "text"));
+    expect(texts.filter((b) => (b as { text: string }).text === "[图片已省略]")).toHaveLength(2);
+    // 窗口内的保持原形态（内联 data / 引用 blobRef 均原样——引用由宿主 onRequest 回填）
+    expect(images[0]).toMatchObject({ type: "image", mediaType: "image/png", data: "CCCC" });
+    expect(images[1]).toMatchObject({ type: "image", mediaType: "image/gif", data: "DDDD" });
+  });
+
+  it("回合数不足窗口：全保留（现行为不变）；窗口 0：全占位", () => {
+    const twoTurns: SessionEvent[] = [turnStart(0), imageTurn(1, "image/png", { data: "AA" }), turnStart(2), imageTurn(3, "image/png", { data: "BB" })];
+    expect(projectSurface(twoTurns).flatMap((it) => it.message.content).some((b) => b.type === "image")).toBe(true);
+    const zero = projectSurface(twoTurns, { ...DEFAULT_PRUNE, imageTurnWindow: 0 });
+    expect(zero.flatMap((it) => it.message.content).some((b) => b.type === "image")).toBe(false);
+  });
+
+  it("占位不污染日志事件对象（投影纯函数；事件是共享引用）", () => {
+    const events: SessionEvent[] = [turnStart(0), imageTurn(1, "image/png", { data: "AA" }), turnStart(2), imageTurn(3, "image/png", { data: "BB" }), turnStart(4), imageTurn(5, "image/png", { data: "CC" })];
+    projectSurface(events);
+    const first = (events[1] as { message: { content: Array<{ type: string; data?: string }> } }).message.content[0]!;
+    expect(first.type).toBe("image");
+    expect(first.data).toBe("AA"); // 原事件未被改写
   });
 });

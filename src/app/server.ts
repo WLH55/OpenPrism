@@ -575,6 +575,22 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return sendJson(res, 200, deps.conversations.readEvents(cid, { before, limit }));
     }
 
+    // 图片字节（2026-10-17 媒体膨胀治理）：事件里 image 块只留 blobRef，前端 <img> 按需来这取。
+    // 归属校验同 events；ref 是 sha256 hex（内容寻址，不可枚举——不校验 ref 与该会话的关联，越权拉图需先拿到 ref 本身）
+    const blobMatch = /^\/blobs\/([0-9a-f]{64})$/.exec(sub);
+    if (blobMatch && method === "GET") {
+      if (deps.conversations.ownerOf(cid) !== uid) return sendError(res, 404, "会话不存在");
+      const row = deps.db.prepare("SELECT media_type, data FROM conversation_blobs WHERE ref = ?").get(blobMatch[1]!) as
+        | { media_type: string; data: Uint8Array }
+        | undefined;
+      if (!row) return sendError(res, 404, "图片不存在");
+      // Content-Type 白名单（评审 m4）：media_type 来自库，写路径已限定四类图片，但迁移/未来写入端失控时不让任意类型出网（全局另有 nosniff）
+      const contentType = /^(image\/(png|jpeg|gif|webp))$/.test(row.media_type) ? row.media_type : "application/octet-stream";
+      res.writeHead(200, { "Content-Type": contentType, "Cache-Control": "private, max-age=31536000, immutable" });
+      res.end(Buffer.from(row.data));
+      return;
+    }
+
     if (sub === "/messages" && method === "POST") {
       const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown; thinking?: unknown };
       const text = String(body.text ?? "").trim();
@@ -1006,7 +1022,22 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       createdTs: entry.createdTs,
       events: deps.conversations.readEvents(entry.id), // 不带 options = 全量升序
     }));
-    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations, ...(deps.widgets ? { widgets: deps.widgets.list(uid) } : {}) };
+    // 图片字节随行（2026-10-17 媒体膨胀治理，评审 M2）：事件里只留 blobRef，导出收录被引用的
+    // blobs 保持「JSON 全量可审计/可重放」——MD 人读版不需要
+    const referencedRefs = new Set<string>();
+    for (const conversation of conversations) {
+      for (const event of conversation.events) {
+        if (event.type !== "user/message") continue;
+        for (const block of event.message.content) {
+          if (block.type === "image" && block.blobRef !== undefined) referencedRefs.add(block.blobRef);
+        }
+      }
+    }
+    const blobs =
+      referencedRefs.size === 0
+        ? []
+        : (deps.db.prepare(`SELECT ref, media_type, data FROM conversation_blobs WHERE ref IN (${[...referencedRefs].map(() => "?").join(",")})`).all(...referencedRefs) as unknown as Array<{ ref: string; media_type: string; data: Uint8Array }>).map((row) => ({ ref: row.ref, mediaType: row.media_type, dataBase64: Buffer.from(row.data).toString("base64") }));
+    const input = { exportedAt: deps.env.now(), ledger: ledger.readAll(), conversations, ...(deps.widgets ? { widgets: deps.widgets.list(uid) } : {}), blobs };
     const dateTag = new Date(input.exportedAt).toISOString().slice(0, 10).replace(/-/g, "");
     if (format === "json") {
       res.writeHead(200, {

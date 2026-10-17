@@ -2,6 +2,7 @@
 // 全部 DDL 收敛在本文件；各 store 持有 DatabaseSync 做同步读写（persona 注入/会话签发的同步语义不破）。
 // harness 零平台依赖铁律不破：node:sqlite 只允许出现在 src/app 层。
 
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -310,6 +311,16 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- 图片内容寻址存储（2026-10-17 媒体膨胀治理）：base64 不再内联进 conversation_events.event_json，
+-- 事件里 image 块只留 blobRef（sha256 hex）。ref 即拉图能力凭证（不可枚举），同图天然去重；
+-- 已知取舍：删除会话不回收 blobs（无反向引用，泄漏量级 MB/图，后续可加 GC）。
+CREATE TABLE IF NOT EXISTS conversation_blobs (
+  ref        TEXT PRIMARY KEY,
+  media_type TEXT NOT NULL,
+  data       BLOB NOT NULL,
+  created_ts INTEGER NOT NULL
+);
 `;
 
 /** 存量库补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列） */
@@ -524,4 +535,71 @@ export function dropLegacyTables(db: DatabaseSync): void {
     DROP TABLE IF EXISTS memory_slots;
     DROP TABLE IF EXISTS model_config;
   `);
+}
+
+/** 图片字节入库（内容寻址）：返回 sha256 hex 引用。同图（同字节）INSERT OR IGNORE 天然去重。 */
+export function storeImageBlob(db: DatabaseSync, bytes: Uint8Array, mediaType: string, now: number = Date.now()): string {
+  const ref = createHash("sha256").update(bytes).digest("hex");
+  db.prepare("INSERT OR IGNORE INTO conversation_blobs (ref, media_type, data, created_ts) VALUES (?, ?, ?, ?)").run(
+    ref,
+    mediaType,
+    bytes,
+    now,
+  );
+  return ref;
+}
+
+/** 按引用批量取图（onRequest 回填 / hydrate 用）：ref → { mediaType, data(base64) } */
+export function readImageBlobs(db: DatabaseSync, refs: string[]): Map<string, { mediaType: string; dataBase64: string }> {
+  const out = new Map<string, { mediaType: string; dataBase64: string }>();
+  for (const ref of refs) {
+    if (out.has(ref)) continue;
+    const row = db.prepare("SELECT media_type, data FROM conversation_blobs WHERE ref = ?").get(ref) as
+      | { media_type: string; data: Uint8Array }
+      | undefined;
+    if (row) out.set(ref, { mediaType: row.media_type, dataBase64: Buffer.from(row.data).toString("base64") });
+  }
+  return out;
+}
+
+/**
+ * 存量事件内联图片迁移（2026-10-17 媒体膨胀治理）：user/message 事件里 image 块的 base64 data
+ * 抽到 conversation_blobs，event_json 重写为 blobRef 引用形态（seq/type/ts 不动，投影不受扰动）。
+ * 幂等：无内联 data 的事件是 no-op。必须在任何 SqliteSessionLog.open 之前跑（main.ts 启动序列保证）。
+ */
+export function migrateInlineImages(db: DatabaseSync): void {
+  // 已知取舍（评审 m2，接受）：一次性 .all() 物化含图事件（LIKE 预筛后）+ 逐行 parse，启动峰值内存约为数据量数倍——
+  // 当前生产规模（29MB 事件/1.8G 可用）无碍；更大库可改 iterate 流式。崩溃收敛性：blob 先写、事件后改，任意中断点重跑幂等收敛。
+  const rows = db
+    .prepare("SELECT cid, seq, event_json FROM conversation_events WHERE type = 'user/message' AND event_json LIKE '%\"type\":\"image\"%'")
+    .all() as unknown as { cid: string; seq: number; event_json: string }[];
+  let moved = 0;
+  let savedChars = 0;
+  const update = db.prepare("UPDATE conversation_events SET event_json = ? WHERE cid = ? AND seq = ?");
+  for (const row of rows) {
+    let event: { message?: { content?: Array<Record<string, unknown>> } };
+    try {
+      event = JSON.parse(row.event_json);
+    } catch {
+      continue; // 坏行不动（历史遗留由重建机制兜底）
+    }
+    const content = event.message?.content;
+    if (!Array.isArray(content)) continue;
+    let changed = false;
+    for (const block of content) {
+      if (block?.["type"] !== "image" || typeof block["data"] !== "string") continue;
+      const bytes = Buffer.from(block["data"] as string, "base64");
+      const mediaType = String(block["mediaType"] ?? "image/png");
+      const ref = storeImageBlob(db, bytes, mediaType);
+      savedChars += (block["data"] as string).length;
+      delete block["data"];
+      block["blobRef"] = ref;
+      changed = true;
+      moved += 1;
+    }
+    if (changed) update.run(JSON.stringify(event), row.cid, row.seq);
+  }
+  if (moved > 0) {
+    process.stdout.write(`[openprism] 内联图片迁移：${moved} 张入 blobs 表，事件日志瘦身约 ${Math.round(savedChars / 1024 / 1024)}MB\n`);
+  }
 }

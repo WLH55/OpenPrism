@@ -23,6 +23,9 @@ export interface ExportInput {
   conversations: ExportConversation[];
   /** 今天页自定义卡片（2026-10-12）：JSON 全量备份收录；缺省 = 服务端未装配 widgets */
   widgets?: Widget[];
+  /** 会话图片字节（2026-10-17 媒体膨胀治理）：事件里 image 块只留 blobRef，导出收录被引用的
+   * blobs（ref → base64）保持「JSON 全量可审计/可重放」口径；缺省 = 无图片引用 */
+  blobs?: Array<{ ref: string; mediaType: string; dataBase64: string }>;
 }
 
 export function buildExportJson(input: ExportInput): string {
@@ -39,6 +42,7 @@ export function buildExportJson(input: ExportInput): string {
         events: c.events,
       })),
       ...(input.widgets !== undefined ? { widgets: input.widgets } : {}),
+      ...(input.blobs !== undefined ? { blobs: input.blobs } : {}),
     },
     null,
     2,

@@ -3,7 +3,7 @@
 // fetch 由 PlatformEnv 注入；usage 归一（prompt_tokens 为总输入，缓存命中单列 cacheRead）。
 
 import type { EnvFetchResponse, PlatformEnv } from "../env";
-import { flattenText, imageBlocksOf, plainTextOf, type AssistantMessage, type Message, type ToolCallBlock, type Usage } from "../types";
+import { flattenText, imageBlocksOf, plainTextOf, IMAGE_OMITTED_PLACEHOLDER, type AssistantMessage, type Message, type ToolCallBlock, type Usage } from "../types";
 import type { LlmAdapter, LlmCallOptions, LlmEmbeddingRequest, LlmEmbeddingResponse, LlmRequest, LlmResponse } from "./adapter";
 import { isAbortLike, isLlmFailure, llmFailure, looksLikeContextOverflow, looksLikeQuota } from "./errors";
 import { IncrementalUtf8Decoder } from "./utf8";
@@ -42,6 +42,12 @@ function toWireUserContent(message: Message): string | WireContentPart[] {
   const parts: WireContentPart[] = [];
   if (text !== "") parts.push({ type: "text", text });
   for (const image of images) {
+    // 引用形态（blobRef 未回填/回填失败）不进 wire：宿主 onRequest 负责回填 data，这里是深度防御。
+    // 换占位文本（评审 m5）而非静默跳过：压缩摘要请求不经回填，跳过会让模型对"曾经有图"零感知，与投影层占位口径统一
+    if (image.data === undefined) {
+      parts.push({ type: "text", text: IMAGE_OMITTED_PLACEHOLDER });
+      continue;
+    }
     parts.push({ type: "image_url", image_url: { url: `data:${image.mediaType};base64,${image.data}` } });
   }
   return parts;

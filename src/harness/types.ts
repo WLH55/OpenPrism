@@ -13,13 +13,18 @@ export interface ToolCallBlock {
   arguments: unknown;
 }
 
-/** 图片（多模态输入）：data 为 base64 裸数据（不含 data: 前缀），adapter 拼成自家协议的图片部件 */
+/** 图片（多模态输入）：data 为 base64 裸数据（不含 data: 前缀），adapter 拼成自家协议的图片部件。
+ * 引用形态（2026-10-17 媒体膨胀治理）：落库时 data 抽到宿主 blobs 表，块内只留 blobRef（sha256 hex，
+ * 内容寻址）；发给模型前由宿主回填 data（投影的回合窗口规则决定哪些图被回填，窗口外的在投影层换占位文本）。
+ * 两种形态互斥：有 data 无 blobRef = 内联（迁移前存量/测试夹具），有 blobRef 无 data = 引用。 */
 export interface ImageBlock {
   type: "image";
   /** MIME 类型，如 image/png */
   mediaType: string;
-  /** base64 裸数据 */
-  data: string;
+  /** base64 裸数据（内联形态） */
+  data?: string;
+  /** 内容寻址引用（引用形态）：sha256(原始图片字节) hex */
+  blobRef?: string;
 }
 
 /** 文本附件（上传的文件）：正文随块入日志，模型与界面都能重建 */
@@ -33,6 +38,9 @@ export interface FileBlock {
 }
 
 export type ContentBlock = TextBlock | ImageBlock | FileBlock | ToolCallBlock;
+
+/** 图片不进 wire 时的占位（投影回合窗口外的老图 / 引用未回填的图）：投影层与 adapter wire 统一口径 */
+export const IMAGE_OMITTED_PLACEHOLDER = "[图片已省略]";
 
 /** 用户输入的两种写法：纯文本 / 带附件的块序列 */
 export type UserContent = string | ContentBlock[];

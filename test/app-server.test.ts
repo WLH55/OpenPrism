@@ -27,6 +27,7 @@ import { WechatBridge } from "../src/app/wechat-bridge";
 import { createMockLlmAdapter, type LlmAdapter } from "../src/harness/index";
 import { testDb } from "./helpers-db";
 import { sleep } from "./helpers";
+import { createHash } from "node:crypto";
 
 let root: string;
 let baseUrl: string;
@@ -1032,11 +1033,19 @@ describe("HTTP API 批次5（多模态图片与个人资料）", () => {
         if (events.some((e) => e.type === "turn/end")) break;
       }
       const userEvent = events.find((e) => e.type === "user/message")!;
+      // 图片分离（2026-10-17 媒体膨胀治理）：事件落引用形态（blobRef，无 data）；文本附件照旧内联
+      const blobRef = createHash("sha256").update(Buffer.from(PNG_BASE64, "base64")).digest("hex");
       expect(userEvent.message!.content).toEqual([
         { type: "text", text: "看看这张" },
-        { type: "image", mediaType: "image/png", data: PNG_BASE64 },
+        { type: "image", mediaType: "image/png", blobRef },
         { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 备注" },
       ]);
+      // blob 路由：本人会话取回原字节；不存在的 ref 404
+      const blobRes = await fetch(`${baseUrl}/api/conversations/${visionConv.id}/blobs/${blobRef}`, { headers: { cookie } });
+      expect(blobRes.status).toBe(200);
+      expect(Buffer.from(await blobRes.arrayBuffer()).toString("base64")).toBe(PNG_BASE64);
+      expect(blobRes.headers.get("content-type")).toBe("image/png");
+      expect((await fetch(`${baseUrl}/api/conversations/${visionConv.id}/blobs/${"0".repeat(64)}`, { headers: { cookie } })).status).toBe(404);
     } finally {
       multimodalModel = false;
     }
