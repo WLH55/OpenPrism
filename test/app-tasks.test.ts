@@ -416,19 +416,20 @@ describe("任务工具四件套（双入口之二；2026-09-04 补 CRUD）", () 
     expect(off.tasks).toHaveLength(0);
   });
 
-  it("query_tasks 带内置标记（评审 O4）：builtin 字段与「（内置）」回执标注——模型可定位'把内置的简报挪到九点'", async () => {
+  it("query_tasks 带内置标记（评审 O4）：builtin 字段与「（内置·渠道）」回执标注——模型可定位'把内置的简报挪到九点'、看得到通知渠道（2026-10-17 渠道可见性修复）", async () => {
     let seq = 0;
     const store = new TaskStore({ db: testDb(), now: () => 1, randomUUID: () => `tid-bq-${++seq}` });
     const tools = createTaskTools({ store, uid: "u-bq", now: () => NOW });
     const by = (name: string) => tools.find((t) => t.name === name)!;
-    await store.create("u-bq", { title: "每日简报", instruction: "x", trigger: { kind: "daily", time: "08:30" }, builtin: "daily-brief", tzOffsetMinutes: 480 });
+    await store.create("u-bq", { title: "每日简报", instruction: "x", trigger: { kind: "daily", time: "08:30" }, builtin: "daily-brief", tzOffsetMinutes: 480, notifyChannel: "wechat" });
     await store.create("u-bq", { title: "喝水", instruction: "x", trigger: { kind: "daily", time: "10:00" } });
-    const result = (await by("query_tasks").execute({}, ctx)) as { tasks: { title: string; builtin?: string }[] };
+    const result = (await by("query_tasks").execute({}, ctx)) as { tasks: { title: string; builtin?: string; notifyChannel?: string }[] };
     expect(result.tasks.find((t) => t.title === "每日简报")!.builtin).toBe("daily-brief");
     expect(result.tasks.find((t) => t.title === "喝水")!.builtin).toBeUndefined();
     const blocks = by("query_tasks").output.render!({}, result) as { text: string }[];
-    expect(blocks[0]!.text).toContain("每日简报（内置）");
-    expect(blocks[0]!.text).not.toContain("喝水（内置）");
+    expect(blocks[0]!.text).toContain("每日简报（内置·微信推送）");
+    expect(blocks[0]!.text).toContain("喝水（站内通知）");
+    expect(blocks[0]!.text).not.toContain("喝水（内置");
   });
 
   it("update_task：停用/改触发；坏 trigger 拒绝；空 patch 拒绝", async () => {

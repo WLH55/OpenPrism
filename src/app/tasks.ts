@@ -762,7 +762,7 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
 
   const queryTasks: ToolDefinition = {
     name: "query_tasks",
-    description: "查用户的定时任务列表：id、标题、触发、启用态、下次到点。用户问「我有哪些提醒」「那个任务还在吗」就用它。",
+    description: "查用户的定时任务列表：id、标题、触发、启用态、下次到点、通知渠道（站内 inapp | 微信 wechat）。用户问「我有哪些提醒」「那个任务还在吗」「简报是走微信还是站内」就用它。",
     parameters: {
       type: "object",
       properties: {
@@ -772,8 +772,20 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     output: {
       schema: { type: "object", required: ["tasks"], properties: { tasks: { type: "array" } } },
       render: (_args, value) => {
-        const tasks = (value as { tasks: { title: string; builtin?: string }[] }).tasks ?? [];
-        const text = tasks.length === 0 ? "没有定时任务" : `共 ${tasks.length} 个：${tasks.map((t) => (t.builtin !== undefined ? `${t.title}（内置）` : t.title)).join("；")}`;
+        const tasks = (value as { tasks: { title: string; builtin?: string; notifyChannel?: string; enabled?: boolean }[] }).tasks ?? [];
+        const text =
+          tasks.length === 0
+            ? "没有定时任务"
+            : `共 ${tasks.length} 个：${tasks
+                .map((t) => {
+                  const tags: string[] = [];
+                  if (t.builtin !== undefined) tags.push("内置");
+                  if (t.notifyChannel === "wechat") tags.push("微信推送");
+                  else tags.push("站内通知");
+                  if (t.enabled === false) tags.push("已停用");
+                  return `${t.title}（${tags.join("·")}）`;
+                })
+                .join("；")}`;
         return [{ type: "text", text }];
       },
     },
