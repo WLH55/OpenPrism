@@ -33,6 +33,12 @@ const WECHAT_FEED_TITLE = "微信对话";
 /** 回复单条上限（防御性；iLink 无公开文档，WeKnora 通知侧截 500） */
 const REPLY_MAX_CHARS = 4000;
 
+/** 入站媒体聚合窗口（2026-10-17 媒体膨胀治理/多图识别）：iLink 一图一消息投递，
+ * 微信多选连发会被拆成 N 条 → 不聚合就 N 个独立回合分 N 次回复。纯媒体消息进窗口攒批：
+ * 窗口内继续追加并重置计时，收文本（含语音转写）立即合并同回合，超上限即发。 */
+export const WECHAT_AGGREGATE_WINDOW_MS = 2500;
+export const WECHAT_AGGREGATE_MAX_ITEMS = 9;
+
 /** 上下文窗口阈值（2026-10-06，社区逆向口径 12–14h 取中）：warn=推送开始内嵌回复提醒，stale=大概率已推不出去。
  * web IM 页健康度展示用同一组口径（web/src/pages/IM.tsx 以同值常量对齐）。 */
 export const WECHAT_CONTEXT_THRESHOLDS = { warnMs: 11 * 3600_000, staleMs: 13 * 3600_000 };
@@ -75,7 +81,21 @@ export interface WechatBridgeDeps {
   notifications: NotificationStore;
   /** 退避等待（注入固定值保测试确定性；缺省真实 setTimeout） */
   sleep?: (ms: number) => Promise<void>;
+  /** 聚合窗口定时（注入手动触发保测试确定性；缺省真实 setTimeout）。返回取消函数。 */
+  schedule?: (fn: () => void, ms: number) => () => void;
   now?(): number;
+}
+
+interface PendingMedia {
+  bind: WechatBindRow & { botToken: string };
+  /** 已下载解密的附件块（窗口内跨消息累积） */
+  blocks: ContentBlock[];
+  /** 攒批图片解码字节累计（评审 M1）：单条消息各自 ≤12MB 不够——9 张近上限图会合成 ~72MB 的 LLM 请求
+   * 整批被提供方拒且用户零反馈；攒批累计超整批上限立即 flush，与张数上限并列 */
+  bytes: number;
+  /** 回推锚取最后一条入站消息（fromUserId/contextToken） */
+  lastMsg: ILinkInboundMessage;
+  cancel?: () => void;
 }
 
 export class WechatBridge {
@@ -84,6 +104,11 @@ export class WechatBridge {
   private feedEnsured = new Set<string>();
   /** 申请中的登录二维码 → 归属用户（防他账号持码劫绑；confirmed/expired 即除名，弃扫残留一条可忽略） */
   private pendingQRCodes = new Map<string, string>();
+  /** 入站媒体聚合（2026-10-17）：uid → 攒批中的纯媒体消息（窗口计时中） */
+  private pendingMedia = new Map<string, PendingMedia>();
+  /** 回合串行链（2026-10-17 聚合引入）：timer 触发的 flush 回合与轮询循环里的文本回合可能并发，
+   * per-uid 排队保「同会话同时至多一个回合」（send 的会话池不会并发跑同 key 回合，排队是防线） */
+  private turnChains = new Map<string, Promise<unknown>>();
 
   constructor(private deps: WechatBridgeDeps) {
     this.client = createILinkClient({ fetch: deps.env.fetch });
@@ -91,6 +116,51 @@ export class WechatBridge {
 
   private now(): number {
     return this.deps.now?.() ?? this.deps.env.now();
+  }
+
+  private schedule(fn: () => void, ms: number): () => void {
+    const injected = this.deps.schedule;
+    if (injected) return injected(fn, ms);
+    const timer = setTimeout(fn, ms);
+    return () => clearTimeout(timer);
+  }
+
+  private enqueueTurn<T>(uid: string, run: () => Promise<T>): Promise<T> {
+    const prev = this.turnChains.get(uid) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.turnChains.set(uid, next.then(() => undefined, () => undefined));
+    return next;
+  }
+
+  /** 取走攒批媒体（文本触发合并/清理路径用）：取消计时、清状态、返回已攒块 */
+  private takePendingMedia(uid: string): { bind: WechatBindRow & { botToken: string }; blocks: ContentBlock[]; lastMsg: ILinkInboundMessage } | undefined {
+    const pending = this.pendingMedia.get(uid);
+    if (!pending) return undefined;
+    pending.cancel?.();
+    this.pendingMedia.delete(uid);
+    return pending;
+  }
+
+  private flushPendingMedia(uid: string): void {
+    const pending = this.takePendingMedia(uid);
+    if (!pending) return;
+    // 已知取舍：pendingMedia 是内存态，2.5s 窗口内进程重启会丢在窗图片（无痕；用户重发即可）——窗口极小，不做持久化。
+    // 已知竞态（评审 m1，接受）：媒体下载 await 期间窗口到期会先 flush 已攒批，本条走新窗口——不丢数据，极端时拆两回合。
+    void this.enqueueTurn(uid, () => this.runTurn(uid, pending.bind, pending.lastMsg, "", pending.blocks)).catch(async (error) => {
+      console.error("[wechat] 聚合回合失败:", error instanceof Error ? error.message : error);
+      // flush 路径不在轮询循环里，失败没人报（评审 m3）：至少给用户一条提示，尽力推送
+      try {
+        await this.client.sendMessage(pending.bind.botToken, pending.lastMsg.fromUserId, pending.lastMsg.contextToken, "图片刚没处理成功，麻烦再发一次试试。");
+      } catch {
+        // 提示也推不出去（绑定多半已失效）：上面已有日志
+      }
+    });
+  }
+
+  /** 等该用户的回合链排空（测试驱动聚合窗口的确定性收口；生产可用于关停前排空） */
+  async idle(uid: string): Promise<void> {
+    const chain = this.turnChains.get(uid);
+    if (chain !== undefined) await chain.then(() => undefined, () => undefined);
   }
 
   // ── 绑定管理 ────────────────────────────────────────────
@@ -130,6 +200,7 @@ export class WechatBridge {
     if (runner) runner.stopped = true;
     this.runners.delete(uid);
     this.feedEnsured.delete(uid);
+    this.takePendingMedia(uid); // 攒批中的媒体随绑定一起放弃（重绑后用户重发）
     this.deps.db.prepare("DELETE FROM wechat_binds WHERE uid = ?").run(uid);
   }
 
@@ -233,7 +304,9 @@ export class WechatBridge {
 
   /** 一条入站消息 → 会话回合 → 回复推回（串行：回合跑完才处理下一条/下一轮拉取，天然保序）。
    * 媒体面（2026-10-11）：语音转写并入文本；图片/文件下载解密后走 attachments 管线；
-   * transport/配置类失败（下载/解密/超限/模型非多模态）不跑回合——直接回说明文本，不进轮询退避（重试无意义且伤同批后续消息）。 */
+   * transport/配置类失败（下载/解密/超限/模型非多模态）不跑回合——直接回说明文本，不进轮询退避（重试无意义且伤同批后续消息）。
+   * 聚合（2026-10-17 多图识别）：纯媒体消息不立即开回合——进 2.5s 窗口攒批（连发多图合成单回合单次回复）；
+   * 带文本（含语音转写）的消息立即开回合并合并窗口内已攒媒体。回合一律经 enqueueTurn 串行（timer flush 与轮询并发防线）。 */
   private async handle(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage): Promise<void> {
     if (msg.fromUserId !== bind.ilink_user_id) return; // 非绑定微信用户：忽略（AC5）
     // 上下文锚（2026-09-30）：任何入站即存——媒体消息也算「用户回复」，保活窗口靠它刷新；空串 token 照存
@@ -250,8 +323,6 @@ export class WechatBridge {
       await this.pushNotice(bind, msg, "这条语音没能转写出文字——麻烦打字发我，或者重新说一遍。");
       return;
     }
-    await this.ensureFeed(uid);
-    const cid = WECHAT_FEED_CID(uid);
     let attachments: ContentBlock[] = [];
     if (downloadable.length > 0) {
       const result = await this.mediaToAttachments(msg, downloadable);
@@ -261,6 +332,44 @@ export class WechatBridge {
       }
       attachments = result.blocks;
     }
+    // 聚合决策：带文本 → 立即回合（合并窗口内已攒媒体）；纯媒体 → 进窗口攒批
+    if (text !== "") {
+      const pending = this.takePendingMedia(uid);
+      const blocks = [...(pending?.blocks ?? []), ...attachments];
+      // 锚 = 当前文本消息（最后到达；比攒批里的图新，回推复用最新 token）
+      await this.enqueueTurn(uid, () => this.runTurn(uid, bind, msg, text, blocks));
+      return;
+    }
+    const batchBytes = (blocks: ContentBlock[]): number =>
+      blocks.reduce((sum, b) => sum + (b.type === "image" && b.data !== undefined ? Buffer.byteLength(b.data, "base64") : 0), 0);
+    const incoming = this.pendingMedia.get(uid);
+    if (incoming !== undefined) {
+      incoming.blocks.push(...attachments);
+      incoming.bytes += batchBytes(attachments);
+      incoming.lastMsg = msg;
+      incoming.cancel?.();
+      if (incoming.blocks.length >= WECHAT_AGGREGATE_MAX_ITEMS || incoming.bytes >= ATTACHMENT_TOTAL_MAX_BYTES) {
+        this.pendingMedia.delete(uid);
+        await this.enqueueTurn(uid, () => this.runTurn(uid, bind, msg, "", incoming.blocks));
+      } else {
+        incoming.cancel = this.schedule(() => this.flushPendingMedia(uid), WECHAT_AGGREGATE_WINDOW_MS);
+      }
+      return;
+    }
+    const fresh: PendingMedia = { bind, blocks: attachments, bytes: batchBytes(attachments), lastMsg: msg };
+    if (fresh.bytes >= ATTACHMENT_TOTAL_MAX_BYTES) {
+      // 单条消息就顶满整批上限（如一条消息里两张 6MB 图）：不值得再等窗口，直接发
+      await this.enqueueTurn(uid, () => this.runTurn(uid, bind, msg, "", fresh.blocks));
+      return;
+    }
+    this.pendingMedia.set(uid, fresh);
+    fresh.cancel = this.schedule(() => this.flushPendingMedia(uid), WECHAT_AGGREGATE_WINDOW_MS);
+  }
+
+  /** 开一个回合并把回复推回微信（handle 与聚合 flush 共用；串行链上执行）。 */
+  private async runTurn(uid: string, bind: WechatBindRow & { botToken: string }, anchorMsg: ILinkInboundMessage, text: string, attachments: ContentBlock[]): Promise<void> {
+    await this.ensureFeed(uid);
+    const cid = WECHAT_FEED_CID(uid);
     const agent = await this.deps.conversations.agent(uid, cid);
     const before = agent.sessionLog.readAll().length;
     try {
@@ -268,7 +377,7 @@ export class WechatBridge {
     } catch (error) {
       // 多模态校验失败不消耗回合：配置类错误给指引，不上抛进轮询退避
       if (error instanceof ModelNotMultimodalError) {
-        await this.pushNotice(bind, msg, "当前模型不支持看图——到网页端「设置」里切换为多模态模型后再发，或直接到网页端对话里发图。");
+        await this.pushNotice(bind, anchorMsg, "当前模型不支持看图——到网页端「设置」里切换为多模态模型后再发，或直接到网页端对话里发图。");
         return;
       }
       throw error;
@@ -282,7 +391,7 @@ export class WechatBridge {
           ? event.message.content.filter((b) => b.type === "text").map((b) => (b as { text?: string }).text ?? "").join("")
           : "",
       )
-      .filter((text) => text !== "")
+      .filter((rtext) => rtext !== "")
       .join("\n\n");
     if (reply === "") {
       // 排障（2026-09-28 真机）：事件明明有 assistant 文本却提取为空——把中间态全部现形
@@ -294,7 +403,7 @@ export class WechatBridge {
       return;
     }
     try {
-      await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
+      await this.client.sendMessage(bind.botToken, anchorMsg.fromUserId, anchorMsg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
     } catch (error) {
       // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）——但必须留日志（排障）
       console.error(
@@ -375,6 +484,7 @@ export class WechatBridge {
     const runner = this.runners.get(uid);
     if (runner) runner.stopped = true;
     this.runners.delete(uid);
+    this.takePendingMedia(uid); // 攒批媒体放弃（过期后推送不出去，重扫后用户重发）
     const result = this.deps.db.prepare("UPDATE wechat_binds SET state = 'expired' WHERE uid = ? AND state = 'active'").run(uid);
     if (result.changes === 0) return; // 已解绑/已标记：不重复提醒
     try {

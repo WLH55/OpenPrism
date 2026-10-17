@@ -128,8 +128,29 @@ function makeFixture(script: MockScriptStep[], opts?: { multimodal?: boolean }) 
   const notifications = new NotificationStore({ db, now: NOW });
   const iLink = fakeILink();
   const masterKey = Buffer.alloc(32, 7);
-  const bridge = new WechatBridge({ env: envOf(iLink.fetch), db, masterKey, conversations, notifications, now: NOW });
-  return { db, mock, conversations, notifications, iLink, bridge, masterKey };
+  // 聚合窗口（2026-10-17 多图识别）：schedule 收集到期回调不真跑；fireAggregate 手动放行窗口 + 等回合链排空
+  const scheduledFns: Array<() => void> = [];
+  const bridge = new WechatBridge({
+    env: envOf(iLink.fetch),
+    db,
+    masterKey,
+    conversations,
+    notifications,
+    now: NOW,
+    schedule: (fn) => {
+      scheduledFns.push(fn);
+      return () => {
+        const at = scheduledFns.indexOf(fn);
+        if (at >= 0) scheduledFns.splice(at, 1);
+      };
+    },
+  });
+  const fireAggregate = async () => {
+    const fns = scheduledFns.splice(0);
+    for (const fn of fns) fn();
+    await bridge.idle(UID);
+  };
+  return { db, mock, conversations, notifications, iLink, bridge, masterKey, fireAggregate };
 }
 
 const bindActive = async (fixture: ReturnType<typeof makeFixture>) => {
@@ -299,6 +320,8 @@ describe("微信桥媒体闭环", () => {
     onCdn(fixture, encryptEcb(PNG_BYTES));
     await bindActive(fixture);
     await fixture.bridge.pollOnce(UID);
+    // 纯图片消息进聚合窗口（2026-10-17 多图识别）：手动放行窗口到期
+    await fixture.fireAggregate();
 
     // CDN 请求 URL：encrypt_query_param 经 encodeURIComponent
     const cdnCall = fixture.iLink.calls.find((c) => c.url.startsWith("https://novac2c"))!;
@@ -348,6 +371,8 @@ describe("微信桥媒体闭环", () => {
     onCdn(fixture, encryptEcb(Buffer.from("# 标题\n正文内容", "utf8")));
     await bindActive(fixture);
     await fixture.bridge.pollOnce(UID);
+    // 纯文件消息同样进聚合窗口：手动放行
+    await fixture.fireAggregate();
 
     const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
     expect(userMessage.content[0]!.type === "text" && userMessage.content[0]!.text.includes("〔系统上下文〕")).toBe(true);
@@ -462,6 +487,8 @@ describe("微信桥媒体闭环", () => {
     onCdn(fixture, encryptEcb(PNG_BYTES));
     await bindActive(fixture);
     await fixture.bridge.pollOnce(UID);
+    // 纯图片进聚合窗口：放行后 flush → 回合内多模态拦截 → push 指引（不进轮询退避）
+    await fixture.fireAggregate();
 
     expect(fixture.mock.requests.length).toBe(0);
     expect(sentTexts(fixture).at(-1)).toContain("不支持看图");
@@ -480,5 +507,78 @@ describe("微信桥媒体闭环", () => {
     const bind = fixture.db.prepare("SELECT last_context_token, last_msg_ts FROM wechat_binds WHERE uid = ?").get(UID) as unknown as { last_context_token: string; last_msg_ts: number };
     expect(bind.last_context_token).toBe("ctx-43");
     expect(bind.last_msg_ts).toBe(NOW());
+  });
+
+  it("AC6 聚合窗口：连发两张纯图（同批两条消息）→ 窗口到期合并为单回合（单条 user/message 携两图、单次回复、挂最后一条 token）", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "两张都看到了。" }]);
+    onSendOk(fixture);
+    // 两条独立图片消息（iLink 一图一消息）：不同 CDN 密文给不同图，避免内容寻址去重掩盖张数
+    fixture.iLink.on((url) => url.endsWith("/c2c/download?encrypted_query_param=a"), () => ({ __bytes: encryptEcb(PNG_BYTES) }));
+    fixture.iLink.on((url) => url.endsWith("/c2c/download?encrypted_query_param=b"), () => ({ __bytes: encryptEcb(JPEG_BYTES) }));
+    onUpdates(fixture, [imageMsg(44, "a", KEY.toString("hex")), imageMsg(45, "b", KEY.toString("hex"))]);
+    await bindActive(fixture);
+    await fixture.bridge.pollOnce(UID);
+
+    // 窗口内：零 LLM 请求（攒批中，不逐张开回合）
+    expect(fixture.mock.requests.length).toBe(0);
+    await fixture.fireAggregate();
+
+    // 单回合：一次 LLM 请求，user 消息带两图（回填后 wire 形态）
+    expect(fixture.mock.requests.length).toBe(1);
+    const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
+    const images = userMessage.content.filter((b) => b.type === "image");
+    expect(images).toHaveLength(2);
+    expect(images.map((b) => (b as { mediaType: string }).mediaType).sort()).toEqual(["image/jpeg", "image/png"]);
+
+    // 会话日志单条 user/message（两张图在一条事件里）
+    const rows = fixture.db.prepare("SELECT event_json FROM conversation_events WHERE cid = ? AND type = 'user/message'").all(WECHAT_FEED_CID(UID)) as unknown as { event_json: string }[];
+    expect(rows).toHaveLength(1);
+    const imageBlocks = (JSON.parse(rows[0]!.event_json) as { message: { content: Array<Record<string, unknown>> } }).message.content.filter((b) => b["type"] === "image");
+    expect(imageBlocks).toHaveLength(2);
+    // 引用形态落库（2026-10-17 媒体膨胀治理）：有 blobRef 无 data
+    for (const block of imageBlocks) {
+      expect(typeof block["blobRef"]).toBe("string");
+      expect(block["data"]).toBeUndefined();
+    }
+
+    // 单次回复，挂最后一条消息的 context_token
+    expect(sentTexts(fixture).at(-1)).toBe("两张都看到了。");
+    const reply = fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!;
+    expect(JSON.parse(reply.init?.body ?? "{}").msg).toMatchObject({ context_token: "ctx-45" });
+  });
+
+  it("AC6b 聚合窗口：图后补文本 → 文本触发立即合并同回合（不等窗口）", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "图文一起收到。" }]);
+    onSendOk(fixture);
+    onUpdates(fixture, [imageMsg(46, "c", KEY.toString("hex")), { message_id: 47, from_user_id: "wxuser-1", message_type: 1, item_list: [{ type: 1, text_item: { text: "这图什么意思" } }], context_token: "ctx-47" }]);
+    fixture.iLink.on((url) => url.endsWith("/c2c/download?encrypted_query_param=c"), () => ({ __bytes: encryptEcb(PNG_BYTES) }));
+    await bindActive(fixture);
+    await fixture.bridge.pollOnce(UID);
+
+    // 文本消息到达即触发：pollOnce 返回时回合已跑完（未 fireAggregate）
+    expect(fixture.mock.requests.length).toBe(1);
+    const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
+    expect(userMessage.content.some((b) => b.type === "text" && b.text === "这图什么意思")).toBe(true);
+    expect(userMessage.content.some((b) => b.type === "image")).toBe(true);
+    expect(sentTexts(fixture).at(-1)).toBe("图文一起收到。");
+    const reply = fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!;
+    expect(JSON.parse(reply.init?.body ?? "{}").msg).toMatchObject({ context_token: "ctx-47" });
+  });
+
+  it("AC6c 聚合上限：攒满 9 项即发（不等窗口到期；评审 m6 补测）", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "收到九连发。" }]);
+    onSendOk(fixture);
+    fixture.iLink.on((url) => url.endsWith("/c2c/download?encrypted_query_param=cap"), () => ({ __bytes: encryptEcb(PNG_BYTES) }));
+    onUpdates(fixture, Array.from({ length: 9 }, (_, i) => imageMsg(50 + i, "cap", KEY.toString("hex"))));
+    await bindActive(fixture);
+    await fixture.bridge.pollOnce(UID);
+
+    // 未放行窗口（fireAggregate 未调）：上限即发路径在 pollOnce 内完成——单回合单请求九图
+    expect(fixture.mock.requests.length).toBe(1);
+    const userMessage = fixture.mock.requests[0]!.messages.filter((m) => m.role === "user").at(-1)!;
+    expect(userMessage.content.filter((b) => b.type === "image")).toHaveLength(9);
+    expect(sentTexts(fixture).at(-1)).toBe("收到九连发。");
+    const reply = fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!;
+    expect(JSON.parse(reply.init?.body ?? "{}").msg).toMatchObject({ context_token: "ctx-58" });
   });
 });
