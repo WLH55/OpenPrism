@@ -347,6 +347,46 @@ describe("HTTP API", () => {
     })).status).toBe(200);
   });
 
+  it("计划执行内容（2026-10-17）：POST 落库 → /api/today HTTP 面带全文与标记；PUT 三态（设置/保持/清除）；两侧 8000 字上限 400；null 不落字面量", async () => {
+    const post = async (body: Record<string, unknown>) =>
+      (await (await fetch(`${baseUrl}/api/plans`, { ...json(body), headers: { "Content-Type": "application/json", cookie } })).json()) as { planId: string };
+    const todayPlans = async () =>
+      ((await (await fetch(`${baseUrl}/api/today?tz=480`, { headers: { cookie } })).json()) as { plans: { planId: string; hasDetails?: boolean; details?: string }[] }).plans;
+
+    // POST 带 details：HTTP 面今天视图带全文（评审 M1：includePlanDetails 唯一放行通道）
+    const details = "高位下拉 4×8–12（90秒）\n要点：肩胛先下沉再拉";
+    const { planId } = await post({ title: "周一拉日", scope: "week", timesPerPeriod: 1, details });
+    let plans = await todayPlans();
+    expect(plans.find((p) => p.planId === planId)!.hasDetails).toBe(true);
+    expect(plans.find((p) => p.planId === planId)!.details).toBe(details);
+
+    // PUT 不传 details = 保持；传新值 = 替换；传空白串 = 清除
+    await fetch(`${baseUrl}/api/plans/${planId}`, { ...json({ title: "只改标题" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } });
+    plans = await todayPlans();
+    expect(plans.find((p) => p.planId === planId)!.details).toBe(details);
+    await fetch(`${baseUrl}/api/plans/${planId}`, { ...json({ details: "新内容：深蹲 5×5" }), method: "PUT", headers: { "Content-Type": "application/json", cookie } });
+    plans = await todayPlans();
+    expect(plans.find((p) => p.planId === planId)!.details).toBe("新内容：深蹲 5×5");
+    await fetch(`${baseUrl}/api/plans/${planId}`, { ...json({ details: "  " }), method: "PUT", headers: { "Content-Type": "application/json", cookie } });
+    plans = await todayPlans();
+    expect(plans.find((p) => p.planId === planId)!.details).toBeUndefined();
+    expect(plans.find((p) => p.planId === planId)!.hasDetails).toBeUndefined();
+
+    // 超限 400（POST 与 PUT 同限）；null 视为未提供不落 "null" 字面量（评审 m1）
+    expect((await fetch(`${baseUrl}/api/plans`, {
+      ...json({ title: "超限", scope: "day", details: "长".repeat(8001) }),
+      headers: { "Content-Type": "application/json", cookie },
+    })).status).toBe(400);
+    expect((await fetch(`${baseUrl}/api/plans/${planId}`, {
+      ...json({ details: "长".repeat(8001) }),
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+    })).status).toBe(400);
+    const { planId: nullPlan } = await post({ title: "null 详情", scope: "day", details: null });
+    plans = await todayPlans();
+    expect(plans.find((p) => p.planId === nullPlan)!.hasDetails).toBeUndefined();
+  });
+
   it("PUT /api/plans/:planId（2026-09-29）：改标题/due 生效、planId 不变、旧记录 void；未知 404、非法 scope 400", async () => {
     const uid = users.get("lathan")!.uid;
     const ledger = await ledgers.get(uid)!;

@@ -53,6 +53,11 @@ export interface TodayPlanView {
    * day=今日打卡次数；week/month/year=本期不同本地日数；done=进度 ≥ 配额（跨期自动清零重开） */
   timesPerPeriod?: number;
   periodCount?: number;
+  /** 有执行内容（2026-10-17 计划执行内容存储与AI读取）：标记位——全文不进模型面摘要（防膨胀），
+   * AI 经 query_ledger what=plan&planId 单查；HTTP 侧（todayView includePlanDetails）额外带 details 全文供前端展开 */
+  hasDetails?: boolean;
+  /** 执行内容全文（仅 HTTP 面 includePlanDetails=true 时出现；模型面 query_ledger what=today 永不带） */
+  details?: string;
 }
 
 export type PlanState = "overdue" | "dueToday" | "doing" | "todo" | "upcoming" | "done";
@@ -159,7 +164,7 @@ export function planScopeCoversToday(plan: PlanRecord, now: number, tzOffsetMinu
   }
 }
 
-export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes = 0): TodayView {
+export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes = 0, options?: { includePlanDetails?: boolean }): TodayView {
   const active = records.filter((r) => r.kind !== "void") as Array<FlowRecord | PlanRecord | CheckinRecord>;
   const voidedSeqs = new Set(
     records.filter((r): r is Extract<LedgerRecord, { kind: "void" }> => r.kind === "void").map((r) => r.targetSeq),
@@ -250,6 +255,11 @@ export function todayView(records: LedgerRecord[], now: number, tzOffsetMinutes 
         seq: plan.seq,
         ...(state === "done" ? { doneAt: lastDone } : {}),
         doneToday: doneTodayFlag,
+        ...(plan.details !== undefined
+          ? options?.includePlanDetails === true
+            ? { hasDetails: true, details: plan.details } // HTTP 面：前端展开直接用，不用再拉
+            : { hasDetails: true } // 模型面：只标记，全文走 query_ledger what=plan 单查
+          : {}),
       };
     })
     // 已完成存档的 30 天窗口（评审 2026-09-29：载荷/模型上下文无界增长）——「已完成」视图本就按 30 天过滤，
@@ -313,6 +323,8 @@ export interface TopItem {
   due?: string;
   /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
   progress?: string;
+  /** 有执行内容（2026-10-17 计划执行内容存储与AI读取）：AI 见标记后 what=plan 单查全文 */
+  hasDetails?: boolean;
 }
 
 /** 今日必做 Top3（确定性，0 模型）：逾期 > 今日截止 > 覆盖今天的未完成 */
@@ -332,6 +344,7 @@ export function top3(records: LedgerRecord[], now: number, tzOffsetMinutes: numb
     title: plan.title,
     planId: plan.planId,
     ...(plan.due !== undefined ? { due: plan.due } : {}),
+    ...(plan.details !== undefined ? { hasDetails: true } : {}),
   });
 
   const overdue: TopItem[] = [];

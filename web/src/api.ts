@@ -60,6 +60,9 @@ export interface TodayPlanView {
   /** 习惯计划（2026-09-30）：配额与当前周期进度，成对出现——day=今日打卡次数；week/month/year=本期不同本地日数 */
   timesPerPeriod?: number;
   periodCount?: number;
+  /** 执行内容（2026-10-17 计划执行内容存储与AI读取）：有标记可展开；HTTP 面带全文，AI 面只标记 */
+  hasDetails?: boolean;
+  details?: string;
 }
 
 export interface TodayFlowView {
@@ -89,6 +92,8 @@ export interface TopItemLoose {
   due?: string;
   /** 习惯计划当前周期进度（如 "2/3"；2026-09-30 习惯化） */
   progress?: string;
+  /** 有执行内容（2026-10-17 计划执行内容存储与AI读取）：AI 见标记单查全文 */
+  hasDetails?: boolean;
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
@@ -239,8 +244,9 @@ export const api = {
     }),
 
   // ── 计划（2026-09-30 目标层级下线）：UI 建计划入口随 Plans 页移除，创建走对话（agent 工具，同一账本） ──
-  /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定 */
-  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number }) =>
+  /** UI 修订计划（2026-09-29）：与 update_plan 工具同源（mergePlanUpdate）——追加新版本+void 旧记录，planId 稳定。
+   *  details（2026-10-17 执行内容）：不传=保持、空白串=清除、非空=设置 */
+  updatePlan: (planId: string, patch: { title?: string; scope?: string; due?: string; ndays?: number; details?: string }) =>
     request<{ ok: boolean; planId: string; title: string }>(`/api/plans/${encodeURIComponent(planId)}`, {
       method: "PUT",
       body: JSON.stringify(patch),

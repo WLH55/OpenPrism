@@ -39,6 +39,9 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   const [editing, setEditing] = useState(false);
   const [titleDraft, setTitleDraft] = useState(plan.title);
   const [dueDraft, setDueDraft] = useState(plan.due ?? "");
+  // 执行内容（2026-10-17）：编辑稿 + 展开态；保存时没动就不传（三态：不传=保持，空串=清除，非空=设置）
+  const [detailsDraft, setDetailsDraft] = useState(plan.details ?? "");
+  const [showDetails, setShowDetails] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
   const [backfillDate, setBackfillDate] = useState("");
   const [busy, setBusy] = useState(false);
@@ -88,7 +91,12 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
     setBusy(true);
     try {
       // due 只对 deadline 型生效（周期/习惯计划没有截止日概念，mergePlanUpdate 本就不收）——非 deadline 不带该键
-      await api.updatePlan(plan.planId, { title: titleDraft.trim(), ...(plan.scope === "deadline" && dueDraft !== "" ? { due: dueDraft } : {}) });
+      const detailsChanged = detailsDraft.trim() !== (plan.details ?? "");
+      await api.updatePlan(plan.planId, {
+        title: titleDraft.trim(),
+        ...(plan.scope === "deadline" && dueDraft !== "" ? { due: dueDraft } : {}),
+        ...(detailsChanged ? { details: detailsDraft.trim() } : {}),
+      });
       setEditing(false);
     } catch (e) {
       window.alert(String((e as Error).message));
@@ -118,24 +126,36 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
   const field = "min-w-0 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-accent";
   if (editing) {
     return (
-      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-surface px-4 py-3">
-        <input className={`${field} flex-1`} value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)} placeholder="标题" />
-        {plan.scope === "deadline" && (
-          <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="修改截止日" aria-label="截止日" />
-        )}
-        <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
-          保存
-        </button>
-        <button
-          className="text-xs text-ink3 transition hover:text-ink"
-          onClick={() => {
-            setEditing(false);
-            setTitleDraft(plan.title);
-            setDueDraft(plan.due ?? "");
-          }}
-        >
-          取消
-        </button>
+      <div className="rounded-xl border border-line bg-surface px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <input className={`${field} min-w-40 flex-1`} value={titleDraft} onChange={(e) => setTitleDraft(e.target.value)} placeholder="标题" />
+          {plan.scope === "deadline" && (
+            <input className={field} type="date" value={dueDraft} onChange={(e) => setDueDraft(e.target.value)} title="修改截止日" aria-label="截止日" />
+          )}
+          <button className="rounded bg-accent2 px-3 py-1.5 text-xs font-semibold text-white transition hover:opacity-90 disabled:opacity-50" disabled={busy} onClick={() => void save()}>
+            保存
+          </button>
+          <button
+            className="text-xs text-ink3 transition hover:text-ink"
+            onClick={() => {
+              setEditing(false);
+              setTitleDraft(plan.title);
+              setDueDraft(plan.due ?? "");
+              setDetailsDraft(plan.details ?? "");
+            }}
+          >
+            取消
+          </button>
+        </div>
+        <textarea
+          className={`${field} mt-2 w-full resize-y text-[13px] leading-relaxed`}
+          rows={5}
+          maxLength={8000}
+          value={detailsDraft}
+          onChange={(e) => setDetailsDraft(e.target.value)}
+          placeholder="执行内容（可选，≤8000 字）：组数×次数 / 动作要点 / 步骤——AI 会按它指导执行。清空保存 = 删除"
+          aria-label="执行内容"
+        />
       </div>
     );
   }
@@ -154,6 +174,7 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
     );
   }
   return (
+    <>
     <div
       className={`flex w-full items-center gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-left transition ${
         undoable || !done ? "cursor-pointer hover:bg-surface2/60" : "opacity-90"
@@ -219,11 +240,25 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
           补卡
         </button>
       )}
+      {plan.hasDetails && (
+        <button
+          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] transition hover:bg-accent/10 ${showDetails ? "text-accent" : "text-ink3 hover:text-accent"}`}
+          title="展开执行内容（组数×次数 / 要点）"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowDetails((v) => !v);
+          }}
+        >
+          {showDetails ? "收起" : "详情"}
+        </button>
+      )}
       <button
         className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink3 transition hover:bg-surface2 hover:text-ink"
-        title="编辑标题/截止日（planId 不变，历史打卡保留）"
+        title="编辑标题/截止日/执行内容（planId 不变，历史打卡保留）"
         onClick={(e) => {
           e.stopPropagation();
+          // 进编辑态时重置草稿（评审 m8）：AI 可能在对话侧改过 details——挂载时的一次性 useState 快照会拿旧值静默覆盖
+          setDetailsDraft(plan.details ?? "");
           setEditing(true);
         }}
       >
@@ -242,6 +277,12 @@ function PlanRow({ plan, viewDate, onChanged }: { plan: TodayPlanView; viewDate:
         </button>
       )}
     </div>
+    {showDetails && plan.details !== undefined && (
+      <div className="whitespace-pre-wrap rounded-xl border border-line bg-surface2/40 px-4 py-3 text-[13px] leading-relaxed text-ink2">
+        {plan.details}
+      </div>
+    )}
+    </>
   );
 }
 
