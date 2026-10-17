@@ -40,6 +40,9 @@ export interface PlanRecord extends LedgerEventBase {
   ndays?: number; // scope=ndays 必填
   timesPerPeriod?: number; // ≥1；day=每日打卡次数，week/month/year=每期不同本地日数
   goalId?: string;
+  /** 执行内容（2026-10-17 计划执行内容存储与AI读取）：自由文本（组数×次数/步骤/要点，≤8000 字）。
+   * 修订=追加新版本行，details 随快照走；AI 经 query_ledger what=plan 单查全文，列表只带 hasDetails 标记 */
+  details?: string;
 }
 
 /** 打卡：认证"计划做了没"（引用 planId，不与流水混同） */
@@ -111,7 +114,7 @@ export function insertLedgerRecord(db: DatabaseSync, uid: string, record: Ledger
       break;
     case "plan":
       db.prepare(
-        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, plan_id, title, scope, due, ndays, times_per_period, plan_goal_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ledger_entries (uid, seq, kind, ts, source, actor_conv, actor_agent, plan_id, title, scope, due, ndays, times_per_period, plan_goal_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).run(
         uid,
         record.seq,
@@ -127,6 +130,7 @@ export function insertLedgerRecord(db: DatabaseSync, uid: string, record: Ledger
         record.ndays ?? null,
         record.timesPerPeriod ?? null,
         record.goalId ?? null,
+        record.details ?? null,
       );
       break;
     case "checkin":
@@ -195,6 +199,7 @@ type LedgerRow = {
   due: string | null;
   ndays: number | null;
   times_per_period: number | null;
+  details: string | null;
   checkin_plan_id: string | null;
   at: number | null;
   done: number | null;
@@ -249,6 +254,7 @@ function rowToRecord(row: LedgerRow): LedgerRecord | null {
         ...(row.ndays !== null ? { ndays: row.ndays } : {}),
         ...(row.times_per_period !== null ? { timesPerPeriod: row.times_per_period } : {}),
         ...(row.plan_goal_id !== null ? { goalId: row.plan_goal_id } : {}),
+        ...(row.details !== null ? { details: row.details } : {}),
       };
     case "goal":
       return {

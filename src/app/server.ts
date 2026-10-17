@@ -26,7 +26,7 @@ import {
 } from "./secretbox";
 import type { Ledger } from "./ledger";
 import { categoryView, listCategories, progressView, todayView } from "./fold";
-import { mergePlanUpdate, parseAt } from "./plans";
+import { mergePlanUpdate, parseAt, PLAN_DETAILS_MAX_CHARS } from "./plans";
 import type { PlanRecord } from "./ledger";
 import { buildExportJson, buildExportMarkdown, type ExportConversation } from "./export";
 import { ModelNotConfiguredError, ModelNotMultimodalError, type ConversationStore } from "./conversations";
@@ -1092,7 +1092,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (method === "GET" && path === "/api/today") {
     const tz = Number(url.searchParams.get("tz") ?? "0") || 0;
     const ledger = await deps.ledgerFor(uid);
-    return sendJson(res, 200, todayView(ledger.readAll(), deps.env.now(), tz));
+    // includePlanDetails（2026-10-17）：HTTP 面带执行内容全文供前端展开；模型面（query_ledger what=today）只带 hasDetails 标记
+    return sendJson(res, 200, todayView(ledger.readAll(), deps.env.now(), tz, { includePlanDetails: true }));
   }
 
   if (method === "POST" && path === "/api/flows") {
@@ -1154,7 +1155,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   if (method === "POST" && path === "/api/plans") {
-    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string; details?: string };
     if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const title = String(body.title ?? "").trim();
     if (title === "") return sendError(res, 400, "title 必填");
@@ -1176,6 +1177,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (body.timesPerPeriod !== undefined && !(scope === "day" || scope === "week" || scope === "month" || scope === "year")) {
       return sendError(res, 400, "timesPerPeriod 只支持 day | week | month | year（deadline/ndays 是一次性计划）");
     }
+    // 执行内容（2026-10-17 计划执行内容存储与AI读取）：与工具侧同限；非 string（含 null）视为未提供（PUT 同口径）
+    const details = typeof body.details === "string" ? body.details.trim() : undefined;
+    if (details !== undefined && details.length > PLAN_DETAILS_MAX_CHARS) {
+      return sendError(res, 400, `details 过长（≤${PLAN_DETAILS_MAX_CHARS} 字）`);
+    }
     const ledger = await deps.ledgerFor(uid);
     const record = await ledger.append({
       kind: "plan",
@@ -1186,6 +1192,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       ...(body.due !== undefined && body.due !== "" ? { due: body.due } : {}),
       ...(body.ndays !== undefined ? { ndays: body.ndays } : {}),
       ...(body.timesPerPeriod !== undefined ? { timesPerPeriod: body.timesPerPeriod } : {}),
+      ...(details !== undefined && details !== "" ? { details } : {}),
     });
     return sendJson(res, 200, { planId: (record as { planId: string }).planId, ts: record.ts });
   }
@@ -1195,12 +1202,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   const planMatch = /^\/api\/plans\/([^/]+)$/.exec(path);
   if (planMatch && method === "PUT") {
     const planId = decodeURIComponent(planMatch[1]!);
-    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+    const body = (await readBody(req)) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string; details?: string };
     if (body.goalId !== undefined) return sendError(res, 400, "目标层级（方向/阶段/项目）已下线，计划都是独立待办，不收 goalId");
     const ledger = await deps.ledgerFor(uid);
     const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as { planId: string }).planId === planId);
     if (!hit) return sendError(res, 404, `planId "${planId}" 不存在`);
     try {
+      // details 三态（2026-10-17）：不传=保持、空白串=清除、非空=设置——mergePlanUpdate 内同源校验（含 8000 字上限）
       const merged = mergePlanUpdate(hit as PlanRecord, body);
       await ledger.append({ ...merged, kind: "plan", source: "ui" });
       await ledger.append({ kind: "void", source: "ui", targetSeq: hit.seq, reason: "更新计划" });

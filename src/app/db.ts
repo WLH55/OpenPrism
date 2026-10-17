@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   due         TEXT,
   ndays       INTEGER,
   times_per_period INTEGER, -- 习惯计划：每周期目标数（day=每日次数；week/month/year=每期不同日数）。NULL=一次性本周期计划（2026-09-30 习惯化）
+  details           TEXT,   -- 计划执行内容（2026-10-17 计划执行内容存储与AI读取）：组数×次数/步骤/要点的自由文本，AI 单查全文指导执行
   checkin_plan_id TEXT,
   at          INTEGER,
   done        INTEGER,
@@ -484,6 +485,7 @@ export function openDb(dbPath: string): DatabaseSync {
   // 习惯化 + 任务编辑新列（2026-09-30）：必须在 ensureGoalKind 之后——重建会 DROP 原表，先加的列会被带走
   ensureColumn(db, "ledger_entries", "times_per_period", "INTEGER");
   ensureColumn(db, "tasks", "customized", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "ledger_entries", "details", "TEXT"); // 计划执行内容（2026-10-17 计划执行内容存储与AI读取）
   // 任务微信推送上下文锚（2026-09-30）：空 contextToken 凭空推送 iLink 可拒（ret=-2 prepare failed 实锤），
   // 存最近入站消息的 token 供主动推送复用
   ensureColumn(db, "wechat_binds", "last_context_token", "TEXT");

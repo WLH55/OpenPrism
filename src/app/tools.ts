@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import type { ContentBlock, ToolDefinition } from "../harness/index";
 import { todayView } from "./fold";
-import { mergePlanUpdate, parseAt } from "./plans";
+import { mergePlanUpdate, parseAt, PLAN_DETAILS_MAX_CHARS } from "./plans";
 import type { Ledger, LedgerActor, PlanRecord } from "./ledger";
 
 export interface LedgerToolsDeps {
@@ -97,6 +97,11 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
           description:
             "每周期目标数（≥1 整数，仅 day/week/month/year）：周期习惯必带。day=每天打卡几次（\"每天喝8杯水\"=8）；week/month/year=每期要覆盖几个不同日子（\"每周运动三天\"=3，同一天打两卡只算 1 天）。",
         },
+        details: {
+          type: "string",
+          description:
+            "执行内容（可选，≤8000 字自由文本）：具体步骤/组数×次数/发力要点/配方/流程等。用户给了具体做法就存进来——之后问\"这个怎么做/今天练什么\"会按它指导执行。改用 update_plan。",
+        },
       },
     },
     output: {
@@ -106,16 +111,18 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         properties: { planId: { type: "string" }, title: { type: "string" }, scope: { type: "string" }, timesPerPeriod: { type: "integer" } },
       },
       render: (_args, value) => {
-        const v = value as { title: string; scope?: string; timesPerPeriod?: number };
+        const v = value as { title: string; scope?: string; timesPerPeriod?: number; hasDetails?: boolean };
         const quota = v.timesPerPeriod !== undefined ? `（习惯：${{ day: "每天", week: "每周", month: "每月", year: "每年" }[v.scope ?? "day"] ?? "每期"} ${v.timesPerPeriod}${v.scope === "day" ? " 次" : " 天"}）` : "";
-        return [{ type: "text", text: `已建计划「${v.title}」${quota}` }];
+        return [{ type: "text", text: `已建计划「${v.title}」${quota}${v.hasDetails === true ? "（已存执行内容）" : ""}` }];
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+      const input = (args ?? {}) as { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; details?: string; goalId?: string };
       if (input.goalId !== undefined) throw new Error("目标层级（方向/阶段/项目）已下线，计划都是独立待办，不要传 goalId");
       if (typeof input.title !== "string" || input.title.trim() === "") throw new Error("title 必填");
       if (input.title.trim().length > 200) throw new Error("title 过长（≤200 字）");
+      const details = typeof input.details === "string" ? input.details.trim() : undefined; // 非 string（null/number）视为未提供，与 mergePlanUpdate/HTTP 同口径
+      if (details !== undefined && details.length > PLAN_DETAILS_MAX_CHARS) throw new Error(`details 过长（≤${PLAN_DETAILS_MAX_CHARS} 字），精简或分条存放`);
       const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
       const scope = scopes.find((s) => s === input.scope);
       if (!scope) throw new Error(`scope 必须是 ${scopes.join(" | ")}`);
@@ -138,15 +145,16 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         ...(input.due !== undefined ? { due: input.due } : {}),
         ...(input.ndays !== undefined ? { ndays: input.ndays } : {}),
         ...(input.timesPerPeriod !== undefined ? { timesPerPeriod: input.timesPerPeriod } : {}),
+        ...(details !== undefined && details !== "" ? { details } : {}),
       });
-      return { planId, title: input.title.trim(), scope, ...(input.timesPerPeriod !== undefined ? { timesPerPeriod: input.timesPerPeriod } : {}) };
+      return { planId, title: input.title.trim(), scope, ...(input.timesPerPeriod !== undefined ? { timesPerPeriod: input.timesPerPeriod } : {}), ...(details !== undefined && details !== "" ? { hasDetails: true } : {}) };
     },
     isConcurrencySafe: () => false,
   };
 
   const updatePlan: ToolDefinition = {
     name: "update_plan",
-    description: "修改计划：标题/截止日/周期/每期配额，只传要改的字段，未提供的保持原值。比取消重建好——planId 不变，已打的卡都还在。",
+    description: "修改计划：标题/截止日/周期/每期配额/执行内容，只传要改的字段，未提供的保持原值。比取消重建好——planId 不变，已打的卡都还在。",
     parameters: {
       type: "object",
       required: ["planId"],
@@ -160,21 +168,26 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
           type: "integer",
           description: "改每周期目标数（≥1 整数，仅 day/week/month/year）：把普通计划升级成习惯（带上即跨周期续期），或改习惯配额（\"每周改成 4 天\"）。scope 换到 deadline/ndays 时不可带。",
         },
+        details: {
+          type: "string",
+          description: "执行内容（≤8000 字自由文本）：组数×次数/步骤/要点。传了就整体替换；传空串 = 清除；不传 = 保持。",
+        },
       },
     },
     output: {
       schema: {
         type: "object",
         required: ["planId", "title"],
-        properties: { planId: { type: "string" }, title: { type: "string" } },
+        properties: { planId: { type: "string" }, title: { type: "string" }, hasDetails: { type: "boolean" }, detailsCleared: { type: "boolean" } },
       },
       render: (_args, value) => {
-        const v = value as { title: string };
-        return [{ type: "text", text: `已更新计划「${v.title}」` }];
+        const v = value as { title: string; hasDetails?: boolean; detailsCleared?: boolean };
+        const note = v.detailsCleared === true ? "（已清除执行内容）" : v.hasDetails === true ? "（已存执行内容）" : "";
+        return [{ type: "text", text: `已更新计划「${v.title}」${note}` }];
       },
     },
     async execute(args) {
-      const input = (args ?? {}) as { planId?: string; title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; goalId?: string };
+      const input = (args ?? {}) as { planId?: string; title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; details?: string; goalId?: string };
       if (input.goalId !== undefined) throw new Error("目标层级（方向/阶段/项目）已下线，计划都是独立待办，不要传 goalId");
       if (typeof input.planId !== "string" || input.planId === "") throw new Error("planId 必填（query_ledger 的 plans 里有）");
       const hit = ledger.activeRecords().find((r) => r.kind === "plan" && (r as PlanRecord).planId === input.planId);
@@ -186,7 +199,14 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       // 追加新版本 + void 旧记录（与「逾期跳过」同构）：planId 稳定 → 历史打卡引用不断，折叠层零感知
       await append({ ...merged, kind: "plan", source: "agent", actor: actor() });
       await append({ kind: "void", source: "agent", actor: actor(), targetSeq: cur.seq, reason: "更新计划" });
-      return { planId: merged.planId, title: merged.title };
+      // 回执确认执行内容终态（评审 m3）：模型看不到原始载荷，回执不渲染就等于不存在
+      const clearedIntent = typeof input.details === "string" && input.details.trim() === ""; // 传空白串 = 清除意图
+      return {
+        planId: merged.planId,
+        title: merged.title,
+        ...(merged.details !== undefined ? { hasDetails: true } : {}),
+        ...(clearedIntent ? { detailsCleared: true } : {}),
+      };
     },
     isConcurrencySafe: () => false,
   };
@@ -246,11 +266,18 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       date?: string;
       streakDays?: number;
       flows?: { category: string }[];
-      plans?: { planId?: string; title: string; state?: string; due?: string; doneToday?: boolean; doneAt?: number; checkins?: { seq: number }[]; scope?: string; timesPerPeriod?: number; periodCount?: number }[];
-      top3?: { kind: string; title: string; planId?: string; due?: string; progress?: string }[];
+      plans?: { planId?: string; title: string; state?: string; due?: string; doneToday?: boolean; doneAt?: number; checkins?: { seq: number }[]; scope?: string; timesPerPeriod?: number; periodCount?: number; hasDetails?: boolean }[];
+      top3?: { kind: string; title: string; planId?: string; due?: string; progress?: string; hasDetails?: boolean }[];
+      plan?: { planId: string; title: string; scope: string; details?: string; due?: string; ndays?: number; timesPerPeriod?: number };
       total?: number;
       truncated?: boolean;
     };
+    if (v.plan !== undefined) {
+      // 单查（2026-10-17）：details 全文原样输出——模型照此指导用户执行
+      const p = v.plan;
+      const head = `计划「${p.title}」(${p.planId}, ${p.scope}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${p.ndays !== undefined ? `, ${p.ndays} 天窗口` : ""}${p.timesPerPeriod !== undefined ? `, 每期 ${p.timesPerPeriod}` : ""})`;
+      return [{ type: "text", text: p.details !== undefined ? `${head} 执行内容：\n${p.details}` : `${head}\n（未存执行内容）` }];
+    }
     if (v.date !== undefined) {
       const undone = (v.plans ?? []).filter((p) => p.state !== "done");
       const scopeWord: Record<string, string> = { day: "今天", week: "本周", month: "本月", year: "今年" };
@@ -258,7 +285,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
         `${v.date}：${(v.flows ?? []).length} 笔流水、${(v.plans ?? []).length} 个计划（${undone.length} 个未完成）、连续记录 ${v.streakDays} 天`,
       ];
       if ((v.top3 ?? []).length > 0) {
-        lines.push(`今日必做：${v.top3!.map((t) => `${t.title}${t.progress !== undefined ? ` ${t.progress}` : ""}${t.planId !== undefined ? `(${t.planId})` : ""}`).join("；")}`);
+        lines.push(`今日必做：${v.top3!.map((t) => `${t.title}${t.progress !== undefined ? ` ${t.progress}` : ""}${t.hasDetails ? " 有详情" : ""}${t.planId !== undefined ? `(${t.planId})` : ""}`).join("；")}`);
       }
       if (undone.length > 0) {
         lines.push(
@@ -271,7 +298,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
                 p.timesPerPeriod !== undefined
                   ? `${scopeWord[p.scope ?? "day"] ?? "本期"} ${p.periodCount ?? 0}/${p.timesPerPeriod}`
                   : `${p.state ?? "?"}`;
-              return `${p.title}(${p.planId ?? "?"}, ${stateText}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${seqs !== "" ? `, 打卡${seqs}` : ""})`;
+              return `${p.title}(${p.planId ?? "?"}, ${stateText}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${p.hasDetails ? ", 有详情可查" : ""}${seqs !== "" ? `, 打卡${seqs}` : ""})`;
             })
             .join("、")}${undone.length > 10 ? ` 等 ${undone.length} 个` : ""}`,
         );
@@ -293,7 +320,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     if (v.plans !== undefined) {
       const names = v.plans
         .slice(0, 10)
-        .map((p) => `${p.title}(${p.planId ?? "?"}${p.timesPerPeriod !== undefined ? `, 习惯${p.timesPerPeriod}` : ""}${p.due !== undefined ? `, 截止 ${p.due}` : ""})`)
+        .map((p) => `${p.title}(${p.planId ?? "?"}${p.timesPerPeriod !== undefined ? `, 习惯${p.timesPerPeriod}` : ""}${p.due !== undefined ? `, 截止 ${p.due}` : ""}${p.hasDetails ? ", 有详情可查(what=plan)" : ""})`)
         .join("；");
       const more = (v.total ?? v.plans.length) - Math.min(10, v.plans.length);
       return [{ type: "text", text: `共 ${v.total} 个计划${v.truncated ? `（列表截断为前 ${v.plans.length} 个）` : ""}：${names}${more > 0 ? ` 等 ${more} 个未列出` : ""}` }];
@@ -309,12 +336,14 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
 
   const queryLedger: ToolDefinition = {
     name: "query_ledger",
-    description: "查用户的账本：今天视图（流水+计划+打卡态+Top3）、活跃计划列表、按分类/日期过滤流水。只读。",
+    description:
+      "查用户的账本：今天视图（流水+计划+打卡态+Top3）、活跃计划列表、单个计划全文（执行内容 details）、按分类/日期过滤流水。只读。计划带「有详情」标记时，用户问怎么执行/要具体步骤就用 what=plan 查全文。",
     parameters: {
       type: "object",
       required: ["what"],
       properties: {
-        what: { type: "string", description: "today | plans | flows" },
+        what: { type: "string", description: "today | plans | plan | flows" },
+        planId: { type: "string", description: "what=plan 必填：单个计划的 planId" },
         category: { type: "string" },
         from: { type: "string", description: "YYYY-MM-DD" },
         to: { type: "string", description: "YYYY-MM-DD" },
@@ -323,7 +352,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     },
     output: { schema: { type: "object" }, render: renderQuery },
     async execute(args) {
-      const input = (args ?? {}) as { what?: string; category?: string; from?: string; to?: string; limit?: number };
+      const input = (args ?? {}) as { what?: string; planId?: string; category?: string; from?: string; to?: string; limit?: number };
       const limit = input.limit ?? 200;
       if (!Number.isInteger(limit) || limit < 1) throw new Error("limit 需为 ≥1 的整数");
       const active = ledger.activeRecords();
@@ -334,12 +363,30 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
       if (input.what === "plans") {
         const all = active
           .filter((r): r is PlanRecord => r.kind === "plan")
-          .map(({ planId, title, scope, due, timesPerPeriod }) => ({
+          .map(({ planId, title, scope, due, timesPerPeriod, details }) => ({
             planId, title, scope,
             ...(due !== undefined ? { due } : {}),
             ...(timesPerPeriod !== undefined ? { timesPerPeriod } : {}),
+            ...(details !== undefined ? { hasDetails: true } : {}), // 全文走 what=plan 单查，列表不膨胀
           }));
         return { plans: all.slice(0, limit), total: all.length, truncated: all.length > limit };
+      }
+      if (input.what === "plan") {
+        // 单查（2026-10-17 计划执行内容存储与AI读取）：details 全文 + 骨架字段——"怎么执行"的权威数据源
+        if (typeof input.planId !== "string" || input.planId === "") throw new Error("what=plan 需要 planId（query_ledger 的 plans 里有）");
+        const hit = active.find((r): r is PlanRecord => r.kind === "plan" && r.planId === input.planId);
+        if (!hit) throw new Error(`planId "${input.planId}" 不存在，先用 query_ledger what=plans 查`);
+        return {
+          plan: {
+            planId: hit.planId,
+            title: hit.title,
+            scope: hit.scope,
+            ...(hit.due !== undefined ? { due: hit.due } : {}),
+            ...(hit.ndays !== undefined ? { ndays: hit.ndays } : {}),
+            ...(hit.timesPerPeriod !== undefined ? { timesPerPeriod: hit.timesPerPeriod } : {}),
+            ...(hit.details !== undefined ? { details: hit.details } : {}),
+          },
+        };
       }
       if (input.what === "flows") {
         // from/to 过滤按用户档案当地日近似（与 today 同钟面；粗粒度够用）
@@ -354,7 +401,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
           .sort((a, b) => b.time - a.time || b.seq - a.seq); // 时间倒序，同刻按后记优先（limit 截断稳定）
         return { flows: filtered.slice(0, limit), total: filtered.length, truncated: filtered.length > limit }; // seq 是作废（void_flow）的引用凭据
       }
-      throw new Error("what 必须是 today | plans | flows");
+      throw new Error("what 必须是 today | plans | plan | flows");
     },
     isConcurrencySafe: () => true,
   };

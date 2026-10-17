@@ -27,12 +27,16 @@ export function parseAt(date: string | undefined, time: string | undefined, now:
   return base.getTime();
 }
 
+/** 计划执行内容上限（2026-10-17 计划执行内容存储与AI读取）：自由文本；三分化课表约 2KB/天，8000 字留足余量 */
+export const PLAN_DETAILS_MAX_CHARS = 8000;
+
 /** 计划修订的校验+合并（纯函数，返回 append payload 的业务字段；seq/ts/source/actor 由调用方按写入方落账）。
  * 部分更新语义：title 空白串=未提供；周期切换不残留 due/ndays；goalId 修订时一律剥离（目标层级已下线）。
- * timesPerPeriod（2026-09-30 习惯化）：undefined=保留；提供须 ≥1 整数且 scope ∈ day/week/month/year（习惯续期）。 */
+ * timesPerPeriod（2026-09-30 习惯化）：undefined=保留；提供须 ≥1 整数且 scope ∈ day/week/month/year（习惯续期）。
+ * details（2026-10-17）：undefined=保留；非空白串=设置（trim）；空白串=清除。 */
 export function mergePlanUpdate(
   cur: PlanRecord,
-  changes: { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number },
+  changes: { title?: string; scope?: string; due?: string; ndays?: number; timesPerPeriod?: number; details?: string },
 ): Omit<PlanRecord, "seq" | "ts" | "source" | "actor"> {
   const scopes = ["day", "week", "month", "year", "ndays", "deadline"] as const;
   const nextScope = changes.scope !== undefined ? scopes.find((s) => s === changes.scope) : undefined;
@@ -60,8 +64,19 @@ export function mergePlanUpdate(
       : undefined; // 切到 deadline/ndays = 放弃习惯语义，配额随周期专属字段一并剥离
   if (nextTimes !== undefined && (!Number.isInteger(nextTimes) || nextTimes < 1)) throw new Error("timesPerPeriod 需为 ≥1 的整数");
 
-  // 先剥离旧凭据与周期专属字段，再按 mergedScope 按需重建（goalId 剥离后不再重建——新版本即独立计划）
-  const { seq: _seq, ts: _ts, source: _source, actor: _actor, due: _oldDue, ndays: _oldNdays, timesPerPeriod: _oldTimes, goalId: _oldGoalId, ...snapshot } = cur;
+  // 先剥离旧凭据与周期专属字段，再按 mergedScope 按需重建（goalId 剥离后不再重建——新版本即独立计划）；
+  // details 一并剥出（2026-10-17）：按三态语义重新决定——undefined=保留旧值，空白串=清除，非空=设置
+  const { seq: _seq, ts: _ts, source: _source, actor: _actor, due: _oldDue, ndays: _oldNdays, timesPerPeriod: _oldTimes, goalId: _oldGoalId, details: _oldDetails, ...snapshot } = cur;
+  const detailsInput = typeof changes.details === "string" ? changes.details.trim() : undefined;
+  if (detailsInput !== undefined && detailsInput.length > PLAN_DETAILS_MAX_CHARS) {
+    throw new Error(`details 过长（≤${PLAN_DETAILS_MAX_CHARS} 字），精简或分条存放`);
+  }
+  const nextDetails =
+    detailsInput === undefined
+      ? (_oldDetails !== undefined ? { details: _oldDetails } : {})
+      : detailsInput === ""
+        ? {}
+        : { details: detailsInput };
   return {
     ...snapshot,
     ...(newTitle !== undefined && newTitle !== "" ? { title: newTitle } : {}),
@@ -69,5 +84,6 @@ export function mergePlanUpdate(
     ...(nextDue !== undefined ? { due: nextDue } : {}),
     ...(nextNdays !== undefined ? { ndays: nextNdays } : {}),
     ...(nextTimes !== undefined ? { timesPerPeriod: nextTimes } : {}),
+    ...nextDetails,
   };
 }

@@ -143,7 +143,7 @@ describe("目标层级下线（2026-09-30 SDD）：goal 工具不存在、goalId
 
   it("query_ledger what=goals 报未知视角；schema 无 goalId 参数", async () => {
     const { by } = await freshTools();
-    await expect(by("query_ledger").execute({ what: "goals" }, ctx)).rejects.toThrow("today | plans | flows");
+    await expect(by("query_ledger").execute({ what: "goals" }, ctx)).rejects.toThrow("today | plans | plan | flows");
     expect(JSON.stringify(by("create_plan").parameters)).not.toContain("goalId");
     expect(JSON.stringify(by("update_plan").parameters)).not.toContain("goalId");
     expect(JSON.stringify(by("query_ledger").parameters)).not.toContain("goalId");
@@ -404,5 +404,75 @@ describe("档案时区口径（2026-09-29：tzOffsetMinutes 注入）", () => {
     const toolsUtc = createLedgerTools({ ledger: ledgerUtc, now: () => NOW2 });
     const todayUtc = (await toolsUtc.find((t) => t.name === "query_ledger")!.execute({ what: "today" }, ctx)) as { date: string };
     expect(todayUtc.date).toBe("2026-09-03"); // 缺省 UTC：同一时刻的"今天"还是 9-3
+  });
+});
+
+describe("计划执行内容（2026-10-17 计划执行内容存储与AI读取：details）", () => {
+  const render = (tool: ToolDefinition, value: unknown): string => (tool.output!.render!({}, value) as { text: string }[])[0]!.text;
+
+  it("create_plan 带 details 落库；what=plans 列表只带 hasDetails 标记（全文不进摘要）；what=plan 单查返回全文", async () => {
+    const { ledger, by } = await freshTools();
+    const details = "高位下拉 4×8–12（90秒休息）\n坐姿划船 3×10–12\n要点：肩胛先下沉再拉，别耸肩";
+    await by("create_plan").execute({ title: "周一拉日", scope: "week", timesPerPeriod: 1, details }, ctx);
+
+    const row = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(row.details).toBe(details); // 落库原文
+
+    // 列表：标记位而无全文（防摘要膨胀）
+    const plans = (await by("query_ledger").execute({ what: "plans" }, ctx)) as { plans: { planId: string; hasDetails?: boolean; details?: string }[] };
+    const listed = plans.plans[0]!;
+    expect(listed.hasDetails).toBe(true);
+    expect(listed.details).toBeUndefined();
+    expect(render(by("query_ledger"), plans)).toContain("有详情可查");
+    expect(render(by("query_ledger"), plans)).not.toContain("高位下拉"); // 摘要绝不含全文
+
+    // 单查：全文 + 骨架
+    const single = (await by("query_ledger").execute({ what: "plan", planId: listed.planId }, ctx)) as { plan: { title: string; details?: string; scope: string } };
+    expect(single.plan.title).toBe("周一拉日");
+    expect(single.plan.details).toBe(details);
+    const singleText = render(by("query_ledger"), single);
+    expect(singleText).toContain("执行内容");
+    expect(singleText).toContain("高位下拉 4×8–12");
+  });
+
+  it("today 视图：带详情计划出 hasDetails 标记（模型面无全文）；top3 行与未完成行渲染「有详情」提示", async () => {
+    const { by } = await freshTools();
+    await by("create_plan").execute({ title: "周一拉日", scope: "week", timesPerPeriod: 1, details: "腿举 4×10" }, ctx);
+    const today = (await by("query_ledger").execute({ what: "today" }, ctx)) as { plans: { hasDetails?: boolean; details?: string }[]; top3: { hasDetails?: boolean }[] };
+    expect(today.plans[0]!.hasDetails).toBe(true);
+    expect(today.plans[0]!.details).toBeUndefined(); // 模型面绝不带全文
+    expect(today.top3[0]!.hasDetails).toBe(true);
+    const text = render(by("query_ledger"), today);
+    expect(text).toContain("有详情");
+    expect(text).not.toContain("腿举");
+  });
+
+  it("update_plan 三态：不传=保持；非空=替换；空串=清除；修订后 planId 不变历史打卡在", async () => {
+    const { ledger, by } = await freshTools();
+    const created = (await by("create_plan").execute({ title: "周三腿日", scope: "week", timesPerPeriod: 1, details: "腿举 4×10" }, ctx)) as { planId: string };
+    await by("checkin_plan").execute({ planId: created.planId, date: "2026-09-01" }, ctx);
+
+    await by("update_plan").execute({ planId: created.planId, title: "只改标题" }, ctx); // 不传 details
+    let row = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(row.details).toBe("腿举 4×10");
+
+    await by("update_plan").execute({ planId: created.planId, details: "新内容：深蹲 5×5" }, ctx); // 替换
+    row = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(row.details).toBe("新内容：深蹲 5×5");
+
+    await by("update_plan").execute({ planId: created.planId, details: "  " }, ctx); // 空白串清除
+    row = ledger.activeRecords().find((r) => r.kind === "plan") as PlanRecord;
+    expect(row.details).toBeUndefined();
+
+    expect(row.planId).toBe(created.planId); // 修订三轮 planId 不变
+    const checkins = ledger.activeRecords().filter((r) => r.kind === "checkin");
+    expect(checkins).toHaveLength(1); // 历史打卡引用不断
+  });
+
+  it("超限拒绝（工具与 merge 同限 8000 字）；what=plan 缺 planId / 不存在报错引导", async () => {
+    const { by } = await freshTools();
+    await expect(by("create_plan").execute({ title: "x", scope: "day", details: "长".repeat(8001) }, ctx)).rejects.toThrow("details 过长");
+    await expect(by("query_ledger").execute({ what: "plan" }, ctx)).rejects.toThrow("planId");
+    await expect(by("query_ledger").execute({ what: "plan", planId: "plan-none" }, ctx)).rejects.toThrow("不存在");
   });
 });
