@@ -7,7 +7,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { nodeEnv } from "./env";
 import { appPaths } from "./store";
-import { openDb, dropLegacyTables } from "./db";
+import { migrateInlineImages, openDb, dropLegacyTables } from "./db";
 import { migrateLegacyModelConfig } from "./migrate";
 import { loadUsers, readUserTz, SessionStore } from "./auth";
 import { loadOrCreateMasterKey, open, readModelConfig, readModelProviderConfig, type ModelConfig } from "./secretbox";
@@ -39,6 +39,9 @@ async function main(): Promise<void> {
 
   const db = openDb(dbFile);
   migrateLegacyModelConfig(db); // 旧单模型配置 → model_providers（幂等；表已删的库直接跳过）
+  // 内联图片迁移（2026-10-17 媒体膨胀治理）：存量 user/message 里的 base64 抽到 blobs 表。
+  // 必须先于任何 SqliteSessionLog.open / wechat.startAll（会话都是惰性打开的，这里就是全前提）
+  migrateInlineImages(db);
 
   const masterKey = await loadOrCreateMasterKey(dataRoot, appPaths(dataRoot).secretKeyFile);
   const users = await loadUsers(db);

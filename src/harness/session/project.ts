@@ -4,21 +4,43 @@
 // 规则是日志的纯函数，因此"过阈才裁"与"恒定裁剪"对不变量等价，后者不需要额外事件——这是本实现的一个决定。
 
 import type { Message, ToolResultMessage, UserMessage } from "../types";
+import { IMAGE_OMITTED_PLACEHOLDER } from "../types";
 import type { SessionEvent } from "./events";
+
+export { IMAGE_OMITTED_PLACEHOLDER };
 
 export interface PruneConfig {
   thresholdChars: number;
   headChars: number;
   tailChars: number;
+  /** 图片回合窗口（2026-10-17 媒体膨胀治理）：仅最近 N 个回合内的图片进模型上下文，
+   * 更早回合的 image 块替换为占位文本（内联与引用形态同样适用）。0 = 全部占位。 */
+  imageTurnWindow: number;
 }
 
 export const DEFAULT_PRUNE: PruneConfig = {
   thresholdChars: 8192,
   headChars: 4096,
   tailChars: 1024,
+  imageTurnWindow: 2,
 };
 
 export const PRUNE_PLACEHOLDER = "[... tool result middle pruned ...]";
+
+function elideImagesOlderThan(items: SurfaceItem[], cutoffSeq: number): void {
+  for (const item of items) {
+    if (item.seq >= cutoffSeq) continue;
+    const { message } = item;
+    if (message.role !== "user") continue; // assistant/tool_result 不产图（词表决定），防御性只动 user
+    if (!message.content.some((block) => block.type === "image")) continue;
+    item.message = {
+      ...message,
+      content: message.content.map((block) =>
+        block.type === "image" ? { type: "text" as const, text: IMAGE_OMITTED_PLACEHOLDER } : block,
+      ),
+    };
+  }
+}
 
 export interface SurfaceItem {
   seq: number;
@@ -58,7 +80,9 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
   // 历史注入剥离使 wire 至多一个注入块（历史不膨胀），缓存失配点被压在历史尾部（system 与深历史持续命中）。
   // 按 seq 记位（压缩会重建 items，下标不稳）；该消息若被压缩区间吞掉则自然放弃注入。
   let lastContext: { seq: number; text: string } | undefined;
+  const turnStartSeqs: number[] = [];
   for (const event of events) {
+    if (event.type === "turn/start") turnStartSeqs.push(event.seq);
     switch (event.type) {
       case "user/message":
         items.push({ seq: event.seq, message: event.message });
@@ -101,6 +125,15 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
         // turn/*、llm/retry、request/header、tool/call（执行记录）不进入模型可见历史
         break;
     }
+  }
+  // 图片回合窗口（2026-10-17 媒体膨胀治理）：cutoff = 倒数第 imageTurnWindow 个回合边界（turn/start 的 seq），
+  // 更早回合的图片换占位——模型回答过老图后不再携带像素，请求体不随历史图片数线性膨胀。
+  // 回合数不足窗口 = 全保留（现行为）；窗口 ≤ 0 = 全占位（显式关图片）。
+  if (prune.imageTurnWindow <= 0) {
+    elideImagesOlderThan(items, Infinity);
+  } else if (turnStartSeqs.length > prune.imageTurnWindow) {
+    const cutoff = turnStartSeqs[turnStartSeqs.length - prune.imageTurnWindow]!;
+    elideImagesOlderThan(items, cutoff);
   }
   if (lastContext !== undefined) {
     const target = items.find((it) => it.seq === lastContext!.seq);

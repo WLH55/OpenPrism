@@ -92,13 +92,23 @@ export interface TopItemLoose {
 }
 
 /** 会话日志事件（harness 九事件）的宽松视图 */
-/** 内容块宽松视图：文本 / 图片（base64）/ 文本附件 / 工具调用 */
+/** 内容块宽松视图：文本 / 图片（内联 base64 或 blobRef 引用）/ 文本附件 / 工具调用。
+ * 图片双形态（2026-10-17 媒体膨胀治理）：老事件内联 data；新事件只留 blobRef，
+ * 前端经 GET /api/conversations/:cid/blobs/:ref 按需取图（img src 直连，同源带 cookie）。 */
 export interface BlockLoose {
   type: string;
   text?: string;
   mediaType?: string;
   data?: string;
+  blobRef?: string;
   name?: string;
+}
+
+/** 图片块的显示源：内联 data → data URL；引用 → blob 接口 URL（cid 归属服务端校验） */
+export function imageSrcOf(cid: string, image: BlockLoose): string {
+  if (image.data !== undefined) return `data:${image.mediaType ?? "image/webp"};base64,${image.data}`;
+  if (image.blobRef !== undefined) return `/api/conversations/${encodeURIComponent(cid)}/blobs/${image.blobRef}`;
+  return "";
 }
 
 export interface SessionEventLoose {

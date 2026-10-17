@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, api2, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
+import { api, api2, imageSrcOf, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
 import { CheckSolidIcon, ChevronDownIcon, CloseIcon, SlidersIcon, StopIcon, SwitchPartnerIcon } from "../icons";
 import { FaceAvatar } from "../components/FaceEditor";
 import { AttachmentTray, toAttachmentInputs, type PendingAttachment } from "../components/Attachments";
@@ -670,7 +670,8 @@ export function Chat({
                   {item.images.length > 0 && (
                     <div className="flex flex-wrap justify-end gap-1.5">
                       {item.images.map((image, index) => {
-                        const src = `data:${image.mediaType ?? "image/webp"};base64,${image.data ?? ""}`;
+                        // 双形态（2026-10-17 媒体膨胀治理）：老事件内联 base64，新事件 blobRef 走接口按需取
+                        const src = imageSrcOf(activeConvId ?? "", image);
                         return (
                           <button
                             key={index}
@@ -679,7 +680,7 @@ export function Chat({
                             className="cursor-zoom-in transition hover:opacity-90"
                             onClick={() => openImage({ src, name: `发送的图片 ${index + 1}` })}
                           >
-                            <img src={src} alt="发送的图片" className="max-h-52 rounded-xl border border-line object-cover" />
+                            <img src={src} alt="发送的图片" loading="lazy" className="max-h-52 rounded-xl border border-line object-cover" />
                           </button>
                         );
                       })}

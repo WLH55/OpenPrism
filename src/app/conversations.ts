@@ -3,7 +3,7 @@
 // systemPrompt 每步同步重读（人设/记忆/技能目录改动下一步生效，D4.2/4.1）；
 // 能力绑定（工具开关 + 技能 + MCP）在装配时生效；save_preference 恒可用（记忆全局唯一，D5）。
 
-import type { Agent, ContentBlock, LlmAdapter, PlatformEnv, SessionEvent, SessionLog, ToolDefinition, UserMessage } from "../harness/index";
+import type { Agent, ContentBlock, LlmAdapter, Message, PlatformEnv, SessionEvent, SessionLog, ToolDefinition, UserMessage } from "../harness/index";
 import { createAgent, flattenText, hasImageBlocks } from "../harness/index";
 import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
@@ -16,6 +16,7 @@ import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
 import { createWidgetTools } from "./widgets";
 import type { McpRegistry } from "./mcp";
 import type { ModelConfig } from "./secretbox";
+import { readImageBlobs } from "./db";
 
 export class ModelNotConfiguredError extends Error {
   constructor() {
@@ -30,6 +31,38 @@ export class ModelNotMultimodalError extends Error {
     super(`${detail}——在「模型接入」里勾选该模型的「支持图片识别（多模态）」，或换一个支持图片的模型`);
     this.name = "ModelNotMultimodalError";
   }
+}
+
+/**
+ * 图片引用回填（2026-10-17 媒体膨胀治理）：把 wire 上 image 块的 blobRef 换成 blobs 表里的 base64 data。
+ * onRequest 调用（每步 LLM 请求前）——投影的回合窗口已把老图换成占位，这里只补窗口内残存的引用块。
+ * 回填不到（理论不可达：append/迁移同事务写 blobs）防御性换成占位文本，不把半截图发给模型。
+ * 纯拷贝变换：不修改入参消息对象（日志事件是共享引用）。
+ */
+export function hydrateImageRefs(db: DatabaseSync, messages: Message[]): Message[] {
+  const refs = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "assistant") continue;
+    for (const block of message.content) {
+      if (block.type === "image" && block.blobRef !== undefined && block.data === undefined) refs.add(block.blobRef);
+    }
+  }
+  if (refs.size === 0) return messages;
+  const blobs = readImageBlobs(db, [...refs]);
+  return messages.map((message) => {
+    if (message.role === "assistant") return message;
+    if (!message.content.some((block) => block.type === "image" && block.blobRef !== undefined && block.data === undefined)) return message;
+    return {
+      ...message,
+      content: message.content.map((block) => {
+        // 双字段块（互斥约定被破坏时的防御，评审 m7）：有 data 的原样保留，不因 blobRef 丢掉现成数据
+        if (block.type !== "image" || block.blobRef === undefined || block.data !== undefined) return block;
+        const hit = blobs.get(block.blobRef);
+        if (hit === undefined) return { type: "text" as const, text: "[图片加载失败]" };
+        return { type: "image" as const, mediaType: block.mediaType, data: hit.dataBase64 };
+      }) as ContentBlock[],
+    };
+  });
 }
 
 export interface ConversationDeps {
@@ -588,8 +621,10 @@ export class ConversationStore {
         if (!config.multimodal && request.messages.some((message) => hasImageBlocks(message))) {
           throw new ModelNotMultimodalError();
         }
+        const hydrated = hydrateImageRefs(this.db, request.messages);
+        const next = hydrated === request.messages ? request : { ...request, messages: hydrated };
         const thinking = this.turnThinking.get(`${uid}:${conversationId}`);
-        return thinking === undefined ? request : { ...request, thinking };
+        return thinking === undefined ? next : { ...next, thinking };
       },
       tools,
       maxStepsPerTurn: 24,
