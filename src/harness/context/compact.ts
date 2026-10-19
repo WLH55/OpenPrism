@@ -18,6 +18,8 @@ export interface CompactionConfig {
   retainRatio: number; // 0.16
   summaryMaxTokens: number;
   maxOverflowRetries: number;
+  /** 摘要指令（2026-10-19 指令可配置）：缺省为领域中立口径，app 层注入自身定位的口径 */
+  summaryInstruction: string;
 }
 
 export const DEFAULT_COMPACTION: CompactionConfig = {
@@ -26,6 +28,16 @@ export const DEFAULT_COMPACTION: CompactionConfig = {
   retainRatio: 0.16,
   summaryMaxTokens: 2048,
   maxOverflowRetries: 1,
+  summaryInstruction: `请把以上对话历史压缩为一份结构化 Markdown 摘要，供后续对话作为唯一的历史记忆。严格按以下小节输出：
+
+# 对话主题与意图
+# 关键事实与数值
+# 决定与约定
+# 未完成事项
+# 当前状态与下一步
+# 关键上下文
+
+要求：日期时间、数值、名称等关键信息必须逐字保留，不得改写或省略；没有内容的小节写"无"；只输出摘要本身。`,
 };
 
 export interface CompactDeps {
@@ -50,19 +62,6 @@ export interface CompactResult {
   /** 提交后的替换代数 */
   generation: number;
 }
-
-const SUMMARY_INSTRUCTION = `请把以上对话历史压缩为一份结构化 Markdown 摘要，供后续对话作为唯一的历史记忆。严格按以下小节输出：
-
-# 任务意图
-# 关键概念
-# 文件与代码
-# 错误与修复
-# 未竟事项
-# 当前工作
-# 下一步
-# 关键上下文
-
-要求：文件路径、命令、错误原文、数值等必须逐字保留，不得改写或省略；没有内容的小节写"无"；只输出摘要本身。`;
 
 function summaryCheckpoint(summary: string): UserMessage {
   return { role: "user", content: [{ type: "text", text: summary }] };
@@ -109,7 +108,7 @@ export function selectShadowInterval(surface: SurfaceItem[], retainTokens: numbe
 }
 
 async function requestSummary(deps: CompactDeps, intervalMessages: Message[]): Promise<string> {
-  const instruction: UserMessage = { role: "user", content: [{ type: "text", text: SUMMARY_INSTRUCTION }] };
+  const instruction: UserMessage = { role: "user", content: [{ type: "text", text: deps.config.summaryInstruction }] };
   const request: LlmRequest = {
     provider: deps.model.provider,
     model: deps.model.model,

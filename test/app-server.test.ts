@@ -1491,3 +1491,24 @@ describe("HTTP API 工作台化一期（2026-10-12：场景标签 + 自定义卡
     expect(mine[0]!.id).toBe(progressCard.id);
   });
 });
+
+describe("手动压缩路由（2026-10-19 手动压缩入口）", () => {
+  it("POST /compact：归属不符 404；空会话无可压缩区间 400 且错误可读", async () => {
+    const created = await fetch(`${baseUrl}/api/conversations`, {
+      ...json({}),
+      headers: { "Content-Type": "application/json", cookie },
+    });
+    const conv = (await created.json()) as { id: string };
+
+    // 他人会话按不存在拒绝
+    const reg = await fetch(`${baseUrl}/api/auth/register`, json({ username: "compactother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const foreign = await fetch(`${baseUrl}/api/conversations/${conv.id}/compact`, { method: "POST", headers: { cookie: otherCookie } });
+    expect(foreign.status).toBe(404);
+
+    // 本人空会话：无可压缩区间 → 400 + 可读说明（压缩成功的 200 路径由 app-conversations 的 compactNow 用例覆盖）
+    const tooShort = await fetch(`${baseUrl}/api/conversations/${conv.id}/compact`, { method: "POST", headers: { cookie } });
+    expect(tooShort.status).toBe(400);
+    expect(((await tooShort.json()) as { error?: string }).error).toContain("会话还太短");
+  });
+});

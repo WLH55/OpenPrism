@@ -592,7 +592,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
 
     if (sub === "/messages" && method === "POST") {
-      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: string; attachments?: unknown; thinking?: unknown };
+      const body = (await readBody(req, MESSAGE_BODY_LIMIT)) as { text?: unknown; attachments?: unknown; thinking?: unknown };
       const text = String(body.text ?? "").trim();
       let attachments;
       try {
@@ -609,6 +609,21 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         if (error instanceof ModelNotMultimodalError) return sendError(res, 409, error.message, "model_not_multimodal");
         // 归属不符（2026-09-27 越权补齐）按不存在处理，不泄露他人会话存在性
         if (String((error as Error).message).includes("不存在")) return sendError(res, 404, "会话不存在");
+        throw error;
+      }
+    }
+
+    // 手动压缩（2026-10-19 手动压缩入口）：输入框 /compact 命令直达；结果错误带可读文案
+    if (sub === "/compact" && method === "POST") {
+      try {
+        await deps.conversations.compactNow(uid, cid);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        if (error instanceof ModelNotConfiguredError) return sendError(res, 409, "model_not_configured", "model_not_configured");
+        const message = String((error as Error).message ?? error);
+        if (message.includes("不存在")) return sendError(res, 404, "会话不存在");
+        if (message.includes("稍后再试")) return sendError(res, 409, message);
+        if (message.includes("没有可压缩") || message.includes("压缩失败")) return sendError(res, 400, message);
         throw error;
       }
     }

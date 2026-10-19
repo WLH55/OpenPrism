@@ -199,11 +199,11 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "void_flow",
     ]);
   });
 
-  it("场景标签与卡片工具（2026-10-12 工作台化一期）：提供 widgets → 装配 18 工具；Turn 内 set_conversation_scene 落库、回执入日志", async () => {
+  it("场景标签与卡片工具（2026-10-12 工作台化一期）：提供 widgets → 装配 19 工具（含 compact，2026-10-19）；Turn 内 set_conversation_scene 落库、回执入日志", async () => {
     const db = testDb();
     const mock = createMockLlmAdapter([
       { kind: "tool-calls", calls: [{ name: "set_conversation_scene", arguments: { scene: "装修" } }] },
@@ -216,7 +216,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "把这个会话归到装修场景");
     await (await store.agent(UID, entry.id)).whenIdle();
     expect((mock.requests[0]!.tools ?? []).map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "create_plan", "create_task", "create_widget", "delete_task", "delete_widget", "list_widgets", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "update_widget", "void_flow",
+      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "create_widget", "delete_task", "delete_widget", "list_widgets", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "update_widget", "void_flow",
     ]);
     // 工具作用于当前会话：落库 + 回执入会话日志（model-visible means logged）
     expect((await store.list(UID)).find((c) => c.id === entry.id)?.scene).toBe("装修");
@@ -286,7 +286,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "帮我看看");
     await (await store.agent(UID, entry.id)).whenIdle();
     const names = mock.requests[0]!.tools!.map((t) => t.name).sort();
-    expect(names).toEqual(["create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "save_preference", "search_memory", "update_task"]);
+    expect(names).toEqual(["compact", "create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "save_preference", "search_memory", "update_task"]);
     expect(mock.requests[0]!.system).toContain("健身复盘");
     expect(mock.requests[0]!.system).toContain("健身话题");
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
@@ -815,7 +815,7 @@ describe("回合上下文注入（2026-10-14 前缀缓存稳定化）", () => {
 });
 
 describe("任务触发上下文（2026-10-14）", () => {
-  it("taskFeedContext：钟面行 + 记忆召回（query = 触发消息文本），供 main.ts 直投 followup 携带", async () => {
+  it("taskFeedContext：钟面行 + 模型身份行 + 记忆召回（query = 触发消息文本），供 main.ts 直投 followup 携带", async () => {
     const db = testDb();
     const deps = makeDeps(db, undefined as unknown as LlmAdapter);
     deps.memory.insertItem(UID, { kind: "profile", content: "软件工程师，重复利", origin: "manual", importance: 4 });
@@ -823,8 +823,179 @@ describe("任务触发上下文（2026-10-14）", () => {
       { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, tzOffsetMinutes: () => 480 },
       db,
     );
-    const context = store.taskFeedContext(UID, "【定时任务触发】睡前提醒");
+    const context = await store.taskFeedContext(UID, "feed-1", "【定时任务触发】睡前提醒");
     expect(context).toContain("今天是 2026-09-03 周四，用户当地时间 20:00。"); // NOW=UTC 9-3 12:00 + 480min
+    expect(context).toContain("当前底座：mock-1"); // 模型身份随任务回合注入（2026-10-19 模型身份可见性）
     expect(context).toContain("软件工程师，重复利"); // 常驻记忆随任务回合注入
+  });
+});
+
+describe("模型身份注入（2026-10-19 模型身份可见性）", () => {
+  const step = () => ({ message: { role: "assistant" as const, content: [{ type: "text" as const, text: "ok" }] } });
+  const openerContext = async (store: ReturnType<ReturnType<typeof makeDeps>["makeStore"]>, cid: string, nth = 0) => {
+    const events = (await store.agent(UID, cid)).sessionLog.readAll().filter((e) => e.type === "user/message");
+    return (events[nth] as { context?: string }).context ?? "";
+  };
+
+  it("send() 回合上下文注入「当前底座：platform · model」行，随 user/message 事件 context 落日志", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => step() }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { baseURL: "https://api.mock.local", model: "mock-1", platform: "智谱 Coding" });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.send(UID, entry.id, "你是谁");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(await openerContext(store, entry.id)).toContain("当前底座：智谱 Coding · mock-1");
+  });
+
+  it("platform 识别不出（空）时只显示型号，不出现分隔点", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => step() }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter); // MODEL 无 platform 字段
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.send(UID, entry.id, "你是谁");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    const context = await openerContext(store, entry.id);
+    expect(context).toContain("当前底座：mock-1");
+    expect(context).not.toContain("当前底座：·");
+  });
+
+  it("切换会话绑定模型 → 下一回合注入新模型（与 adapter 每回合现读同口径）", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([
+      { kind: "fn", fn: async () => step() },
+      { kind: "fn", fn: async () => step() },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, MODEL, true); // modelFromDb：config 从库现读
+    const a = addModelProvider(db, UID, { baseURL: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.7" }); // platform 推导「智谱 GLM」
+    const b = addModelProvider(db, UID, { baseURL: "https://api.deepseek.com", model: "deepseek-chat" }); // platform 推导「DeepSeek」
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.switchModel(UID, entry.id, a.id);
+    await store.send(UID, entry.id, "你是谁");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(await openerContext(store, entry.id, 0)).toContain("当前底座：智谱 GLM · glm-4.7");
+
+    await store.switchModel(UID, entry.id, b.id);
+    await store.send(UID, entry.id, "现在呢");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    expect(await openerContext(store, entry.id, 1)).toContain("当前底座：DeepSeek · deepseek-chat");
+  });
+
+  it("app 装配注入个人助理摘要指令：自动压缩触发的摘要请求含「用户近况与情绪」小节（2026-10-19 摘要指令适配）", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([
+      { kind: "fn", fn: async () => ({ message: { role: "assistant" as const, content: [{ type: "text" as const, text: "这是第一回合助手的完整回复内容，长度足够参与区间与保留的计算。" }] } }) },
+      { kind: "text", text: "无" },
+      { kind: "fn", fn: async () => step() },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, contextWindow: 200 }); // 阈值 160：system+工具表远超 → 每次请求前都尝试压缩
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+
+    await store.send(UID, entry.id, "这是第一回合的用户消息，内容写长一些让遮蔽区间的 token 计算稳定可靠。");
+    await (await store.agent(UID, entry.id)).whenIdle(); // 首回合 surface 仅 1 条：区间不足失败仅告警，回合正常
+    await store.send(UID, entry.id, "第二回合的消息内容");
+    await (await store.agent(UID, entry.id)).whenIdle(); // surface 3 条：压缩成功
+
+    const summaryRequest = mock.requests.find((r) => r.maxTokens === 2048); // summaryMaxTokens 是摘要请求独有特征（回合请求不设 maxTokens）
+    expect(summaryRequest).toBeDefined();
+    const instruction = summaryRequest!.messages.at(-1)!;
+    const text = ((instruction.content as { type: string; text?: string }[])[0] as { text: string }).text;
+    expect(text).toContain("# 用户近况与情绪");
+    expect(text).toContain("# 目标与计划");
+    expect(text).not.toContain("# 文件与代码");
+  });
+});
+
+describe("手动压缩入口（2026-10-19）", () => {
+  const step = () => ({ message: { role: "assistant" as const, content: [{ type: "text" as const, text: "ok" }] } });
+  // 窗口 8000：阈值 6400 大于装配开销（system 383 + 工具表 ~1670 + 消息）→ 回合内自动压缩不触发；
+  // 保留量 0.16×8000 = 1280 token → 三条长消息（每条约 760 token）让切点落在消息边界上且区间非空
+  // （探针实测装配开销 + selectShadowInterval 边界语义后定的参数：两条长消息时尾部保留会吃掉全部历史）
+  const LONG = "长".repeat(3000);
+
+  it("compactNow：三回合历史后手动压缩成功，compaction/summary 落日志", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([
+      { kind: "fn", fn: async () => step() },
+      { kind: "fn", fn: async () => step() },
+      { kind: "fn", fn: async () => step() },
+      { kind: "text", text: "# 摘要" },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, contextWindow: 8000 });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, `第一回合 ${LONG}`);
+    await (await store.agent(UID, entry.id)).whenIdle();
+    await store.send(UID, entry.id, `第二回合 ${LONG}`);
+    await (await store.agent(UID, entry.id)).whenIdle();
+    await store.send(UID, entry.id, `第三回合 ${LONG}`);
+    await (await store.agent(UID, entry.id)).whenIdle();
+
+    await store.compactNow(UID, entry.id);
+    const events = (await store.agent(UID, entry.id)).sessionLog.readAll();
+    expect(events.some((e) => e.type === "compaction/summary")).toBe(true);
+  });
+
+  it("compactNow：空会话无可压缩区间 → 可读错误「会话还太短」", async () => {
+    const db = testDb();
+    const deps = makeDeps(db, textAdapter());
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await expect(store.compactNow(UID, entry.id)).rejects.toThrow("会话还太短");
+  });
+
+  it("compactNow：AI 回复进行中 → 明确拒绝「稍后再试」，回合照常完成", async () => {
+    const db = testDb();
+    const gate = deferred<void>();
+    const mock = createMockLlmAdapter([
+      { kind: "fn", fn: async () => { await gate.promise; return step(); } },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "慢一点回");
+    const agent = await store.agent(UID, entry.id);
+    await expect(store.compactNow(UID, entry.id)).rejects.toThrow("稍后再试");
+    gate.resolve();
+    await agent.whenIdle();
+    expect(agent.sessionLog.readAll().some((e) => e.type === "turn/end")).toBe(true);
+  });
+
+  it("AI 调 compact 工具：设置标志 → 本回合结束后间隙执行压缩（app 装配延迟引用真实链路）", async () => {
+    const db = testDb();
+    const long = "长".repeat(6000); // 单条约 1500 token：两条长消息后遮蔽首条，尾部保留量（1280）在边界内
+    const mock = createMockLlmAdapter([
+      { kind: "text", text: "第一回合的普通回复" },
+      { kind: "text", text: "第二回合的普通回复" },
+      { kind: "tool-calls", calls: [{ name: "compact", arguments: {} }] },
+      { kind: "text", text: "好的，马上压缩" },
+      { kind: "text", text: "# 摘要" },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter, { ...MODEL, contextWindow: 8000 });
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, `先聊一段长的 ${long}`);
+    await (await store.agent(UID, entry.id)).whenIdle();
+    await store.send(UID, entry.id, `再聊一段长的 ${long}`);
+    await (await store.agent(UID, entry.id)).whenIdle();
+    await store.send(UID, entry.id, "压缩一下上下文");
+    await (await store.agent(UID, entry.id)).whenIdle();
+
+    const events = (await store.agent(UID, entry.id)).sessionLog.readAll();
+    const summaryIdx = events.findIndex((e) => e.type === "compaction/summary");
+    expect(summaryIdx).toBeGreaterThan(-1);
+    const lastTurnEndIdx = events.length - 1 - [...events].reverse().findIndex((e) => e.type === "turn/end");
+    expect(summaryIdx).toBeGreaterThan(lastTurnEndIdx);
+    // 工具本身已回话（铁律 3：无悬空 tool_call）
+    const toolCalls = events.filter((e) => e.type === "tool/call");
+    const toolResults = events.filter((e) => e.type === "tool/result");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolResults).toHaveLength(1);
   });
 });

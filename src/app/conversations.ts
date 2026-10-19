@@ -34,6 +34,21 @@ export class ModelNotMultimodalError extends Error {
 }
 
 /**
+ * 个人助理口径的压缩摘要指令（2026-10-19 摘要指令适配）：会话被压缩时，摘要保的是用户近况、
+ * 目标计划、约定承诺这些陪伴/习惯管理要素；harness 缺省为领域中立口径，app 语义在 app 层。
+ */
+export const PERSONAL_SUMMARY_INSTRUCTION = `请把以上对话历史压缩为一份结构化 Markdown 摘要，供后续对话作为唯一的历史记忆。严格按以下小节输出：
+
+# 用户近况与情绪
+# 目标与计划
+# 约定与承诺
+# 关键事实
+# 未完成与待跟进
+# 关键上下文
+
+要求：日期与时间点、数值（组数、次数、配额、体重等）、人名与称呼、用户的原话承诺必须逐字保留，不得改写或省略；没有内容的小节写"无"；只输出摘要本身。`;
+
+/**
  * 图片引用回填（2026-10-17 媒体膨胀治理）：把 wire 上 image 块的 blobRef 换成 blobs 表里的 base64 data。
  * onRequest 调用（每步 LLM 请求前）——投影的回合窗口已把老图换成占位，这里只补窗口内残存的引用块。
  * 回填不到（理论不可达：append/迁移同事务写 blobs）防御性换成占位文本，不把半截图发给模型。
@@ -604,7 +619,25 @@ export class ConversationStore {
       tools.push(...(await this.deps.mcps.toolsFor(uid, mcpId)));
     }
 
-    return createAgent({
+    // 手动压缩工具（2026-10-19 手动压缩入口）：系统级能力不过能力白名单（与 save_preference 同列）；
+    // 工具在回合内执行而压缩要求日志稳定，故只设标志，由 agent 驱动在本回合结束后的间隙执行
+    let agentRef: Agent | undefined;
+    tools.push({
+      name: "compact",
+      description:
+        "手动压缩当前会话的上下文：把较早的对话历史摘要化。用户明确要求压缩上下文、精简历史、释放记忆窗口时调用；日常对话不要主动调用。",
+      parameters: { type: "object", properties: {} },
+      output: {
+        schema: { type: "object", required: ["arranged"], properties: { arranged: { type: "boolean" } } },
+        render: () => [{ type: "text", text: "已安排压缩：本回合结束后执行" }],
+      },
+      async execute() {
+        agentRef?.requestCompact();
+        return { arranged: true };
+      },
+    });
+
+    const agent = createAgent({
       env,
       sessionLog,
       adapter: this.deps.adapterFactory(uid, providerId, config, conversationId),
@@ -614,6 +647,8 @@ export class ConversationStore {
         // 上下文窗口喂给压缩器判压（0.8 阈值）；缺省 = harness 默认 64K
         ...(config.contextWindow !== undefined ? { contextWindow: config.contextWindow } : {}),
       },
+      // 摘要指令按个人助理定位注入（2026-10-19 摘要指令适配）；不传则 harness 用领域中立的缺省口径
+      compaction: { summaryInstruction: PERSONAL_SUMMARY_INSTRUCTION },
       systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf()),
       // 兜底拦截：装配期这个模型不支持图片，而请求里带了图片（历史消息/切换伙伴默认模型后的重放）→
       // 就地失败并说明原因，不把图片发给不认识的端点去猜
@@ -629,22 +664,49 @@ export class ConversationStore {
       tools,
       maxStepsPerTurn: 24,
     });
+    agentRef = agent;
+    return agent;
   }
 
-  /** 回合上下文（2026-10-14 前缀缓存稳定化）：钟面 + 记忆召回块（query = 本回合触发消息文本，向量命中可选） */
-  private turnContextFor(uid: string, query: string, vectorHits?: MemoryVectorHit[]): string {
+  /**
+   * 手动压缩（HTTP 入口，2026-10-19 手动压缩入口）：要求会话空闲（AI 回复进行中明确拒绝）；
+   * harness 内部错误转可读文案（区间不足 / shrink 校验失败），其余原样上抛。
+   */
+  async compactNow(uid: string, cid: string): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    const agent = await this.agent(uid, cid);
+    if (agent.status === "running") throw new Error("AI 正在回复，稍后再试");
+    try {
+      await agent.compact();
+    } catch (error) {
+      const message = String((error as Error).message ?? error);
+      if (message.includes("nothing compressible")) throw new Error("会话还太短，暂时没有可压缩的内容");
+      if (message.includes("shrink")) throw new Error("压缩失败：摘要没能小于原历史，请稍后再试");
+      throw error;
+    }
+  }
+
+  /** 回合上下文（2026-10-14 前缀缓存稳定化）：钟面 + 模型身份行 + 记忆召回块（query = 本回合触发消息文本，向量命中可选） */
+  private turnContextFor(uid: string, query: string, vectorHits?: MemoryVectorHit[], modelLine?: string): string {
     const tz = this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset();
     const memoryBlock = (this.deps.memory as unknown as { recallBlockSync(uid: string, query?: string, vectorHits?: MemoryVectorHit[]): string }).recallBlockSync(
       uid,
       query,
       vectorHits,
     );
-    return [dateLine(this.deps.now(), tz), memoryBlock].filter((part) => part !== "").join("\n\n");
+    return [dateLine(this.deps.now(), tz), modelLine ?? "", memoryBlock].filter((part) => part !== "").join("\n\n");
   }
 
-  /** 任务触发回合的上下文（main.ts taskRunner 直投 followup 时携带）：钟面 + 记忆召回（query = 触发消息文本） */
-  taskFeedContext(uid: string, query: string): string {
-    return this.turnContextFor(uid, query);
+  /** 模型身份行（2026-10-19 模型身份可见性）：AI 被问「你是什么模型」时据此如实回答；未配置返回空串（注入省略） */
+  private modelIdentityLine(config: ModelConfig | null): string {
+    if (!config || config.model === "") return "";
+    return config.platform ? `当前底座：${config.platform} · ${config.model}` : `当前底座：${config.model}`;
+  }
+
+  /** 任务触发回合的上下文（main.ts taskRunner 直投 followup 时携带）：钟面 + 模型身份行 + 记忆召回（query = 触发消息文本） */
+  async taskFeedContext(uid: string, cid: string, query: string): Promise<string> {
+    const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
+    return this.turnContextFor(uid, query, undefined, this.modelIdentityLine(config));
   }
 
   private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
@@ -672,8 +734,10 @@ export class ConversationStore {
     opts?: { thinking?: boolean },
   ): Promise<void> {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    // 模型身份行（2026-10-19 模型身份可见性）：每回合现读生效配置（与 adapter 现读同口径），随回合上下文注入；
+    // 带图消息的多模态校验复用同一次读取
+    const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
     if (attachments.some((block) => block.type === "image")) {
-      const config = await this.deps.modelConfigFor(uid, this.effectiveProviderId(uid, this.dbMetaSync(uid, cid)));
       if (!config) throw new ModelNotConfiguredError();
       if (!config.multimodal) throw new ModelNotMultimodalError();
     }
@@ -688,7 +752,7 @@ export class ConversationStore {
       this.deps.memoryVector && query.trim() !== ""
         ? await this.deps.memoryVector.recallHits(uid, query, { scope: "situational" })
         : null;
-    agent.followup(content, this.turnContextFor(uid, query, hits ?? undefined));
+    agent.followup(content, this.turnContextFor(uid, query, hits ?? undefined, this.modelIdentityLine(config)));
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
   }

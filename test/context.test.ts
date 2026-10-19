@@ -15,6 +15,7 @@ import {
   heuristicTextTokens,
 } from "../src/harness/context/meter";
 import { createAgent } from "../src/harness/core/agent";
+import type { ToolDefinition } from "../src/harness/tools/registry";
 import { llmFailure } from "../src/harness/llm/errors";
 import { createMockLlmAdapter, type MockScriptStep } from "../src/harness/llm/mock";
 import { InMemorySessionLog } from "../src/harness/session/log";
@@ -166,6 +167,49 @@ describe("compactConversation", () => {
   });
 });
 
+describe("摘要指令可配置（2026-10-19 压缩摘要指令适配个人助理）", () => {
+  it("summaryInstruction 自定义值随摘要请求末条 user 消息发出", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await seedConversation(log);
+    const mock = createMockLlmAdapter([{ kind: "text", text: "# 摘要\n短摘要" }]);
+    const deps: CompactDeps = {
+      sessionLog: log,
+      adapter: mock.adapter,
+      model: { provider: "p", model: "m" },
+      system: "S",
+      tools: [],
+      config: { ...DEFAULT_COMPACTION, contextWindow: 10, summaryInstruction: "自定义压缩指令" },
+    };
+    const result = await compactConversation(deps, { force: true, retainTokens: heuristicMessageTokens(user("第二个问题")) });
+    expect(result.changed).toBe(true);
+    const instruction = mock.requests[0]!.messages.at(-1)!;
+    const block = (instruction.content as { type: string; text?: string }[])[0]!;
+    expect(instruction.role).toBe("user");
+    expect(block.type === "text" && block.text === "自定义压缩指令").toBe(true);
+  });
+
+  it("缺省指令为领域中立口径：含「决定与约定」小节，不含 coding 专属小节", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await seedConversation(log);
+    const mock = createMockLlmAdapter([{ kind: "text", text: "# 摘要\n短摘要" }]);
+    const deps: CompactDeps = {
+      sessionLog: log,
+      adapter: mock.adapter,
+      model: { provider: "p", model: "m" },
+      system: "S",
+      tools: [],
+      config: { ...DEFAULT_COMPACTION, contextWindow: 10 },
+    };
+    await compactConversation(deps, { force: true, retainTokens: heuristicMessageTokens(user("第二个问题")) });
+    const instruction = mock.requests[0]!.messages.at(-1)!;
+    const text = ((instruction.content as { type: string; text?: string }[])[0] as { text: string }).text;
+    expect(text).toContain("# 决定与约定");
+    expect(text).toContain("# 关键事实与数值");
+    expect(text).not.toContain("# 文件与代码");
+    expect(text).not.toContain("# 错误与修复");
+  });
+});
+
 describe("agent 集成：压力与溢出", () => {
   it("压力过阈触发压缩；区间不足时失败仅告警不阻塞 Turn", async () => {
     const log = new InMemorySessionLog(() => 0);
@@ -274,5 +318,99 @@ describe("agent 集成：压力与溢出", () => {
     await seedConversation(log);
     await agent.compact();
     expect(currentGeneration(log.readAll())).toBe(1);
+  });
+});
+
+describe("requestCompact 回合间隙执行（2026-10-19 手动压缩入口）", () => {
+  /** 长 seed：消息量大到手动压缩（retain = 0.16×400 = 64 token）有可选区间、又小到回合内不过阈（阈值 320） */
+  const seedLong = async (log: InMemorySessionLog): Promise<void> => {
+    await log.append({ type: "user/message", channel: "followup", message: user("这是一段足够长的第一回合用户消息，用来撑起手动压缩需要遮蔽的历史区间。") });
+    await log.append({ type: "assistant/message", message: { role: "assistant", content: [{ type: "text", text: "这是一段足够长的第一回合助手回复，同样用来撑起遮蔽区间的另一半。" }] } });
+    await log.append({ type: "user/message", channel: "followup", message: user("这是一段足够长的第二回合用户消息，继续补充历史区间的体量。") });
+  };
+  const compactToolOf = (agentRef: { current: ReturnType<typeof createAgent> | undefined }): ToolDefinition => ({
+    name: "compact",
+    description: "手动压缩当前会话的上下文",
+    parameters: { type: "object", properties: {} },
+    output: {
+      schema: { type: "object", required: ["arranged"], properties: { arranged: { type: "boolean" } } },
+      render: () => [{ type: "text", text: "已安排压缩：本回合结束后执行" }],
+    },
+    async execute() {
+      agentRef.current?.requestCompact();
+      return { arranged: true };
+    },
+  });
+
+  it("工具执行内 requestCompact：回合结束后执行压缩，compaction/summary 落在最后 turn/end 之后", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await seedLong(log);
+    const mock = createMockLlmAdapter([
+      { kind: "tool-calls", calls: [{ name: "compact", arguments: {} }] },
+      { kind: "text", text: "好的，马上压缩" },
+      { kind: "text", text: "# 摘要" },
+    ]);
+    const agentRef: { current: ReturnType<typeof createAgent> | undefined } = { current: undefined };
+    const agent = createAgent({
+      env: fakeEnv(),
+      sessionLog: log,
+      adapter: mock.adapter,
+      model: { provider: "p", model: "m" },
+      systemPrompt: () => "S",
+      tools: [compactToolOf(agentRef)],
+      compaction: { contextWindow: 400 },
+    });
+    agentRef.current = agent;
+
+    agent.followup("压缩一下");
+    await agent.whenIdle();
+
+    const events = log.readAll();
+    const summaryIdx = events.findIndex((event) => event.type === "compaction/summary");
+    expect(summaryIdx).toBeGreaterThan(-1);
+    const lastTurnEndIdx = events.length - 1 - [...events].reverse().findIndex((event) => event.type === "turn/end");
+    expect(summaryIdx).toBeGreaterThan(lastTurnEndIdx);
+    expect(currentGeneration(events)).toBe(1);
+  });
+
+  it("间隙压缩失败（shrink 校验）→ compaction 直播事件 ok:false、驱动不死，后续回合正常", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await seedLong(log);
+    const huge = "概".repeat(500);
+    const mock = createMockLlmAdapter([
+      { kind: "tool-calls", calls: [{ name: "compact", arguments: {} }] },
+      { kind: "text", text: "好的" },
+      { kind: "text", text: huge },
+      { kind: "text", text: "第二回合回复" },
+    ]);
+    const agentRef: { current: ReturnType<typeof createAgent> | undefined } = { current: undefined };
+    const agent = createAgent({
+      env: fakeEnv(),
+      sessionLog: log,
+      adapter: mock.adapter,
+      model: { provider: "p", model: "m" },
+      systemPrompt: () => "S",
+      tools: [compactToolOf(agentRef)],
+      compaction: { contextWindow: 400 },
+    });
+    agentRef.current = agent;
+    const live: { type: string; ok?: boolean }[] = [];
+    agent.subscribe((event) => {
+      if (event.type === "compaction") live.push(event as unknown as { type: string; ok?: boolean });
+    });
+
+    agent.followup("压缩一下");
+    await agent.whenIdle();
+    agent.followup("再聊一句");
+    await agent.whenIdle();
+
+    expect(log.readAll().some((event) => event.type === "compaction/summary")).toBe(false);
+    expect(live.some((event) => event.ok === false)).toBe(true);
+    const reasons = log
+      .readAll()
+      .filter((event) => event.type === "turn/end")
+      .map((event) => (event as { reason: string }).reason);
+    expect(reasons).toEqual(["completed", "completed"]);
+    expect(mock.requests).toHaveLength(4); // 回合1两步 + 间隙摘要请求 + 回合2一步
   });
 });
