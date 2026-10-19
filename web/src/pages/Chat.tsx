@@ -12,7 +12,7 @@ const EVENTS_PAGE_SIZE = 50;
 /** 渲染项：从会话日志事件折叠出的 UI 气泡/回执/切换分割线 */
 type RenderItem =
   | { kind: "user"; key: string; text: string; images: BlockLoose[]; files: string[] }
-  | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean }
+  | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean; model?: string }
   | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
   | { kind: "turn-error"; key: string }
   | { kind: "switch"; key: string; label: string };
@@ -27,6 +27,9 @@ function foldEvents(
   agentIdAt: (ts: number | undefined) => string | undefined,
 ): RenderItem[] {
   const items: RenderItem[] = [];
+  // 模型身份标记（2026-10-19 模型身份可见性）：request/header 指纹变化才落一条，
+  // 该 header 之后至下一条 header 之前的 assistant 消息都挂同一个 model（区间映射）
+  let currentModel: string | undefined;
   for (const event of events) {
     // 切换分割线：插到第一条晚于切换时刻的事件前（D4.2 消息归属可视）
     for (const sw of switches) {
@@ -55,6 +58,7 @@ function foldEvents(
         reasoning: event.message?.reasoning ?? "",
         agentId: agentIdAt(event.ts),
         interrupted: event.message?.interrupted === true,
+        ...(currentModel !== undefined ? { model: currentModel } : {}),
       });
     } else if (event.type === "tool/call") {
       items.push({ kind: "receipt", key: `t${event.id}`, name: event.name ?? "?", ok: true, text: "执行中…" });
@@ -64,6 +68,8 @@ function foldEvents(
         pending.ok = !event.isError;
         pending.text = (event.content ?? []).map((b) => b.text ?? "").join("") || (event.isError ? "失败" : "完成");
       }
+    } else if (event.type === "request/header") {
+      if (event.model !== undefined && event.model !== "") currentModel = event.model;
     } else if (event.type === "turn/end" && event.reason === "error") {
       // 失败回合持久标记：错误详情只在直播流里（不落日志），重载后至少留痕
       items.push({ kind: "turn-error", key: `te${event.seq}` });
@@ -292,6 +298,16 @@ export function Chat({
   const send = () => {
     const text = input.trim();
     if ((text === "" && attachments.length === 0) || !activeConvId) return;
+    // 手动压缩命令（2026-10-19）：精确匹配 /compact 时不发给 AI，直接触发压缩（结果横幅提示，SSE 事件到达时覆盖为同文案）
+    if (text === "/compact" && attachments.length === 0) {
+      setInput("");
+      setComposerError(null);
+      void api
+        .compactConversation(activeConvId)
+        .then(() => setBanner("已压缩：较早的对话已摘要化"))
+        .catch((e: Error) => setBanner(`压缩失败：${e.message}`));
+      return;
+    }
     setInput("");
     setAttachments([]);
     setComposerError(null);
@@ -381,6 +397,20 @@ export function Chat({
           .then(() => reloadConversations())
           .catch(() => undefined);
         settleAndFlush();
+      } else if (event.type === "compaction") {
+        // 压缩结果（2026-10-19 手动压缩入口）：AI 工具路径的压缩发生在回合结束后（接口无法同步返回），结果经此到达；
+        // 自动压缩（阈值触发）完成同样提示——压缩透明化，用户可感知上下文何时被摘要。
+        // 失败原因的两条 harness 内部错误转可读中文（与 HTTP 入口 compactNow 同口径）
+        const raw = event.error;
+        const reason =
+          raw === undefined
+            ? undefined
+            : raw.includes("nothing compressible")
+              ? "会话还太短，暂时没有可压缩的内容"
+              : raw.includes("shrink")
+                ? "摘要没能小于原历史，请稍后再试"
+                : raw;
+        setBanner(event.ok ? "已压缩：较早的对话已摘要化" : `压缩失败：${reason ?? "未知错误"}`);
       } else if (event.type === "tool-call") {
         setItems((prev) => [
           ...prev,
@@ -723,6 +753,9 @@ export function Chat({
                   </div>
                   {item.interrupted && (
                     <span className="w-fit rounded-md bg-warm2 px-2 py-0.5 text-[11px] text-warm">已中止</span>
+                  )}
+                  {item.model !== undefined && (
+                    <span className="w-fit rounded-md bg-surface2 px-2 py-0.5 text-[11px] text-ink3" title="这条回复的生成模型">{item.model}</span>
                   )}
                 </div>
               </div>

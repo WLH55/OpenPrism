@@ -57,6 +57,8 @@ export interface Agent {
   whenIdle(): Promise<void>;
   /** 手动压缩（要求 idle，设计 §12 差异 6） */
   compact(): Promise<void>;
+  /** 请求压缩（2026-10-19 手动压缩入口）：running 时安排在本回合结束后执行（driver 回合间隙，日志已稳定）；idle 时立即执行。结果经 compaction 直播事件可见 */
+  requestCompact(): void;
   subscribe(cb: (event: AgentLiveEvent) => void): () => void;
 }
 
@@ -157,6 +159,24 @@ export function createAgent(config: AgentConfig): Agent {
       compacting = false;
     }
   };
+
+  // 手动压缩执行体（compact 与 requestCompact 共用）：结果走 compaction 直播事件；失败向上抛，由调用方决定口径
+  const runManualCompact = async (): Promise<void> => {
+    const request = applyOnRequest(buildRequest());
+    compacting = true;
+    try {
+      await compactConversation(compactDeps(request), { force: true });
+      emit({ type: "compaction", ok: true });
+    } catch (error) {
+      emit({ type: "compaction", ok: false, error: String((error as Error)?.message ?? error) });
+      throw error;
+    } finally {
+      compacting = false;
+    }
+  };
+
+  // 回合间隙压缩标志（2026-10-19 手动压缩入口）：回合内的工具经 requestCompact() 设置，driver 在本回合结束后执行
+  let pendingCompact = false;
 
   // 压力检查（设计 §5.2）：过阈触发压缩；失败仅告警不阻塞 Turn
   const maybeCompact = async (request: LlmRequest): Promise<boolean> => {
@@ -395,6 +415,16 @@ export function createAgent(config: AgentConfig): Agent {
             // 尽力而为
           }
         }
+        // 回合间隙（2026-10-19 手动压缩入口）：工具请求的压缩在这里执行——turn/end 已落、日志稳定，
+        // status 仍为 running，不与 compact() 的 idle 前置冲突；错误已 emit（compaction ok:false），驱动照常存活
+        if (pendingCompact) {
+          pendingCompact = false;
+          try {
+            await runManualCompact();
+          } catch {
+            // 见上：驱动不因手动压缩失败死亡
+          }
+        }
       }
     } finally {
       status = "idle";
@@ -448,17 +478,15 @@ export function createAgent(config: AgentConfig): Agent {
         throw new Error("compact() requires idle（设计 §12：无 maintenance phase）");
       }
       if (compacting) throw new Error("compaction already in progress");
-      const request = applyOnRequest(buildRequest());
-      compacting = true;
-      try {
-        await compactConversation(compactDeps(request), { force: true });
-        emit({ type: "compaction", ok: true });
-      } catch (error) {
-        emit({ type: "compaction", ok: false, error: String((error as Error)?.message ?? error) });
-        throw error;
-      } finally {
-        compacting = false;
+      await runManualCompact();
+    },
+    requestCompact(): void {
+      if (status === "idle") {
+        // 空闲时直接执行（工具路径只在 running 时被调，这里兜住外部直接调用）；错误已 emit，不外抛
+        void runManualCompact().catch(() => undefined);
+        return;
       }
+      pendingCompact = true;
     },
     subscribe(cb: (event: AgentLiveEvent) => void): () => void {
       listeners.add(cb);

@@ -129,6 +129,8 @@ export interface SessionEventLoose {
   code?: string;
   content?: BlockLoose[];
   reason?: string;
+  /** request/header 事件：本回合实际请求的模型 id（2026-10-19 模型身份可见性） */
+  model?: string;
 }
 
 /** AgentLiveEvent 的宽松视图（SSE 载荷） */
@@ -144,6 +146,8 @@ export interface LiveEventLoose {
   code?: string;
   reason?: string;
   error?: string;
+  /** compaction 事件：压缩结果（2026-10-19 手动压缩入口，含自动压缩完成提示） */
+  ok?: boolean;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -213,6 +217,8 @@ export const api = {
     request<ConversationEntry>("/api/conversations", { method: "POST", body: JSON.stringify(title ? { title } : {}) }),
   deleteConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}`, { method: "DELETE" }),
   autoTitle: (cid: string) => request<{ ok: boolean; title?: string }>(`/api/conversations/${cid}/title`, { method: "POST" }),
+  /** 手动压缩（2026-10-19）：要求会话空闲；错误带可读文案（太短 / AI 回复中） */
+  compactConversation: (cid: string) => request<{ ok: boolean }>(`/api/conversations/${cid}/compact`, { method: "POST" }),
   /** 分段加载（2026-09-23）：limit = 最近 N 条；before = seq 游标（取更早一段）；都不传 = 全量 */
   conversationEvents: (cid: string, options?: { before?: number; limit?: number }): Promise<SessionEventLoose[]> => {
     const params = new URLSearchParams();

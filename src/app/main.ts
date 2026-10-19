@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     const agent = await conversations.agent(uidRun, feed.id);
     conversations.clearTurnThinking(uidRun, feed.id); // 任务触发不吃 web 端残留的回合思考开关
     const trigger = taskTriggerMessage(task, run, Date.now());
-    agent.followup(trigger, conversations.taskFeedContext(uidRun, trigger));
+    agent.followup(trigger, await conversations.taskFeedContext(uidRun, feed.id, trigger));
     await agent.whenIdle();
     const events = agent.sessionLog.readAll();
     const last = [...events].reverse().find((e) => e.type === "assistant/message");

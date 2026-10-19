@@ -207,4 +207,4 @@ Agent = {
 3. Turn Budget 默认 32——dsh 无上限，我们加了一道可关闭的库级保险；
 4. 无审批/沙箱/写意图门/subagent（ADR 0006 回访条件）；
 5. 适配器只做 OpenAI 兼容一种（dsh 有 deepseek/pi-ai 多厂商 adapter；我们以 OpenAI 兼容一词覆盖主流）；
-6. 无 maintenance phase 独立态——手动压缩直接要求 idle（简化，可后补）。
+6. 无 maintenance phase 独立态——手动压缩两条路径：`compact()` 直接要求 idle；`requestCompact()`（2026-10-19 后补）在 running 时设置标志、由 driver 在本回合结束后的间隙执行（turn/end 已落、日志稳定，仍非独立 maintenance 状态机）。
