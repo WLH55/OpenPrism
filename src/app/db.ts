@@ -120,13 +120,19 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS idx_agents_uid ON agents(uid);
 
 CREATE TABLE IF NOT EXISTS skills (
-  id          TEXT PRIMARY KEY,
-  uid         TEXT NOT NULL,
-  name        TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  when_to_use TEXT,
-  body_md     TEXT NOT NULL DEFAULT '',
-  created_ts  INTEGER NOT NULL
+  id            TEXT PRIMARY KEY,
+  uid           TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  description   TEXT NOT NULL DEFAULT '',
+  when_to_use   TEXT,
+  body_md       TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready','installing','failed')),
+  version       TEXT,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  image_tag     TEXT,
+  pkg_sha       TEXT,
+  install_error TEXT,
+  created_ts    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_skills_uid ON skills(uid);
 
@@ -490,6 +496,13 @@ export function openDb(dbPath: string): DatabaseSync {
   // 存最近入站消息的 token 供主动推送复用
   ensureColumn(db, "wechat_binds", "last_context_token", "TEXT");
   ensureColumn(db, "wechat_binds", "last_msg_ts", "INTEGER");
+  // 技能安装态（2026-10-21 技能系统 Docker 沙箱化）：存量粘贴技能默认 ready+enabled；image_tag 为空 = 无脚本执行面
+  ensureColumn(db, "skills", "status", "TEXT NOT NULL DEFAULT 'ready'");
+  ensureColumn(db, "skills", "version", "TEXT");
+  ensureColumn(db, "skills", "enabled", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(db, "skills", "image_tag", "TEXT");
+  ensureColumn(db, "skills", "pkg_sha", "TEXT");
+  ensureColumn(db, "skills", "install_error", "TEXT");
   migrateTaskFeedCid(db); // 提醒会话 cid 补 uid（存量改名，幂等，2026-09-30）
   // REPLACE 而非 IGNORE：schema_version 声明「当前 schema 版本」，升级（如 v2 删遗留表）后跟随代码刷新
   db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));

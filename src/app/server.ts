@@ -34,6 +34,12 @@ import { parseAttachments } from "./attachments";
 import { faceOf, readUserTz, updateUserFace, updateUserTz, validateTzOffsetMinutes, type UserRecord } from "./auth";
 import type { AgentStore, AgentBinding } from "./agents";
 import type { SkillStore } from "./skills";
+import { safeRelPath } from "./skills";
+import type { SkillFilesIO, } from "./skillpkg";
+import { removePackageFiles } from "./skillpkg";
+import type { SkillInstaller } from "./skillinstall";
+import type { DockerClient } from "./skilldocker";
+import Busboy from "busboy";
 import type { McpRegistry } from "./mcp";
 import { MEMORY_KINDS, MEMORY_STATUSES, type MemoryItem, type MemoryKind, type MemoryStatus, type MemoryStore } from "./memory";
 import type { MemoryExtractor } from "./memory-extract";
@@ -82,6 +88,12 @@ export interface ServerDeps {
   wechat?: WechatBridge;
   /** 今天页自定义卡片（2026-10-12 工作台化一期）：REST CRUD；缺省 = 未装配（相关路由 404） */
   widgets?: import("./widgets").WidgetStore;
+  /** 技能安装流水线（2026-10-21 Docker 沙箱化）；缺省 = 安装相关路由 503 */
+  skillInstaller?: SkillInstaller;
+  /** 技能包文件访问（files/file 路由）；缺省 503 */
+  skillFiles?: SkillFilesIO;
+  /** 卸载清理面（镜像 + 包文件）；缺省 = 仅删行 */
+  skillUninstall?: { docker: DockerClient; filesRoot: string };
   staticDir?: string;
 }
 
@@ -113,6 +125,39 @@ async function readBody(req: IncomingMessage, limit: number = BODY_LIMIT): Promi
   }
   if (chunks.length === 0) return {};
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+/** ZIP 上传（multipart/form-data，busboy 解析；单文件 ≤512MiB 与包总量上限对齐） */
+function readZipUpload(req: IncomingMessage): Promise<{ fileName: string; bytes: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 512 * 1024 * 1024 } });
+    let settled = false;
+    bb.on("file", (_field, stream, info) => {
+      const chunks: Buffer[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+      stream.on("limit", () => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("ZIP 超过 512MiB 上限"));
+      });
+      stream.on("end", () => {
+        if (settled) return;
+        settled = true;
+        resolve({ fileName: info.filename || "package.zip", bytes: Buffer.concat(chunks) });
+      });
+    });
+    bb.on("error", (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    bb.on("close", () => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("multipart 里没有文件（需要 file 字段携带 .zip）"));
+    });
+    req.pipe(bb);
+  });
 }
 
 function cookieToken(req: IncomingMessage): string | undefined {
@@ -864,14 +909,120 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       return sendError(res, 400, String((error as Error).message));
     }
   }
+  // 安装入口必须放在 /api/skills/:id 匹配之前（"install"/"install-zip" 会被当成 sid）
+  if (path === "/api/skills/install" && method === "POST") {
+    if (!deps.skillInstaller) return sendError(res, 503, "技能安装未配置（服务器无 Docker 环境或未装配）");
+    const body = (await readBody(req)) as { source?: string };
+    const source = String(body.source ?? "").trim();
+    if (source === "") return sendError(res, 400, "source 不能为空");
+    try {
+      return sendJson(res, 202, await deps.skillInstaller.installFromUrl(uid, source));
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  if (path === "/api/skills/install-zip" && method === "POST") {
+    if (!deps.skillInstaller) return sendError(res, 503, "技能安装未配置（服务器无 Docker 环境或未装配）");
+    try {
+      const upload = await readZipUpload(req);
+      return sendJson(res, 202, await deps.skillInstaller.installFromZip(uid, upload.fileName, upload.bytes));
+    } catch (error) {
+      return sendError(res, 400, String((error as Error).message));
+    }
+  }
+  // 产物下载（ref 是 sha256 内容寻址；技能归属校验同会话事件口径）
+  const artifactMatch = /^\/api\/skills\/([^/]+)\/artifacts\/([0-9a-f]{64})$/.exec(path);
+  if (artifactMatch && method === "GET") {
+    const sid = decodeURIComponent(artifactMatch[1]!);
+    const has = (await deps.skills.list(uid)).some((s) => s.id === sid);
+    if (!has) return sendError(res, 404, "技能不存在");
+    const blob = deps.db.prepare("SELECT media_type, data FROM conversation_blobs WHERE ref = ?").get(artifactMatch[2]!) as
+      | { media_type: string; data: Uint8Array }
+      | undefined;
+    if (!blob) return sendError(res, 404, "产物不存在");
+    res.writeHead(200, {
+      "Content-Type": blob.media_type,
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(artifactMatch[2]!)}`,
+      "Cache-Control": "private, max-age=31536000, immutable",
+    });
+    res.end(Buffer.from(blob.data));
+    return;
+  }
   const skillMatch = /^\/api\/skills\/([^/]+)(\/[^/]*)?$/.exec(path);
   if (skillMatch) {
     const sid = decodeURIComponent(skillMatch[1]!);
     const sub = skillMatch[2] ?? "";
     try {
       if (sub === "/body" && method === "GET") return sendJson(res, 200, { body: await deps.skills.body(uid, sid) });
+      if (sub === "/install-events" && method === "GET") {
+        const row = (await deps.skills.list(uid)).find((s) => s.id === sid);
+        if (!row) return sendError(res, 404, "技能不存在");
+        if (!deps.skillInstaller) return sendError(res, 503, "技能安装未配置");
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+        const send = (data: unknown): void => {
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        };
+        // 服务重启后内存进度已丢：行是终态且无历史事件时合成一条再收流
+        if (row.status !== "installing" && !deps.skillInstaller.hasProgress(uid, sid)) {
+          send(
+            row.status === "ready"
+              ? { percent: 100, phase: "done", message: "已安装" }
+              : { percent: 100, phase: "failed", error: row.installError ?? "安装失败" },
+          );
+          res.end();
+          return;
+        }
+        for await (const progress of deps.skillInstaller.progressStream(uid, sid)) {
+          send(progress);
+          if (progress.phase === "done" || progress.phase === "failed") break;
+        }
+        res.end();
+        return;
+      }
+      if (sub === "/retry" && method === "POST") {
+        if (!deps.skillInstaller) return sendError(res, 503, "技能安装未配置");
+        const row = (await deps.skills.list(uid)).find((s) => s.id === sid);
+        if (!row) return sendError(res, 404, "技能不存在");
+        if (row.status === "installing") return sendError(res, 409, "该技能正在安装中");
+        return sendJson(res, 202, await deps.skillInstaller.retry(uid, sid));
+      }
+      if (sub === "/enable" && method === "POST") {
+        const body = (await readBody(req)) as { enabled?: boolean };
+        const has = (await deps.skills.list(uid)).some((s) => s.id === sid);
+        if (!has) return sendError(res, 404, "技能不存在");
+        deps.skills.setEnabled(uid, sid, body.enabled !== false);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/files" && method === "GET") {
+        if (!deps.skillFiles) return sendError(res, 503, "技能文件访问未配置");
+        const has = (await deps.skills.list(uid)).some((s) => s.id === sid);
+        if (!has) return sendError(res, 404, "技能不存在");
+        return sendJson(res, 200, { files: deps.skillFiles.list(uid, sid) });
+      }
+      if (sub === "/file" && method === "GET") {
+        if (!deps.skillFiles) return sendError(res, 503, "技能文件访问未配置");
+        const has = (await deps.skills.list(uid)).some((s) => s.id === sid);
+        if (!has) return sendError(res, 404, "技能不存在");
+        let wanted: string;
+        try {
+          wanted = safeRelPath(new URL(req.url ?? "/", "http://localhost").searchParams.get("path") ?? "");
+        } catch {
+          return sendError(res, 400, "文件路径不安全");
+        }
+        // 成员校验（验收 B1）：必须在包文件清单内，双重防目录穿越
+        if (!deps.skillFiles.list(uid, sid).includes(wanted)) {
+          return sendError(res, 400, "文件不在该技能包里");
+        }
+        return sendJson(res, 200, { content: deps.skillFiles.read(uid, sid, wanted) });
+      }
       if (sub === "" && method === "DELETE") {
+        // 卸载：删行 + 尽力清理镜像与包文件
+        const row = (await deps.skills.list(uid)).find((s) => s.id === sid);
         await deps.skills.remove(uid, sid);
+        if (deps.skillUninstall && row) {
+          if (row.imageTag) await deps.skillUninstall.docker.removeImage(row.imageTag);
+          removePackageFiles(deps.skillUninstall.filesRoot, uid, sid);
+        }
         return sendJson(res, 200, { ok: true });
       }
     } catch (error) {

@@ -119,6 +119,8 @@ function makeFixture(script: MockScriptStep[], opts?: { multimodal?: boolean }) 
       now: NOW,
       agents,
       skills,
+      // 技能包文件访问面（测试注入空实现：这些用例不触包文件）
+      skillFiles: { list: () => [], read: () => { throw new Error("测试不读包文件"); } },
       mcps,
       memory,
       tasks,

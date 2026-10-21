@@ -309,6 +309,20 @@ export interface SkillLoose {
   name: string;
   description: string;
   whenToUse?: string;
+  /** 安装态（2026-10-21 Docker 沙箱化）；粘贴安装缺省视为 ready */
+  status?: "ready" | "installing" | "failed";
+  version?: string;
+  enabled?: boolean;
+  imageTag?: string;
+  installError?: string;
+}
+
+/** 安装进度事件（SSE install-events） */
+export interface InstallProgressLoose {
+  percent: number;
+  phase: string;
+  message?: string;
+  error?: string;
 }
 export interface McpLoose {
   id: string;
@@ -335,6 +349,40 @@ export const api2 = {
 
   listSkills: () => request<SkillLoose[]>("/api/skills"),
   installSkill: (content: string) => request<SkillLoose>("/api/skills", { method: "POST", body: JSON.stringify({ content }) }),
+  installSkillFromUrl: (source: string) => request<{ id: string }>("/api/skills/install", { method: "POST", body: JSON.stringify({ source }) }),
+  /** multipart 上传（不能走 JSON request：Content-Type 由浏览器按 FormData 生成） */
+  installSkillZip: async (file: File): Promise<{ id: string }> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const res = await fetch("/api/skills/install-zip", { method: "POST", body: form });
+    if (!res.ok) {
+      let error = `HTTP ${res.status}`;
+      try {
+        error = ((await res.json()) as { error?: string }).error ?? error;
+      } catch {
+        /* 保持状态码文案 */
+      }
+      throw new Error(error);
+    }
+    return (await res.json()) as { id: string };
+  },
+  retrySkillInstall: (id: string) => request<{ id: string }>(`/api/skills/${id}/retry`, { method: "POST" }),
+  setSkillEnabled: (id: string, enabled: boolean) =>
+    request<{ ok: boolean }>(`/api/skills/${id}/enable`, { method: "POST", body: JSON.stringify({ enabled }) }),
+  skillFiles: (id: string) => request<{ files: string[] }>(`/api/skills/${id}/files`),
+  skillFile: (id: string, path: string) => request<{ content: string }>(`/api/skills/${id}/file?path=${encodeURIComponent(path)}`),
+  /** 安装进度 SSE；返回关闭函数 */
+  openSkillInstallEvents: (id: string, onEvent: (event: InstallProgressLoose) => void): (() => void) => {
+    const source = new EventSource(`/api/skills/${id}/install-events`);
+    source.onmessage = (message) => {
+      try {
+        onEvent(JSON.parse(message.data) as InstallProgressLoose);
+      } catch {
+        /* 坏帧忽略 */
+      }
+    };
+    return () => source.close();
+  },
   skillBody: (id: string) => request<{ body: string }>(`/api/skills/${id}/body`),
   deleteSkill: (id: string) => request<{ ok: boolean }>(`/api/skills/${id}`, { method: "DELETE" }),
 

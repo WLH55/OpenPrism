@@ -16,6 +16,9 @@ import { ConversationStore } from "./conversations";
 import { SqliteSessionLog } from "./session-log";
 import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
+import { DiskSkillFiles } from "./skillpkg";
+import { NodeDockerClient } from "./skilldocker";
+import { SkillInstaller } from "./skillinstall";
 import { McpRegistry } from "./mcp";
 import { MemoryStore } from "./memory";
 import { MemoryExtractor, migrateLegacyMemory, nightlyDue } from "./memory-extract";
@@ -116,6 +119,40 @@ async function main(): Promise<void> {
     log: (line) => process.stdout.write(`${line}\n`),
   });
 
+  // 技能沙箱三件套（2026-10-21 Docker 沙箱化）：docker 客户端、安装流水线、包文件/执行面
+  const skillsRoot = resolve(dataRoot, "skills");
+  const skillRunsRoot = resolve(dataRoot, "skill-runs");
+  await mkdir(skillRunsRoot, { recursive: true });
+  const skillFiles = new DiskSkillFiles(skillsRoot);
+  const docker = new NodeDockerClient();
+  const skillInstaller = new SkillInstaller({
+    env: nodeEnv,
+    store: skills,
+    docker,
+    filesRoot: skillsRoot,
+    randomUUID: () => nodeEnv.randomUUID(),
+    adapterFor: async (uid) => {
+      const config = await modelConfigFor(uid, null);
+      if (!config) throw new Error("该用户未配置模型，无法运行技能安装智能体");
+      return { adapter: adapterFactory(uid, null, config), model: config.model };
+    },
+    log: (line) => process.stdout.write(`${line}\n`),
+  });
+  skillInstaller.onBootRecover();
+  // 基础镜像就绪检查不阻塞启动：未装技能的服务器只需告警，装的时候会再拦
+  void docker
+    .ensureBaseImage()
+    .then(() => process.stdout.write("[openprism] 技能基础镜像就绪\n"))
+    .catch((error: Error) => process.stdout.write(`[openprism] ${error.message}\n`));
+  const saveSkillBlob = (ref: string, mediaType: string, bytes: Buffer): void => {
+    db.prepare("INSERT OR IGNORE INTO conversation_blobs (ref, media_type, data, created_ts) VALUES (?, ?, ?, ?)").run(
+      ref,
+      mediaType,
+      bytes,
+      Date.now(),
+    );
+  };
+
   const conversations = new ConversationStore(
     {
       env: nodeEnv,
@@ -128,6 +165,9 @@ async function main(): Promise<void> {
       tzOffsetMinutes: (uid) => readUserTz(db, uid) ?? -new Date().getTimezoneOffset(),
       agents,
       skills,
+      // 技能包文件与沙箱执行面（2026-10-21 Docker 沙箱化）：data/skills 与 data/skill-runs
+      skillFiles,
+      skillExec: { docker, runsRoot: skillRunsRoot, saveBlob: saveSkillBlob },
       mcps,
       memory,
       memoryVector,
@@ -270,6 +310,9 @@ async function main(): Promise<void> {
     taskRunner,
     widgets,
     wechat, // 微信桥（2026-09-27）：IM 绑定路由
+    skillInstaller,
+    skillFiles,
+    skillUninstall: { docker, filesRoot: skillsRoot },
     ...(existsSync(staticDir) ? { staticDir } : {}),
   });
 

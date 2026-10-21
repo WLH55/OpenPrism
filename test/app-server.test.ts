@@ -114,6 +114,8 @@ beforeAll(async () => {
       tzOffsetMinutes: (uid) => readUserTz(db, uid) ?? -new Date().getTimezoneOffset(),
       agents,
       skills,
+      // 技能包文件访问面（测试注入空实现：技能路由用例走注入 fake）
+      skillFiles: { list: () => [], read: () => { throw new Error("测试不读包文件"); } },
       mcps,
       memory,
     },
@@ -1510,5 +1512,166 @@ describe("手动压缩路由（2026-10-19 手动压缩入口）", () => {
     const tooShort = await fetch(`${baseUrl}/api/conversations/${conv.id}/compact`, { method: "POST", headers: { cookie } });
     expect(tooShort.status).toBe(400);
     expect(((await tooShort.json()) as { error?: string }).error).toContain("会话还太短");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 技能安装与沙箱路由（2026-10-21 Docker 沙箱化）：独立 server 实例注入 fake 安装器
+
+describe("技能安装与沙箱路由（2026-10-21）", () => {
+  let sandboxUrl: string;
+  let sandboxServer: ReturnType<typeof createAppServer>;
+  let urlCalls: string[] = [];
+  let zipCalls: { fileName: string; bytes: Buffer }[] = [];
+  let retryCalls: string[] = [];
+  const eventsScript = new Map<string, { percent: number; phase: string; message?: string; error?: string }[]>();
+  let filesSid = ""; // 有包文件的技能行 id（用例里建行后回填）
+
+  beforeAll(async () => {
+    const fakeInstaller = {
+      installFromUrl: async (_uid: string, source: string) => {
+        urlCalls.push(source);
+        if (source === "bad") throw new Error("无法识别的来源");
+        return { id: "sk-url" };
+      },
+      installFromZip: async (_uid: string, fileName: string, bytes: Buffer) => {
+        zipCalls.push({ fileName, bytes });
+        return { id: "sk-zip" };
+      },
+      retry: async (_uid: string, sid: string) => {
+        retryCalls.push(sid);
+        return { id: sid };
+      },
+      progressStream: async function* (_uid: string, sid: string) {
+        for (const event of eventsScript.get(sid) ?? []) yield event;
+      },
+      hasProgress: (_uid: string, sid: string) => eventsScript.has(sid),
+      onBootRecover: () => undefined,
+    } as unknown as import("../src/app/skillinstall").SkillInstaller;
+    const fakeFiles = {
+      list: (_uid: string, sid: string) => (sid === filesSid ? ["scripts/a.py", "refs/x.md"] : []),
+      read: (_uid: string, sid: string, path: string) => {
+        if (sid === filesSid && path === "scripts/a.py") return "print(1)";
+        throw new Error(`文件 "${path}" 不在该技能包里`);
+      },
+    };
+    sandboxServer = createAppServer({ ...serverDeps, skillInstaller: fakeInstaller, skillFiles: fakeFiles });
+    await new Promise<void>((resolve) => sandboxServer.listen(0, "127.0.0.1", resolve));
+    sandboxUrl = `http://127.0.0.1:${(sandboxServer.address() as { port: number }).port}`;
+  });
+  afterAll(() => {
+    sandboxServer.close();
+  });
+
+  it("POST /api/skills/install：合法来源 202 带 id；非法来源 400；来源为空 400", async () => {
+    urlCalls = [];
+    const ok = await fetch(`${sandboxUrl}/api/skills/install`, { ...json({ source: "https://github.com/o/r" }), headers: { "Content-Type": "application/json", cookie } });
+    expect(ok.status).toBe(202);
+    expect(await ok.json()).toEqual({ id: "sk-url" });
+    expect(urlCalls).toEqual(["https://github.com/o/r"]);
+    const bad = await fetch(`${sandboxUrl}/api/skills/install`, { ...json({ source: "bad" }), headers: { "Content-Type": "application/json", cookie } });
+    expect(bad.status).toBe(400);
+    const empty = await fetch(`${sandboxUrl}/api/skills/install`, { ...json({}), headers: { "Content-Type": "application/json", cookie } });
+    expect(empty.status).toBe(400);
+  });
+
+  it("POST /api/skills/install-zip：multipart 的 zip 字节原样到达安装器", async () => {
+    zipCalls = [];
+    const { zipSync, strToU8 } = await import("fflate");
+    const zipBytes = Buffer.from(zipSync({ "SKILL.md": strToU8("---\nname: 装包\ndescription: d\n---\n正文") }));
+    const boundary = "----openprism-test";
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="pkg.zip"\r\nContent-Type: application/zip\r\n\r\n`),
+      zipBytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const res = await fetch(`${sandboxUrl}/api/skills/install-zip`, {
+      method: "POST",
+      headers: { cookie, "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body,
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ id: "sk-zip" });
+    expect(zipCalls).toHaveLength(1);
+    expect(zipCalls[0]!.fileName).toBe("pkg.zip");
+    expect(zipCalls[0]!.bytes.equals(zipBytes)).toBe(true);
+  });
+
+  it("GET /install-events：SSE 流进度到终态收尾；终态行且无历史时合成事件", async () => {
+    // 通过粘贴路由建行（ready 终态、无历史事件 → 合成 done）
+    const created = await fetch(`${sandboxUrl}/api/skills`, { ...json({ content: "---\nname: 事件技能\ndescription: d\n---\n正文" }), headers: { "Content-Type": "application/json", cookie } });
+    const meta = (await created.json()) as { id: string };
+    const res = await fetch(`${sandboxUrl}/api/skills/${meta.id}/install-events`, { headers: { cookie } });
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const text = await res.text();
+    expect(text).toContain(`"phase":"done"`);
+  });
+
+  it("POST /retry：failed 行 202 并调安装器；installing 行 409；未知行 404", async () => {
+    retryCalls = [];
+    const uidRow = db.prepare("SELECT uid FROM users WHERE username = 'lathan'").get() as { uid: string };
+    const failed = await serverDeps.skills.createFromPackage(uidRow.uid, { name: "重试技能", description: "d", pkgSha: "p", bodyMd: "---\nname: 重试技能\ndescription: d\n---\n正文" });
+    serverDeps.skills.markFailed(uidRow.uid, failed.id, "上一轮失败");
+    const ok = await fetch(`${sandboxUrl}/api/skills/${failed.id}/retry`, { method: "POST", headers: { cookie } });
+    expect(ok.status).toBe(202);
+    expect(retryCalls).toEqual([failed.id]);
+
+    const installing = await serverDeps.skills.createFromPackage(uidRow.uid, { name: "进行中技能", description: "d", pkgSha: "p", bodyMd: "---\nname: 进行中技能\ndescription: d\n---\n正文" });
+    const busy = await fetch(`${sandboxUrl}/api/skills/${installing.id}/retry`, { method: "POST", headers: { cookie } });
+    expect(busy.status).toBe(409);
+
+    const unknown = await fetch(`${sandboxUrl}/api/skills/nope/retry`, { method: "POST", headers: { cookie } });
+    expect(unknown.status).toBe(404);
+  });
+
+  it("POST /enable：切换后列表反映；GET files/file 读取包文件；越权 404", async () => {
+    const created = await fetch(`${sandboxUrl}/api/skills`, { ...json({ content: "---\nname: 开关技能\ndescription: d\n---\n正文" }), headers: { "Content-Type": "application/json", cookie } });
+    const meta = (await created.json()) as { id: string };
+    const off = await fetch(`${sandboxUrl}/api/skills/${meta.id}/enable`, { ...json({ enabled: false }), headers: { "Content-Type": "application/json", cookie } });
+    expect(off.status).toBe(200);
+    const list = (await (await fetch(`${sandboxUrl}/api/skills`, { headers: { cookie } })).json()) as { id: string; enabled?: boolean }[];
+    expect(list.find((s) => s.id === meta.id)!.enabled).toBe(false);
+
+    const uidRow = db.prepare("SELECT uid FROM users WHERE username = 'lathan'").get() as { uid: string };
+    const withFiles = await serverDeps.skills.create(uidRow.uid, "---\nname: 文件技能\ndescription: d\n---\n正文");
+    filesSid = withFiles.id;
+    const files = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/files`, { headers: { cookie } });
+    expect(files.status).toBe(200);
+    expect(await files.json()).toEqual({ files: ["scripts/a.py", "refs/x.md"] });
+    const one = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/file?path=scripts/a.py`, { headers: { cookie } });
+    expect(await one.json()).toEqual({ content: "print(1)" });
+    // 目录穿越拒绝（验收 B1）：路径安全 + 包内成员双重校验
+    const escape1 = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/file?path=${encodeURIComponent("../../../../etc/passwd")}`, { headers: { cookie } });
+    expect(escape1.status).toBe(400);
+    const escape2 = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/file?path=${encodeURIComponent("/etc/passwd")}`, { headers: { cookie } });
+    expect(escape2.status).toBe(400);
+    const notInPackage = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/file?path=nope.txt`, { headers: { cookie } });
+    expect(notInPackage.status).toBe(400);
+
+    const reg = await fetch(`${sandboxUrl}/api/auth/register`, json({ username: "skillother", password: "hunter2" }));
+    const otherCookie = reg.headers.get("set-cookie")!.split(";")[0]!;
+    const foreign = await fetch(`${sandboxUrl}/api/skills/${withFiles.id}/files`, { headers: { cookie: otherCookie } });
+    expect(foreign.status).toBe(404);
+  });
+
+  it("GET /artifacts/:ref：入库产物按类型下载；未知 ref 与越权 404", async () => {
+    const uidRow = db.prepare("SELECT uid FROM users WHERE username = 'lathan'").get() as { uid: string };
+    const owner = await serverDeps.skills.create(uidRow.uid, "---\nname: 产物技能\ndescription: d\n---\n正文");
+    const payload = Buffer.from("产物内容");
+    const ref = createHash("sha256").update(payload).digest("hex");
+    db.prepare("INSERT OR IGNORE INTO conversation_blobs (ref, media_type, data, created_ts) VALUES (?, ?, ?, ?)").run(ref, "text/plain", payload, 1);
+    const res = await fetch(`${sandboxUrl}/api/skills/${owner.id}/artifacts/${ref}`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/plain");
+    expect(Buffer.from(await res.arrayBuffer()).toString()).toBe("产物内容");
+
+    const missing = await fetch(`${sandboxUrl}/api/skills/${owner.id}/artifacts/${"0".repeat(64)}`, { headers: { cookie } });
+    expect(missing.status).toBe(404);
+
+    // 异账号 sid：他人技能 id + 已知 ref → 404（验收 N5）
+    const reg2 = await fetch(`${sandboxUrl}/api/auth/register`, json({ username: "artifactother", password: "hunter2" }));
+    const otherCookie2 = reg2.headers.get("set-cookie")!.split(";")[0]!;
+    const foreignSid = await fetch(`${sandboxUrl}/api/skills/${owner.id}/artifacts/${ref}`, { headers: { cookie: otherCookie2 } });
+    expect(foreignSid.status).toBe(404);
   });
 });

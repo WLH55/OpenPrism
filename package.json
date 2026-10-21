@@ -13,8 +13,12 @@
     "start": "tsx src/app/main.ts"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.5",
     "@types/node": "^26.4.1",
+    "busboy": "^1.6.0",
+    "fflate": "^0.8.3",
     "sharp": "^0.35.4",
+    "tar-stream": "^3.2.2",
     "tsx": "^4.23.13",
     "typescript": "^5.7.2",
     "undici": "^8.11.2",

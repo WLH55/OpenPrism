@@ -374,6 +374,13 @@ function Shell({ me, onFaceSaved, onLogout }: { me: MeLoose; onFaceSaved: (next:
     return list;
   }, []);
 
+  // 技能卡片「使用」→ 预填 /技能名 并跳回对话（2026-10-21 技能系统）
+  useEffect(() => {
+    const goChat = (): void => setView("chat");
+    window.addEventListener("op-go-chat", goChat);
+    return () => window.removeEventListener("op-go-chat", goChat);
+  }, []);
+
   useEffect(() => {
     // 确保至少一个会话并选中最近——集中在壳子做，避免页面各自挂载时竞态建空会话
     void (async () => {

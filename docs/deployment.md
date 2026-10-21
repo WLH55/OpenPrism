@@ -77,6 +77,29 @@ NO_PROXY=localhost,127.0.0.1,192.168.0.0/16
 - **反向代理 + HTTPS**：有域名时用 Caddy（自动申请续期证书）或 Nginx + certbot 挂在 8787 前面；此时浏览器获得安全上下文，主屏幕快捷方式自动升级为完整安装（独立窗口、离线缓存生效）。
 - 口令用长随机串；定期备份；不再使用时关掉端口映射。
 
+## 技能沙箱基础镜像（Docker）
+
+技能安装与脚本执行依赖 Docker 容器（spec: 2026-10-21_11-23_技能系统Docker沙箱化）。服务器需安装 Docker，并一次性构建基础镜像：
+
+```bash
+# 1. 安装 Docker（以 Debian/Ubuntu 为例；已有则跳过）
+curl -fsSL https://get.docker.com | sh
+
+# 2. 首次拉取基础镜像如遇 Docker Hub 超时，配置镜像加速后重启
+#    /etc/docker/daemon.json: {"registry-mirrors": ["https://mirror.ccs.tencentyun.com"]}
+systemctl restart docker
+
+# 3. 构建技能基础镜像（含 python3.12 + node22 + uv + poppler/ffmpeg/imagemagick，腾讯源加速）
+docker build -t openprism-skill-base:1 -f deploy/skill-base.Dockerfile deploy/
+
+# 4. 验证
+docker images openprism-skill-base
+```
+
+- OpenPrism 服务需要能免 sudo 调用 docker（root 运行天然满足；非 root 用户把服务用户加入 docker 组）。
+- 技能安装时自动从基础镜像起临时容器装依赖，完成后 `docker commit` 出每技能专属镜像（层共享，磁盘成本低）；脚本执行时每次 `docker run --rm` 独立短命容器，跑完即销毁。
+- 升级基础镜像内容：改 `deploy/skill-base.Dockerfile` 后用新 tag 重新构建（如 `:2`），已装技能继续用旧镜像不受影响。
+
 ## 备份与升级
 
 ```bash
