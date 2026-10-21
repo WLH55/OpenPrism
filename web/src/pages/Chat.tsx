@@ -146,14 +146,18 @@ export function Chat({
     }
   };
   const [pickerOpen, setPickerOpen] = useState(false);
-  // /技能名 自动补全（2026-10-21 手动调用）：敲 / 弹已装可用技能，点选或回车补全
+  // /技能名 自动补全（2026-10-21 手动调用；同日绑定裁决收口）：只弹当前伙伴绑定的可用技能——绑定才可见可用
   const [slashSkills, setSlashSkills] = useState<SkillLoose[]>([]);
   const [slashActive, setSlashActive] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const slashQuery = /^\/([^\s]*)$/.exec(input);
+  // 绑定才可见：当前伙伴绑定集内且名称匹配的可用技能（2026-10-21 绑定裁决，与目录层同口径）
+  const boundSkillIds = new Set(agents.find((a) => a.id === currentAgentId)?.binding.skills ?? []);
   const slashMatches =
     slashQuery && !slashDismissed
-      ? slashSkills.filter((s) => s.name.toLowerCase().includes(slashQuery[1]!.toLowerCase())).slice(0, 6)
+      ? slashSkills
+          .filter((s) => boundSkillIds.has(s.id) && s.name.toLowerCase().includes(slashQuery[1]!.toLowerCase()))
+          .slice(0, 6)
       : [];
   const slashIndex = Math.min(slashActive, Math.max(slashMatches.length - 1, 0));
   // 窄屏「会话设置」面板（模型 / 思维链 / 切换伙伴收进来；桌面这三件在头部一行摆开）
@@ -277,9 +281,14 @@ export function Chat({
       .catch(() => undefined);
   }, []);
 
-  // 首次敲 / 时拉一次可用技能列表（ready 且启用；之后缓存）
+  // 首次敲 / 时拉一次可用技能列表（ready 且启用；之后缓存），同时刷新伙伴列表——
+  // 绑定集从最新伙伴数据现算（绑定可能在伙伴页改过），过滤在渲染处按当前会话伙伴算
   useEffect(() => {
     if (input.startsWith("/") && slashSkills.length === 0) {
+      void api2
+        .listAgents()
+        .then(setAgents)
+        .catch(() => undefined);
       void api2
         .listSkills()
         .then((all) => setSlashSkills(all.filter((s) => (s.status ?? "ready") === "ready" && (s.enabled ?? true))))

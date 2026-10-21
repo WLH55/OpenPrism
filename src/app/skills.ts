@@ -76,13 +76,18 @@ export class SkillStore {
     return rows.map(rowToMeta);
   }
 
+  /** 同步取该用户全部 ready 且启用的技能（/技能名 点名裁决与目录层共用口径） */
+  visibleSync(uid: string): SkillMeta[] {
+    const rows = this.deps.db
+      .prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE uid = ? AND status = 'ready' AND enabled = 1 ORDER BY created_ts, id`)
+      .all(uid) as unknown as SkillRow[];
+    return rows.map(rowToMeta);
+  }
+
   /** 同步取绑定技能的目录层（systemPrompt 每步重取；只透出 ready 且启用的；ids 为空数组返回空） */
   listSync(uid: string, ids: string[]): SkillMeta[] {
     if (ids.length === 0) return [];
-    const all = this.deps.db
-      .prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE uid = ? AND status = 'ready' AND enabled = 1 ORDER BY created_ts, id`)
-      .all(uid) as unknown as SkillRow[];
-    return all.map(rowToMeta).filter((meta) => ids.includes(meta.id));
+    return this.visibleSync(uid).filter((meta) => ids.includes(meta.id));
   }
 
   async create(uid: string, content: string): Promise<SkillMeta> {
@@ -208,7 +213,13 @@ export function safeRelPath(path: string): string {
   return path;
 }
 
-export function createLoadSkillTool(deps: { store: SkillStore; uid: string; files: SkillFilesIO }): ToolDefinition {
+export function createLoadSkillTool(deps: {
+  store: SkillStore;
+  uid: string;
+  files: SkillFilesIO;
+  /** 装配期伙伴绑定的技能 id 集：未绑定就绪技能在此拒绝（绑定才可用，2026-10-21） */
+  allowedSkillIds: ReadonlySet<string>;
+}): ToolDefinition {
   return {
     name: "load_skill",
     description: "载入某个已安装技能的完整内容（目录只给了摘要，正文用这个工具拿）；返回正文与捆绑文件清单。",
@@ -233,6 +244,7 @@ export function createLoadSkillTool(deps: { store: SkillStore; uid: string; file
       const metas = await deps.store.list(deps.uid);
       const hit = metas.find((m) => m.name === name);
       if (!hit) throw new Error(`技能 "${name}" 未安装`);
+      if (!deps.allowedSkillIds.has(hit.id)) throw new Error(`技能 "${name}" 未绑定到当前伙伴：请让用户先在伙伴设置里绑定该技能`);
       if (!skillVisible(hit)) {
         const reason = hit.status === "installing" ? "正在安装" : hit.status === "failed" ? "安装失败" : "已停用";
         throw new Error(`技能 "${name}" 当前不可用（${reason}）`);
@@ -249,7 +261,13 @@ export function createLoadSkillTool(deps: { store: SkillStore; uid: string; file
 /** 单文件读取上限（字符）：捆绑文件是给模型读的参考内容，超限就地报错 */
 export const SKILL_FILE_MAX_CHARS = 200_000;
 
-export function createReadSkillFileTool(deps: { store: SkillStore; uid: string; files: SkillFilesIO }): ToolDefinition {
+export function createReadSkillFileTool(deps: {
+  store: SkillStore;
+  uid: string;
+  files: SkillFilesIO;
+  /** 装配期伙伴绑定的技能 id 集：与 load_skill 同一裁决（绑定才可用，2026-10-21） */
+  allowedSkillIds: ReadonlySet<string>;
+}): ToolDefinition {
   return {
     name: "read_skill_file",
     description:
@@ -276,6 +294,7 @@ export function createReadSkillFileTool(deps: { store: SkillStore; uid: string; 
       const metas = await deps.store.list(deps.uid);
       const hit = metas.find((m) => m.name === skillName);
       if (!hit) throw new Error(`技能 "${skillName}" 未安装`);
+      if (!deps.allowedSkillIds.has(hit.id)) throw new Error(`技能 "${skillName}" 未绑定到当前伙伴`);
       if (!skillVisible(hit)) throw new Error(`技能 "${skillName}" 当前不可用`);
       const listed = deps.files.list(deps.uid, hit.id);
       if (!listed.includes(path)) throw new Error(`文件 "${path}" 不在该技能包里（可用文件见 load_skill 返回的 files）`);

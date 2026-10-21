@@ -78,8 +78,8 @@ describe("skillCatalogPrompt / load_skill", () => {
 
   it("load_skill：execute 返回正文；未知名抛错；exclusive", async () => {
     const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-9" });
-    await store.create("u1", SKILL_MD);
-    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}) });
+    const meta = await store.create("u1", SKILL_MD);
+    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}), allowedSkillIds: new Set([meta.id]) });
     const ctx = { signal: new AbortController().signal, env: nodeEnv };
     const value = (await tool.execute({ name: "健身复盘" }, ctx)) as { body: string };
     expect(value.body).toContain("健身复盘框架");
@@ -180,7 +180,7 @@ describe("SkillStore 安装态扩展", () => {
   it("load_skill 对非可见技能报不可用（含状态原因）", async () => {
     const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-e" });
     const meta = await store.createFromPackage("u1", { name: "压缩图片", description: "d", pkgSha: "p", bodyMd: PKG_MD });
-    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}) });
+    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}), allowedSkillIds: new Set([meta.id]) });
     const ctx = { signal: new AbortController().signal, env: nodeEnv };
     await expect(tool.execute({ name: "压缩图片" }, ctx)).rejects.toThrow(/不可用/);
     store.markReady("u1", meta.id, { imageTag: "t" });
@@ -218,7 +218,7 @@ describe("L3 捆绑文件读取", () => {
 
   it("load_skill 返回正文 + 捆绑文件树", async () => {
     const { store, sid } = await readySkillWithFiles();
-    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({ [sid]: FILES }) });
+    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({ [sid]: FILES }), allowedSkillIds: new Set([sid]) });
     const value = (await tool.execute({ name: "压缩图片" }, { signal: new AbortController().signal, env: nodeEnv })) as {
       body: string;
       files: string[];
@@ -229,8 +229,8 @@ describe("L3 捆绑文件读取", () => {
 
   it("粘贴技能无文件时 files 为空数组", async () => {
     const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => "sk-g" });
-    await store.create("u1", SKILL_MD);
-    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}) });
+    const pasted = await store.create("u1", SKILL_MD);
+    const tool = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}), allowedSkillIds: new Set([pasted.id]) });
     const value = (await tool.execute({ name: "健身复盘" }, { signal: new AbortController().signal, env: nodeEnv })) as {
       files: string[];
     };
@@ -239,7 +239,7 @@ describe("L3 捆绑文件读取", () => {
 
   it("read_skill_file：读捆绑文件；未安装/不可见/路径逃逸/不在包内分别报错", async () => {
     const { store, sid } = await readySkillWithFiles();
-    const tool = createReadSkillFileTool({ store, uid: "u1", files: filesIOOf({ [sid]: FILES }) });
+    const tool = createReadSkillFileTool({ store, uid: "u1", files: filesIOOf({ [sid]: FILES }), allowedSkillIds: new Set([sid]) });
     const ctx = { signal: new AbortController().signal, env: nodeEnv };
     const value = (await tool.execute({ skill_name: "压缩图片", path: "scripts/compress.py" }, ctx)) as {
       content: string;
@@ -250,5 +250,21 @@ describe("L3 捆绑文件读取", () => {
     await expect(tool.execute({ skill_name: "压缩图片", path: "/etc/passwd" }, ctx)).rejects.toThrow(/路径/);
     await expect(tool.execute({ skill_name: "压缩图片", path: "nope.txt" }, ctx)).rejects.toThrow(/不在/);
     expect(tool.isConcurrencySafe?.({})).toBeFalsy();
+  });
+
+  it("绑定裁决（2026-10-21）：未绑定到当前伙伴的 ready 技能，load_skill / read_skill_file 都拒绝", async () => {
+    let seq = 0;
+    const store = new SkillStore({ db: testDb(), now: () => 1, randomUUID: () => `sk-h${seq++}` });
+    const bound = await store.create("u1", SKILL_MD); // 健身复盘
+    const stray = await store.create("u1", PKG_MD); // 压缩图片：已安装可用但未绑定
+    const ctx = { signal: new AbortController().signal, env: nodeEnv };
+    const load = createLoadSkillTool({ store, uid: "u1", files: filesIOOf({}), allowedSkillIds: new Set([bound.id]) });
+    const read = createReadSkillFileTool({ store, uid: "u1", files: filesIOOf({}), allowedSkillIds: new Set([bound.id]) });
+    await expect(load.execute({ name: "压缩图片" }, ctx)).rejects.toThrow(/未绑定到当前伙伴/);
+    await expect(read.execute({ skill_name: "压缩图片", path: "x" }, ctx)).rejects.toThrow(/未绑定到当前伙伴/);
+    // 绑定内的照常可用
+    const value = (await load.execute({ name: "健身复盘" }, ctx)) as { body: string };
+    expect(value.body).toContain("健身复盘框架");
+    expect(stray.name).toBe("压缩图片");
   });
 });

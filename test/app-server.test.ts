@@ -1675,3 +1675,83 @@ describe("技能安装与沙箱路由（2026-10-21）", () => {
     expect(foreignSid.status).toBe(404);
   });
 });
+
+describe("技能绑定裁决与热更（2026-10-21）", () => {
+  let bindUrl: string;
+  let bindServer: ReturnType<typeof createAppServer>;
+  const toolSnapshots: string[][] = [];
+  let bindCid = "";
+  let bindAgentId = "";
+  let bindSkillId = "";
+
+  beforeAll(async () => {
+    // 独立 mock（fn 步循环取 tools 快照）：共享 server 的脚本是一次性序列，本组要跑多个回合
+    const step = (): import("../src/harness/llm/mock").MockScriptStep => ({
+      kind: "fn",
+      fn: async (request: import("../src/harness/llm/adapter").LlmRequest): Promise<import("../src/harness/llm/adapter").LlmResponse> => {
+        toolSnapshots.push((request.tools ?? []).map((t) => t.name));
+        return { message: { role: "assistant", content: [{ type: "text", text: "ok" }] } };
+      },
+    });
+    const mock = createMockLlmAdapter([step(), step(), step()]);
+    const conversations = new ConversationStore(
+      {
+        env: nodeEnv,
+        sessionLog: (key: string) => Promise.resolve(SqliteSessionLog.open(db, key, () => Date.now())),
+        ledgerFor,
+        modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
+        adapterFactory: () => mock.adapter as LlmAdapter,
+        now: () => Date.now(),
+        agents: serverDeps.agents,
+        skills: serverDeps.skills,
+        skillFiles: { list: () => [], read: () => { throw new Error("测试不读包文件"); } },
+        mcps: serverDeps.mcps,
+        memory: serverDeps.memory,
+      },
+      db,
+    );
+    bindServer = createAppServer({ ...serverDeps, conversations });
+    await new Promise<void>((resolve) => bindServer.listen(0, "127.0.0.1", resolve));
+    bindUrl = `http://127.0.0.1:${(bindServer.address() as { port: number }).port}`;
+
+    const uidRow = db.prepare("SELECT uid FROM users WHERE username = 'lathan'").get() as { uid: string };
+    const skill = await serverDeps.skills.create(uidRow.uid, "---\nname: 绑定测试技能\ndescription: d\n---\n正文");
+    bindSkillId = skill.id;
+    const agentRes = await fetch(`${bindUrl}/api/agents`, { ...json({ name: "绑定员", persona: "# p\n干。" }), headers: { "Content-Type": "application/json", cookie } });
+    const agent = (await agentRes.json()) as { id: string };
+    if (agentRes.status !== 200) throw new Error(`agent 创建失败 ${agentRes.status}: ${JSON.stringify(agent)}`);
+    bindAgentId = agent.id;
+    const conv = (await (await fetch(`${bindUrl}/api/conversations`, { ...json({}), headers: { "Content-Type": "application/json", cookie } })).json()) as { id: string };
+    bindCid = conv.id;
+    const switched = await fetch(`${bindUrl}/api/conversations/${bindCid}/agent`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ agentId: bindAgentId }),
+    });
+    if (switched.status !== 200) throw new Error(`切换伙伴失败 ${switched.status}`);
+  });
+  afterAll(() => {
+    bindServer.close();
+  });
+
+  async function sendAndSnapshot(): Promise<string[]> {
+    const before = toolSnapshots.length;
+    await fetch(`${bindUrl}/api/conversations/${bindCid}/messages`, { ...json({ text: "在吗" }), headers: { "Content-Type": "application/json", cookie } });
+    for (let i = 0; i < 120 && toolSnapshots.length === before; i++) await sleep(25);
+    return toolSnapshots[toolSnapshots.length - 1]!;
+  }
+
+  it("PUT /binding 绑技能后下一回合工具集热更：load_skill / read_skill_file 出现（会话池弃用）", async () => {
+    const before = await sendAndSnapshot();
+    expect(before).not.toContain("load_skill");
+    const bound = await fetch(`${bindUrl}/api/agents/${bindAgentId}/binding`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({ binding: { tools: [], skills: [bindSkillId], mcps: [] } }),
+    });
+    expect(bound.status).toBe(200);
+    const after = await sendAndSnapshot();
+    expect(after).toContain("load_skill");
+    expect(after).toContain("read_skill_file");
+  });
+});
