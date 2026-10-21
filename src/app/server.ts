@@ -892,6 +892,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
           return sendError(res, 400, "binding 需要 skills/mcps 数组");
         }
         await deps.agents.updateBinding(uid, aid, binding);
+        // 绑定驱动的工具集热更（2026-10-21 绑定裁决）：技能/MCP/工具开关都在装配期快照，改绑定后弃池重装配
+        deps.conversations.evictAgentConversations(uid, aid);
         return sendJson(res, 200, { ok: true });
       }
     } catch (error) {

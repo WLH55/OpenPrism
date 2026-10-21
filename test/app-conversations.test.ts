@@ -1011,6 +1011,8 @@ describe("技能沙箱执行面与 /技能名 钉住", () => {
     skillSetup: { image: boolean },
     extraDeps: Record<string, unknown>,
     bindExtraSkillNames: string[] = [],
+    unboundNames: string[] = [],
+    script?: import("../src/harness/llm/mock").MockScriptStep[],
   ): Promise<{
     store: ConversationStore;
     mock: ReturnType<typeof createMockLlmAdapter>;
@@ -1018,9 +1020,11 @@ describe("技能沙箱执行面与 /技能名 钉住", () => {
     send: (text: string) => Promise<void>;
   }> {
     const db = testDb();
-    const mock = createMockLlmAdapter([
-      { kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) },
-    ]);
+    const mock = createMockLlmAdapter(
+      script ?? [
+        { kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) },
+      ],
+    );
     const deps = makeDeps(db, mock.adapter as LlmAdapter);
     let skillId: string;
     if (skillSetup.image) {
@@ -1036,6 +1040,10 @@ describe("技能沙箱执行面与 /技能名 钉住", () => {
     for (const name of bindExtraSkillNames) {
       const extra = await deps.skills.create(UID, `---\nname: ${name}\ndescription: 附加技能\n---\n正文`);
       extraIds.push(extra.id);
+    }
+    // 已安装可用、但不在伙伴绑定里的技能（绑定裁决用例的靶子）
+    for (const name of unboundNames) {
+      await deps.skills.create(UID, `---\nname: ${name}\ndescription: 未绑定技能\n---\n正文`);
     }
     const agent = await deps.agents.create(UID, {
       persona: "# 助手\n干活。",
@@ -1090,5 +1098,43 @@ describe("技能沙箱执行面与 /技能名 钉住", () => {
     const reserved = await convWithSkill({ image: true }, {}, ["compact"]);
     await reserved.send("/compact");
     expect(JSON.stringify(reserved.mock.requests[0]!.messages)).not.toContain("技能钉住");
+  });
+
+  it("绑定裁决（2026-10-21）：/已安装未绑定技能 → 注入提示行告知用户先绑定，不注入钉住", async () => {
+    const hinted = await convWithSkill({ image: false }, {}, [], ["外部技能"]);
+    await hinted.send("/外部技能 跑一下");
+    const wire = JSON.stringify(hinted.mock.requests[0]!.messages);
+    expect(wire).toContain("未绑定到当前伙伴");
+    expect(wire).not.toContain("技能钉住");
+  });
+
+  it("绑定裁决（2026-10-21）：模型点名载入未绑定技能 → 工具报错未绑定（装配传入绑定集）", async () => {
+    let calls = 0;
+    const rejected = await convWithSkill(
+      { image: false },
+      {},
+      [],
+      ["外部技能"],
+      [
+        {
+          kind: "fn",
+          fn: async () => {
+            calls += 1;
+            if (calls === 1) {
+              return {
+                message: { role: "assistant", content: [{ type: "tool_call", id: "c1", name: "load_skill", arguments: { name: "外部技能" } }] },
+                finishReason: "tool_calls",
+              };
+            }
+            return { message: { role: "assistant", content: [{ type: "text", text: "没载成" }] } };
+          },
+        },
+      ],
+    );
+    await rejected.send("载入外部技能看看");
+    const events = (await rejected.store.agent(UID, rejected.entry.id)).sessionLog.readAll();
+    const result = events.find((e) => e.type === "tool/result");
+    expect(result).toBeDefined();
+    expect(JSON.stringify(result)).toContain("未绑定到当前伙伴");
   });
 });

@@ -592,9 +592,11 @@ export class ConversationStore {
 
     const tools: ToolDefinition[] = [...ledgerTools];
     if (binding.skills.length > 0) {
-      tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles }));
+      // 绑定才可用（2026-10-21 绑定裁决）：工具面按装配期绑定集收口——目录层、钉住、load/read 同一口径
+      const allowedSkillIds = new Set(binding.skills);
+      tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles, allowedSkillIds }));
       tools.push(
-        createReadSkillFileTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles }),
+        createReadSkillFileTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles, allowedSkillIds }),
       );
       // 沙箱执行面（2026-10-21 Docker 沙箱化）：绑定技能里有已装镜像的才暴露 skill_exec
       if (this.deps.skillExec !== undefined) {
@@ -789,14 +791,19 @@ export class ConversationStore {
   }
 
   /** /技能名 前缀钉住（2026-10-21 手动调用）：命中当前伙伴绑定的可用技能 → 回合上下文追加强制载入指令；
-   *  compact 是保留命令（前端 /compact 压缩入口），即便有同名技能也不钉住（验收 N8） */
+   *  compact 是保留命令（前端 /compact 压缩入口），即便有同名技能也不钉住（验收 N8）；
+   *  已安装可用但未绑定的技能 → 注入提示行，让模型告知用户先绑定（绑定才可用，2026-10-21 绑定裁决） */
   private mergeTurnContext(uid: string, cid: string, text: string, context: string): string {
     const match = /^\/([^\s/]+)(?:\s[\s\S]*)?$/.exec(text.trim());
     if (match === null || match[1] === "compact") return context;
-    const binding = this.syncCurrentAgent(uid, this.dbMetaSync(uid, cid)).binding;
-    const bound = this.syncBoundSkills(uid, binding);
-    const hit = bound.find((m) => m.name === match[1]);
+    const skillsLike = this.deps.skills as unknown as { visibleSync(uid: string): SkillMeta[] };
+    const hit = skillsLike.visibleSync(uid).find((m) => m.name === match[1]);
     if (hit === undefined) return context;
+    const binding = this.syncCurrentAgent(uid, this.dbMetaSync(uid, cid)).binding;
+    if (!binding.skills.includes(hit.id)) {
+      const hint = `〔技能提示〕用户点名了技能「${hit.name}」，但它未绑定到当前伙伴：请告知用户先在伙伴设置里绑定该技能，绑定后即可使用。`;
+      return context === "" ? hint : `${context}\n\n${hint}`;
+    }
     const pin = `〔技能钉住〕用户点名使用技能「${hit.name}」：回答前必须先调用 load_skill 载入「${hit.name}」，并按其正文完成用户的请求。`;
     return context === "" ? pin : `${context}\n\n${pin}`;
   }
