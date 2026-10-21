@@ -25,6 +25,9 @@ const ledgers = new Map<string, Promise<Ledger>>();
 const memory = new MemoryStore({ db, now: () => 5000, randomUUID: () => `mid-${Math.random().toString(36).slice(2, 8)}` });
 const { adapter } = createMockLlmAdapter([{ kind: "text", text: '{"memories":[],"topics":[]}' }]);
 
+// 技能包文件访问面（测试注入空实现：这些用例不触包文件）
+const EMPTY_SKILL_FILES = { list: () => [], read: () => { throw new Error("测试不读包文件"); } };
+
 const json = (body: unknown): { method: string; headers: Record<string, string>; body: string } => ({
   method: "POST",
   headers: { "Content-Type": "application/json" },
@@ -54,6 +57,7 @@ const server = createAppServer({
       now: () => 1,
       agents: new AgentStore({ db, now: () => 1, randomUUID: () => "a1" }),
       skills: new SkillStore({ db, now: () => 1, randomUUID: () => "s1" }),
+      skillFiles: EMPTY_SKILL_FILES,
       mcps: new McpRegistry({ env: nodeEnv, db, now: () => 1, randomUUID: () => "m1" }),
       memory,
     },

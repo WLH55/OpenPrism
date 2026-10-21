@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, api2, imageSrcOf, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose } from "../api";
+import { api, api2, imageSrcOf, openConversationStream, type AgentLoose, type BlockLoose, type ConversationEntry, type ConversationMetaLoose, type FaceLoose, type LiveEventLoose, type ModelProvider, type SessionEventLoose, type SkillLoose } from "../api";
+import { takeChatPrefill } from "../prefill";
 import { CheckSolidIcon, ChevronDownIcon, CloseIcon, SlidersIcon, StopIcon, SwitchPartnerIcon } from "../icons";
 import { FaceAvatar } from "../components/FaceEditor";
 import { AttachmentTray, toAttachmentInputs, type PendingAttachment } from "../components/Attachments";
@@ -13,9 +14,23 @@ const EVENTS_PAGE_SIZE = 50;
 type RenderItem =
   | { kind: "user"; key: string; text: string; images: BlockLoose[]; files: string[] }
   | { kind: "assistant"; key: string; text: string; reasoning: string; agentId?: string; interrupted?: boolean; model?: string }
-  | { kind: "receipt"; key: string; name: string; ok: boolean; text: string }
+  | { kind: "receipt"; key: string; name: string; ok: boolean; text: string; artifacts?: { sid: string; ref: string; name: string; mediaType: string }[] }
   | { kind: "turn-error"; key: string }
   | { kind: "switch"; key: string; label: string };
+
+/** 工具回执文本拆出产物标记行（skill_exec 的 render 约定：〔artifact〕sid|ref|name|mediaType|size） */
+function parseReceiptContent(raw: string): { text: string; artifacts: { sid: string; ref: string; name: string; mediaType: string }[] } {
+  const lines = raw.split("\n");
+  const artifacts = lines
+    .filter((line) => line.startsWith("〔artifact〕"))
+    .map((line) => {
+      const [sid, ref, name, mediaType] = line.replace("〔artifact〕", "").split("|");
+      return { sid: sid ?? "", ref: ref ?? "", name: name ?? "", mediaType: mediaType ?? "" };
+    })
+    .filter((a) => a.sid !== "" && a.ref !== "");
+  const text = lines.filter((line) => !line.startsWith("〔artifact〕")).join("\n");
+  return { text, artifacts };
+}
 
 /** 等待队列条目（2026-09-27）：AI 输出期间发送的消息（文本 + 附件），排队在输入框上方 */
 type QueuedMessage = { key: string; text: string; attachments: PendingAttachment[] };
@@ -65,8 +80,10 @@ function foldEvents(
     } else if (event.type === "tool/result") {
       const pending = [...items].reverse().find((i) => i.kind === "receipt" && i.key === `t${event.id}`);
       if (pending && pending.kind === "receipt") {
+        const parsed = parseReceiptContent((event.content ?? []).map((b) => b.text ?? "").join(""));
         pending.ok = !event.isError;
-        pending.text = (event.content ?? []).map((b) => b.text ?? "").join("") || (event.isError ? "失败" : "完成");
+        pending.text = parsed.text || (event.isError ? "失败" : "完成");
+        if (parsed.artifacts.length > 0) pending.artifacts = parsed.artifacts;
       }
     } else if (event.type === "request/header") {
       if (event.model !== undefined && event.model !== "") currentModel = event.model;
@@ -129,6 +146,16 @@ export function Chat({
     }
   };
   const [pickerOpen, setPickerOpen] = useState(false);
+  // /技能名 自动补全（2026-10-21 手动调用）：敲 / 弹已装可用技能，点选或回车补全
+  const [slashSkills, setSlashSkills] = useState<SkillLoose[]>([]);
+  const [slashActive, setSlashActive] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashQuery = /^\/([^\s]*)$/.exec(input);
+  const slashMatches =
+    slashQuery && !slashDismissed
+      ? slashSkills.filter((s) => s.name.toLowerCase().includes(slashQuery[1]!.toLowerCase())).slice(0, 6)
+      : [];
+  const slashIndex = Math.min(slashActive, Math.max(slashMatches.length - 1, 0));
   // 窄屏「会话设置」面板（模型 / 思维链 / 切换伙伴收进来；桌面这三件在头部一行摆开）
   const [sessionPanel, setSessionPanel] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -234,6 +261,12 @@ export function Chat({
       .catch(() => undefined);
   }, []);
 
+  // 技能卡片「使用」预填 /技能名（2026-10-21）；挂载时取走一次
+  useEffect(() => {
+    const prefill = takeChatPrefill();
+    if (prefill !== "") setInput(prefill);
+  }, []);
+
   useEffect(() => {
     void api
       .getModels()
@@ -243,6 +276,16 @@ export function Chat({
       })
       .catch(() => undefined);
   }, []);
+
+  // 首次敲 / 时拉一次可用技能列表（ready 且启用；之后缓存）
+  useEffect(() => {
+    if (input.startsWith("/") && slashSkills.length === 0) {
+      void api2
+        .listSkills()
+        .then((all) => setSlashSkills(all.filter((s) => (s.status ?? "ready") === "ready" && (s.enabled ?? true))))
+        .catch(() => undefined);
+    }
+  }, [input, slashSkills.length]);
 
   /** 实际发送一条消息（2026-09-27 从 send 抽出，队列出队复用）：乐观插本地气泡；失败撤泡 + 提示，内容回退由调用方决定 */
   const deliver = async (text: string, outgoing: PendingAttachment[]): Promise<boolean> => {
@@ -418,15 +461,16 @@ export function Chat({
         ]);
       } else if (event.type === "tool-result") {
         setItems((prev) =>
-          prev.map((item) =>
-            item.kind === "receipt" && (item.key === `live-${event.id}` || item.key === `t${event.id}`)
-              ? {
-                  ...item,
-                  ok: !event.isError,
-                  text: (event.content ?? []).map((b) => b.text ?? "").join("") || (event.isError ? "失败" : "完成"),
-                }
-              : item,
-          ),
+          prev.map((item) => {
+            if (!(item.kind === "receipt" && (item.key === `live-${event.id}` || item.key === `t${event.id}`))) return item;
+            const parsed = parseReceiptContent((event.content ?? []).map((b) => b.text ?? "").join(""));
+            return {
+              ...item,
+              ok: !event.isError,
+              text: parsed.text || (event.isError ? "失败" : "完成"),
+              ...(parsed.artifacts.length > 0 ? { artifacts: parsed.artifacts } : {}),
+            };
+          }),
         );
       }
     });
@@ -766,7 +810,22 @@ export function Chat({
                 </div>
                 <div className="rounded-xl border border-line bg-accent3/50 px-3 py-2 text-sm">
                   <div className="font-medium text-ink">{item.name}</div>
-                  <div className="text-ink2">{item.text}</div>
+                  <div className="whitespace-pre-wrap text-ink2">{item.text}</div>
+                  {item.artifacts !== undefined && item.artifacts.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      {item.artifacts.map((artifact) => (
+                        <a
+                          key={artifact.ref}
+                          href={`/api/skills/${artifact.sid}/artifacts/${artifact.ref}`}
+                          download
+                          className="rounded-md bg-surface px-2 py-1 text-xs text-accent underline-offset-2 transition hover:underline"
+                          title={artifact.mediaType}
+                        >
+                          ⬇ {artifact.name}
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             ),
@@ -827,14 +886,59 @@ export function Chat({
               </button>
             </div>
           ))}
-          <div className="flex items-end gap-2">
+          <div className="relative flex items-end gap-2">
+            {slashMatches.length > 0 && (
+              <div className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+                {slashMatches.map((skill, index) => (
+                  <button
+                    key={skill.id}
+                    className={`flex w-full flex-col items-start px-3 py-2 text-left text-sm transition ${index === slashIndex ? "bg-surface2" : ""}`}
+                    onMouseEnter={() => setSlashActive(index)}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setInput(`/${skill.name} `);
+                    }}
+                  >
+                    <span className="text-ink">/{skill.name}</span>
+                    <span className="w-full truncate text-xs text-ink3">{skill.description}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <textarea
               rows={1}
               placeholder="说点什么，或随手记一笔…（📎 可上传图片与文本文件）"
               className="max-h-32 flex-1 resize-none rounded-xl border border-line bg-surface px-3 py-2.5 text-[15px] text-ink outline-none transition placeholder:text-ink3 focus:border-accent focus:ring-2 focus:ring-accent3"
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                setInput(next);
+                if (!next.startsWith("/") || next.includes(" ")) setSlashDismissed(false);
+              }}
               onKeyDown={(e) => {
+                // /技能名 补全浮层开着时：上下选、回车补全、Esc 关闭
+                if (slashMatches.length > 0) {
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setSlashActive((slashIndex + 1) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setSlashActive((slashIndex - 1 + slashMatches.length) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    setInput(`/${slashMatches[slashIndex]!.name} `);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setSlashDismissed(true);
+                    return;
+                  }
+                }
                 // isComposing：中文输入法组词时的 Enter 是确认候选词，不是发送
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();

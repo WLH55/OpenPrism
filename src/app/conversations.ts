@@ -10,7 +10,9 @@ import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
 import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt, dateLine } from "./persona";
-import { createLoadSkillTool, skillCatalogPrompt, type SkillMeta } from "./skills";
+import { createLoadSkillTool, createReadSkillFileTool, skillCatalogPrompt, type SkillMeta } from "./skills";
+import { createSkillExecTool } from "./skillexec";
+import type { DockerClient } from "./skilldocker";
 import { createSavePreferenceTool, createSearchMemoryTool, type MemoryVectorHit } from "./memory";
 import { createTaskTools, TASK_FEED_CID_PREFIX } from "./tasks";
 import { createWidgetTools } from "./widgets";
@@ -95,6 +97,16 @@ export interface ConversationDeps {
   tzOffsetMinutes?(uid: string): number;
   agents: AgentStore;
   skills: SkillStoreLike;
+  /** 技能包文件访问面（L3 捆绑文件读取；粘贴技能为空清单） */
+  skillFiles: import("./skillpkg").SkillFilesIO;
+  /** 技能沙箱执行面（2026-10-21 Docker 沙箱化）；缺省不装配 skill_exec（如测试/无 docker 环境） */
+  skillExec?: {
+    docker: DockerClient;
+    /** 技能运行根目录（每次执行独立子目录） */
+    runsRoot: string;
+    /** 产物入库（conversation_blobs，sha256 内容寻址） */
+    saveBlob: import("./skillexec").BlobWriter["save"];
+  };
   mcps: McpRegistry;
   memory: MemoryStoreLike;
   /** 向量召回预查（2026-09-18）；缺省/返回 null = 语义召回不可用，注入退纯词法 */
@@ -580,7 +592,26 @@ export class ConversationStore {
 
     const tools: ToolDefinition[] = [...ledgerTools];
     if (binding.skills.length > 0) {
-      tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid }));
+      tools.push(createLoadSkillTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles }));
+      tools.push(
+        createReadSkillFileTool({ store: this.deps.skills as unknown as import("./skills").SkillStore, uid, files: this.deps.skillFiles }),
+      );
+      // 沙箱执行面（2026-10-21 Docker 沙箱化）：绑定技能里有已装镜像的才暴露 skill_exec
+      if (this.deps.skillExec !== undefined) {
+        const withImage = this.syncBoundSkills(uid, binding).filter((meta) => meta.imageTag !== undefined);
+        if (withImage.length > 0) {
+          tools.push(
+            createSkillExecTool({
+              docker: this.deps.skillExec.docker,
+              store: this.deps.skills as unknown as import("./skills").SkillStore,
+              blobs: { save: this.deps.skillExec.saveBlob },
+              uid,
+              runsRoot: this.deps.skillExec.runsRoot,
+              randomUUID: () => env.randomUUID(),
+            }),
+          );
+        }
+      }
     }
     const memoryStore = this.deps.memory as unknown as import("./memory").MemoryStore;
     tools.push(createSavePreferenceTool({ store: memoryStore, uid, now }));
@@ -752,9 +783,22 @@ export class ConversationStore {
       this.deps.memoryVector && query.trim() !== ""
         ? await this.deps.memoryVector.recallHits(uid, query, { scope: "situational" })
         : null;
-    agent.followup(content, this.turnContextFor(uid, query, hits ?? undefined, this.modelIdentityLine(config)));
+    agent.followup(content, this.mergeTurnContext(uid, cid, text, this.turnContextFor(uid, query, hits ?? undefined, this.modelIdentityLine(config))));
     // 记忆提取去抖登记（立即发、90s 后才跑——给回合收尾留时间；未落盘的消息由水位线 diff 下轮兜底）
     this.deps.onTurnDone?.(uid);
+  }
+
+  /** /技能名 前缀钉住（2026-10-21 手动调用）：命中当前伙伴绑定的可用技能 → 回合上下文追加强制载入指令；
+   *  compact 是保留命令（前端 /compact 压缩入口），即便有同名技能也不钉住（验收 N8） */
+  private mergeTurnContext(uid: string, cid: string, text: string, context: string): string {
+    const match = /^\/([^\s/]+)(?:\s[\s\S]*)?$/.exec(text.trim());
+    if (match === null || match[1] === "compact") return context;
+    const binding = this.syncCurrentAgent(uid, this.dbMetaSync(uid, cid)).binding;
+    const bound = this.syncBoundSkills(uid, binding);
+    const hit = bound.find((m) => m.name === match[1]);
+    if (hit === undefined) return context;
+    const pin = `〔技能钉住〕用户点名使用技能「${hit.name}」：回答前必须先调用 load_skill 载入「${hit.name}」，并按其正文完成用户的请求。`;
+    return context === "" ? pin : `${context}\n\n${pin}`;
   }
 
   /**

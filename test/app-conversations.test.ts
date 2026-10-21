@@ -48,6 +48,7 @@ function makeDeps(db: ReturnType<typeof testDb>, adapter: LlmAdapter, modelConfi
       : async () => modelConfig,
     adapterFactory: () => adapter,
     now: NOW,
+    skillFiles: { list: () => [], read: () => { throw new Error("测试不读包文件"); } },
   };
   const makeStore = () => new ConversationStore({ ...base, agents, skills, mcps, memory, tasks }, db);
   return { base, agents, skills, mcps, memory, tasks, makeStore };
@@ -286,7 +287,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "帮我看看");
     await (await store.agent(UID, entry.id)).whenIdle();
     const names = mock.requests[0]!.tools!.map((t) => t.name).sort();
-    expect(names).toEqual(["compact", "create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "save_preference", "search_memory", "update_task"]);
+    expect(names).toEqual(["compact", "create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "read_skill_file", "save_preference", "search_memory", "update_task"]);
     expect(mock.requests[0]!.system).toContain("健身复盘");
     expect(mock.requests[0]!.system).toContain("健身话题");
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
@@ -997,5 +998,97 @@ describe("手动压缩入口（2026-10-19）", () => {
     const toolResults = events.filter((e) => e.type === "tool/result");
     expect(toolCalls).toHaveLength(1);
     expect(toolResults).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 技能沙箱执行面与 /技能名 钉住（spec 2026-10-21_11-23 §4.3 步骤 10）
+
+describe("技能沙箱执行面与 /技能名 钉住", () => {
+  const SANDBOX_MD = "---\nname: 压缩图片\ndescription: 按需压缩图片\n---\n\n# 压缩图片\n用 scripts/compress.py。";
+
+  async function convWithSkill(
+    skillSetup: { image: boolean },
+    extraDeps: Record<string, unknown>,
+    bindExtraSkillNames: string[] = [],
+  ): Promise<{
+    store: ConversationStore;
+    mock: ReturnType<typeof createMockLlmAdapter>;
+    entry: { id: string };
+    send: (text: string) => Promise<void>;
+  }> {
+    const db = testDb();
+    const mock = createMockLlmAdapter([
+      { kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) },
+    ]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    let skillId: string;
+    if (skillSetup.image) {
+      const meta = await deps.skills.createFromPackage(UID, { name: "压缩图片", description: "按需压缩", pkgSha: "sha-x", bodyMd: SANDBOX_MD });
+      deps.skills.markReady(UID, meta.id, { imageTag: "openprism-skill/x:sha-x" });
+      skillId = meta.id;
+    } else {
+      // 粘贴技能：ready 但无 imageTag
+      const pasted = await deps.skills.create(UID, SANDBOX_MD);
+      skillId = pasted.id;
+    }
+    const extraIds: string[] = [];
+    for (const name of bindExtraSkillNames) {
+      const extra = await deps.skills.create(UID, `---\nname: ${name}\ndescription: 附加技能\n---\n正文`);
+      extraIds.push(extra.id);
+    }
+    const agent = await deps.agents.create(UID, {
+      persona: "# 助手\n干活。",
+      binding: { tools: [], skills: [skillId, ...extraIds], mcps: [] },
+    });
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, ...extraDeps },
+      db,
+    );
+    const entry = await store.create(UID);
+    await store.switchAgent(UID, entry.id, agent.id);
+    const send = async (text: string): Promise<void> => {
+      await store.send(UID, entry.id, text);
+      await (await store.agent(UID, entry.id)).whenIdle();
+    };
+    return { store, mock, entry, send };
+  }
+
+  it("绑定含镜像技能 + skillExec 依赖 → 注入 skill_exec；无依赖或无镜像则不注入", async () => {
+    const skillExec = {
+      docker: {} as never,
+      runsRoot: "/runs",
+      saveBlob: () => undefined,
+    };
+    const withExec = await convWithSkill({ image: true }, { skillExec });
+    await withExec.send("帮我把图压小");
+    const names1 = withExec.mock.requests[0]!.tools!.map((t) => t.name);
+    expect(names1).toContain("skill_exec");
+    expect(names1).toContain("read_skill_file");
+
+    const noExec = await convWithSkill({ image: true }, {});
+    await noExec.send("帮我把图压小");
+    expect(noExec.mock.requests[0]!.tools!.map((t) => t.name)).not.toContain("skill_exec");
+
+    const paste = await convWithSkill({ image: false }, { skillExec });
+    await paste.send("帮我把图压小");
+    const names3 = paste.mock.requests[0]!.tools!.map((t) => t.name);
+    expect(names3).toContain("read_skill_file");
+    expect(names3).not.toContain("skill_exec");
+  });
+
+  it("/技能名 钉住：命中绑定技能注入强制载入指令；未绑定名不注入；/compact 保留命令不钉住（验收 N8）", async () => {
+    const pinned = await convWithSkill({ image: true }, {});
+    await pinned.send("/压缩图片 压到 500KB");
+    expect(JSON.stringify(pinned.mock.requests[0]!.messages)).toContain("必须先调用 load_skill 载入「压缩图片」");
+
+    const unknown = await convWithSkill({ image: true }, {});
+    await unknown.send("/未知技能 做点什么");
+    expect(JSON.stringify(unknown.mock.requests[0]!.messages)).not.toContain("技能钉住");
+
+    // 微信链路直达 send()：即便绑定了名为 compact 的技能，保留命令 /compact 也不触发钉住
+    const reserved = await convWithSkill({ image: true }, {}, ["compact"]);
+    await reserved.send("/compact");
+    expect(JSON.stringify(reserved.mock.requests[0]!.messages)).not.toContain("技能钉住");
   });
 });
