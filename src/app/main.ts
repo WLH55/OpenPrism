@@ -206,10 +206,11 @@ async function main(): Promise<void> {
       last && last.type === "assistant/message"
         ? last.message.content.filter((b) => b.type === "text").map((b) => (b as { text?: string }).text ?? "").join("")
         : "（任务已执行，无文本输出）";
-    await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text: text.slice(0, 500) });
+    await notifications.push(uidRun, { kind: "task_message", taskId: task.id, text }); // 站内存全文（2026-11-04 截断修复，原裁 500）
     if (task.notifyChannel === "wechat") {
       const bind = wechat.status(uidRun);
-      const outcome = await wechat.pushToWechat(uidRun, withContextNudge(`【${task.title}】${text}`.slice(0, 480), bind.lastMsgTs, Date.now()));
+      // 完整「标题+正文」交给桥分段发送（2026-11-04 截断修复，原裁 480——每日简报断半句的根因）
+      const outcome = await wechat.pushToWechat(uidRun, withContextNudge(`【${task.title}】${text}`, bind.lastMsgTs, Date.now()));
       if (!outcome.delivered && outcome.reason !== "unbound") {
         const now = Date.now();
         if (now - (wechatPushWarnedAt.get(uidRun) ?? 0) >= 12 * 3600_000) {

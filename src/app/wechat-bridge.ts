@@ -30,8 +30,9 @@ import {
 
 export const WECHAT_FEED_CID = (uid: string): string => `wechat:${uid}`;
 const WECHAT_FEED_TITLE = "微信对话";
-/** 回复单条上限（防御性；iLink 无公开文档，WeKnora 通知侧截 500） */
-const REPLY_MAX_CHARS = 4000;
+/** 出站单段码点上限（防御性；iLink 无公开文档）。超长文本按此值分段连续发送（splitWechatSegments），
+ * 永不裁剪丢字——4000 是聊天回复通道长期真机验证过的单条承载口径（2026-11-04 推送通道从裁 480/500 收敛到同口径）。 */
+const SEND_SEGMENT_MAX_CHARS = 4000;
 
 /** 入站媒体聚合窗口（2026-10-17 媒体膨胀治理/多图识别）：iLink 一图一消息投递，
  * 微信多选连发会被拆成 N 条 → 不聚合就 N 个独立回合分 N 次回复。纯媒体消息进窗口攒批：
@@ -43,11 +44,38 @@ export const WECHAT_AGGREGATE_MAX_ITEMS = 9;
  * web IM 页健康度展示用同一组口径（web/src/pages/IM.tsx 以同值常量对齐）。 */
 export const WECHAT_CONTEXT_THRESHOLDS = { warnMs: 11 * 3600_000, staleMs: 13 * 3600_000 };
 
-/** 推送内嵌保活提醒（AC6 纯函数）：距上次用户消息 ≥ warnMs 时在推送文本末尾追加一句回复引导，合计不超 500 字符防御上限 */
+/** 出站长文本分段（2026-11-04 截断修复）：码点安全切分（emoji 等代理对不撕裂），段界优先落在窗口内
+ * 最后一个换行处（换行归前段），窗口内无换行则硬切；永不裁剪丢字——各段按序拼接严格等于原文。 */
+export function splitWechatSegments(text: string, max: number): string[] {
+  if (max < 1) throw new Error(`分段上限必须 ≥ 1：${max}`);
+  const runes = [...text];
+  if (runes.length <= max) return [text];
+  const segments: string[] = [];
+  let start = 0;
+  while (start < runes.length) {
+    if (runes.length - start <= max) {
+      segments.push(runes.slice(start).join(""));
+      break;
+    }
+    const window = runes.slice(start, start + max);
+    let cut = max;
+    for (let i = max - 1; i > 0; i--) {
+      if (window[i] === "\n") {
+        cut = i + 1; // 换行归前段，段界落在行边界
+        break;
+      }
+    }
+    segments.push(window.slice(0, cut).join(""));
+    start += cut;
+  }
+  return segments;
+}
+
+/** 推送内嵌保活提醒（AC6 纯函数）：距上次用户消息 ≥ warnMs 时在推送文本末尾追加一句回复引导。
+ * 2026-11-04 起正文一字不裁（丢字问题由分段发送兜底）：全文原样返回或在末尾追加引导句。 */
 export function withContextNudge(text: string, lastMsgTs: number | undefined, now: number): string {
-  if (lastMsgTs === undefined || now - lastMsgTs < WECHAT_CONTEXT_THRESHOLDS.warnMs) return text.slice(0, 500);
-  const nudge = "\n\n——顺带一提：微信约 12 小时内没你的回复，就不让我主动发消息了；随手回一个字，之后的提醒就不会断。";
-  return `${text.slice(0, 500 - nudge.length)}${nudge}`;
+  if (lastMsgTs === undefined || now - lastMsgTs < WECHAT_CONTEXT_THRESHOLDS.warnMs) return text;
+  return `${text}\n\n——顺带一提：微信约 12 小时内没你的回复，就不让我主动发消息了；随手回一个字，之后的提醒就不会断。`;
 }
 
 /** 推送结局（2026-10-06 失败可见化）：失败原因分类供调用方给出可操作指引——
@@ -150,7 +178,7 @@ export class WechatBridge {
       console.error("[wechat] 聚合回合失败:", error instanceof Error ? error.message : error);
       // flush 路径不在轮询循环里，失败没人报（评审 m3）：至少给用户一条提示，尽力推送
       try {
-        await this.client.sendMessage(pending.bind.botToken, pending.lastMsg.fromUserId, pending.lastMsg.contextToken, "图片刚没处理成功，麻烦再发一次试试。");
+        await this.sendSegmented(pending.bind.botToken, pending.lastMsg.fromUserId, pending.lastMsg.contextToken, "图片刚没处理成功，麻烦再发一次试试。");
       } catch {
         // 提示也推不出去（绑定多半已失效）：上面已有日志
       }
@@ -185,14 +213,12 @@ export class WechatBridge {
     if (opts?.start !== false) this.startLoop(uid);
     // 欢迎语后台推：不 await（iLink 慢/挂不拖绑定闭环的路由响应，轮询也已先启）；
     // 无 context_token 的主动推送是否被接受属 Q5 实测项，失败不拦绑定但必须留日志（排障）
-    void this.client
-      .sendMessage(
-        creds.botToken,
-        creds.ilinkUserId,
-        "",
-        "绑定成功！以后直接在这里跟我说话就行；图片、文本文件、语音（自动转文字）也可以直接发；定时任务可以选「微信机器人」通知到这里。",
-      )
-      .catch((error) => console.error("[wechat] 欢迎语推送失败（不拦绑定，Q5 实测项）:", error instanceof Error ? error.message : error));
+    void this.sendSegmented(
+      creds.botToken,
+      creds.ilinkUserId,
+      "",
+      "绑定成功！以后直接在这里跟我说话就行；图片、文本文件、语音（自动转文字）也可以直接发；定时任务可以选「微信机器人」通知到这里。",
+    ).catch((error) => console.error("[wechat] 欢迎语推送失败（不拦绑定，Q5 实测项）:", error instanceof Error ? error.message : error));
   }
 
   async unbind(uid: string): Promise<void> {
@@ -403,11 +429,11 @@ export class WechatBridge {
       return;
     }
     try {
-      await this.client.sendMessage(bind.botToken, anchorMsg.fromUserId, anchorMsg.contextToken, reply.slice(0, REPLY_MAX_CHARS));
+      await this.sendSegmented(bind.botToken, anchorMsg.fromUserId, anchorMsg.contextToken, reply);
     } catch (error) {
       // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）——但必须留日志（排障）
       console.error(
-        `[wechat] 回复推送失败（uid=${uid} cid=${cid} 回复 ${Math.min(reply.length, REPLY_MAX_CHARS)} 字）:`,
+        `[wechat] 回复推送失败（uid=${uid} cid=${cid} 回复 ${reply.length} 字分 ${splitWechatSegments(reply, SEND_SEGMENT_MAX_CHARS).length} 段）:`,
         error instanceof Error ? error.message : error,
       );
     }
@@ -416,7 +442,7 @@ export class WechatBridge {
   /** 说明性回复（媒体失败/转写失败等，不跑回合的路径）：尽力推送，失败留日志 */
   private async pushNotice(bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage, text: string): Promise<void> {
     try {
-      await this.client.sendMessage(bind.botToken, msg.fromUserId, msg.contextToken, text.slice(0, REPLY_MAX_CHARS));
+      await this.sendSegmented(bind.botToken, msg.fromUserId, msg.contextToken, text);
     } catch (error) {
       console.error("[wechat] 说明推送失败:", error instanceof Error ? error.message : error);
     }
@@ -499,6 +525,14 @@ export class WechatBridge {
 
   // ── 主动推送（任务通知） ────────────────────────────────
 
+  /** 出站分段发送（2026-11-04 截断修复）：超长文本按 SEND_SEGMENT_MAX_CHARS 切段连续发送，
+   * 永不裁剪丢字；任一段失败就地抛出（结局分类与「已发段不撤回」由调用方语义承接）。 */
+  private async sendSegmented(botToken: string, toUserId: string, contextToken: string, text: string): Promise<void> {
+    for (const segment of splitWechatSegments(text, SEND_SEGMENT_MAX_CHARS)) {
+      await this.client.sendMessage(botToken, toUserId, contextToken, segment);
+    }
+  }
+
   /** 推文本到绑定微信；未绑定/失败 → 分类结局（调用方按 reason 给用户可操作提示）。
    * 上下文 = 最近入站消息的 contextToken（2026-09-30）：iLink 主动推送必须挂在用户消息的上下文上，
    * 空串只在服务端恰好还有新鲜会话时侥幸放行——从不依赖运气，没存过就空串试一次，失败退站内。 */
@@ -507,7 +541,7 @@ export class WechatBridge {
     if (!bind) return { delivered: false, reason: "unbound" };
     if (bind.state !== "active") return { delivered: false, reason: "rebind" }; // 绑过但已过期：重新扫码
     try {
-      await this.client.sendMessage(bind.botToken, bind.ilink_user_id, bind.last_context_token ?? "", text.slice(0, 500));
+      await this.sendSegmented(bind.botToken, bind.ilink_user_id, bind.last_context_token ?? "", text);
       return { delivered: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
