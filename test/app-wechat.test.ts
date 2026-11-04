@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { EnvFetchRequest, EnvFetchResponse, PlatformEnv } from "../src/harness/env";
 import { createILinkClient, ILinkContextStaleError, ILinkTokenExpiredError, type ILinkCredentials } from "../src/app/ilink";
-import { WechatBridge, WECHAT_FEED_CID, withContextNudge } from "../src/app/wechat-bridge";
+import { WechatBridge, WECHAT_FEED_CID, withContextNudge, splitWechatSegments } from "../src/app/wechat-bridge";
 import { ConversationStore } from "../src/app/conversations";
 import { AgentStore } from "../src/app/agents";
 import { SkillStore } from "../src/app/skills";
@@ -202,21 +202,61 @@ describe("iLink 客户端（协议面）", () => {
   });
 });
 
-describe("withContextNudge（AC6 推送内嵌保活提醒，2026-10-06）", () => {
+describe("withContextNudge（AC6 推送内嵌保活提醒，2026-10-06；2026-11-04 起不裁剪，分段发送兜底）", () => {
   const NOW_MS = 1_000_000_000_000;
-  it("从未对话 / <11h：不追加（避免每条都唠叨）", () => {
+  it("从未对话 / <11h：不追加（避免每条都唠叨），全文原样", () => {
     expect(withContextNudge("早", undefined, NOW_MS)).toBe("早");
     expect(withContextNudge("早", NOW_MS - 5 * 3600_000, NOW_MS)).toBe("早");
     expect(withContextNudge("早", NOW_MS - 11 * 3600_000 + 1, NOW_MS)).toBe("早");
+    expect(withContextNudge("字".repeat(600), NOW_MS - 5 * 3600_000, NOW_MS)).toBe("字".repeat(600));
   });
-  it("≥11h：末尾追加回复引导，且总长不超 500 防御上限", () => {
+  it("≥11h：完整正文末尾追加回复引导，正文一字不裁（裁剪丢字由分段发送兜底，2026-11-04）", () => {
     const nudged = withContextNudge("正文", NOW_MS - 12 * 3600_000, NOW_MS);
     expect(nudged).toContain("回一个字");
     expect(nudged.startsWith("正文")).toBe(true);
-    expect(nudged.length).toBeLessThanOrEqual(500);
     const long = withContextNudge("字".repeat(600), NOW_MS - 13 * 3600_000, NOW_MS);
-    expect(long).toContain("回一个字");
-    expect(long.length).toBeLessThanOrEqual(500); // 超长正文被压缩，引导句完整保留
+    expect(long.startsWith("字".repeat(600))).toBe(true); // 正文全文保留
+    expect(long).toContain("回一个字"); // 引导句完整追加
+    expect(long.length).toBe(600 + nudged.length - "正文".length); // 只追加引导句本身
+  });
+});
+
+describe("splitWechatSegments（2026-11-04 截断修复：出站超限分段，永不裁剪丢字）", () => {
+  const MAX = 4000;
+  it("短文本 / 空串 / 恰好段长：单段原样", () => {
+    expect(splitWechatSegments("【喝水】该喝水了", MAX)).toEqual(["【喝水】该喝水了"]);
+    expect(splitWechatSegments("", MAX)).toEqual([""]);
+    expect(splitWechatSegments("字".repeat(MAX), MAX)).toEqual(["字".repeat(MAX)]);
+  });
+  it("超限多段：各段 ≤max 码点，按序拼接严格等于原文", () => {
+    const text = "字".repeat(9000);
+    const segments = splitWechatSegments(text, MAX);
+    expect(segments).toHaveLength(3);
+    for (const seg of segments) expect([...seg].length).toBeLessThanOrEqual(MAX);
+    expect(segments.join("")).toBe(text);
+  });
+  it("emoji 等代理对不撕裂：整码点切分", () => {
+    const segments = splitWechatSegments("😀".repeat(5000), MAX);
+    expect(segments.map((seg) => [...seg].length)).toEqual([4000, 1000]);
+    expect(segments[0]).toBe("😀".repeat(4000)); // 段内全是完整 emoji，无孤立代理对
+    expect(segments[1]).toBe("😀".repeat(1000));
+    expect(segments.join("")).toBe("😀".repeat(5000));
+  });
+  it("段界优先落在窗口内最后一个换行处（换行归前段）", () => {
+    const text = `${"a".repeat(3000)}\n${"b".repeat(3000)}`;
+    const segments = splitWechatSegments(text, MAX);
+    expect(segments).toEqual([`${"a".repeat(3000)}\n`, "b".repeat(3000)]);
+    expect(segments.join("")).toBe(text);
+  });
+  it("窗口内无换行则硬切；窗口外换行不回看", () => {
+    const text = `${"a".repeat(4500)}\n${"b".repeat(50)}`;
+    const segments = splitWechatSegments(text, MAX);
+    expect(segments).toEqual(["a".repeat(4000), `${"a".repeat(500)}\n${"b".repeat(50)}`]);
+    expect(segments.join("")).toBe(text);
+  });
+  it("max < 1 就地崩溃（fast-fail，防止空段死循环）", () => {
+    expect(() => splitWechatSegments("x", 0)).toThrow();
+    expect(() => splitWechatSegments("x", -1)).toThrow();
   });
 });
 
@@ -359,6 +399,37 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     expect(await reborn.pushToWechat(UID, "重启后")).toEqual({ delivered: true });
     const push2 = JSON.parse(fixture.iLink.calls.filter((c) => c.url.endsWith("/ilink/bot/sendmessage")).at(-1)!.init?.body ?? "{}").msg;
     expect(push2.context_token).toBe("ctx-31");
+  });
+
+  it("pushToWechat 超长文本分段发送（2026-11-04 截断修复）：各段 ≤4000 码点按序完整送达；第二段失败 → 分类结局，首段已发出即已发出", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "用不到" }]);
+    const sentTexts: string[] = [];
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), (call) => {
+      sentTexts.push(JSON.parse(call.init?.body ?? "{}").msg.item_list[0].text_item.text);
+      return iLinkOk;
+    });
+    await bindActive(fixture);
+    sentTexts.length = 0; // 绑定欢迎语不计入
+    const long = "字".repeat(9000);
+    expect(await fixture.bridge.pushToWechat(UID, long)).toEqual({ delivered: true });
+    expect(sentTexts).toHaveLength(3);
+    for (const seg of sentTexts) expect([...seg].length).toBeLessThanOrEqual(4000);
+    expect(sentTexts.join("")).toBe(long); // 各段按序拼接 = 原文，一字不丢
+
+    // 第二段失败：结局按原因分类（ret=-2 → stale-context），失败即停（剩余段不再尝试），已发段不撤回
+    const fixture2 = makeFixture([{ kind: "text", text: "用不到" }]);
+    let sendCount = 0;
+    fixture2.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => {
+      sendCount += 1;
+      return sendCount <= 2 ? iLinkOk : { ret: -2, errmsg: "prepare failed" }; // 欢迎语 + 首段成功，第二段起失败
+    });
+    await bindActive(fixture2);
+    await expect(fixture2.bridge.pushToWechat(UID, "字".repeat(9000))).resolves.toMatchObject({
+      delivered: false,
+      reason: "stale-context",
+      message: expect.stringContaining("prepare failed"),
+    });
+    expect(sendCount).toBe(3); // 欢迎语 + 首段 + 第二段失败即停
   });
 
   it("startAll：重启后恢复 active 绑定轮询；expired 不启；解绑即停", async () => {
