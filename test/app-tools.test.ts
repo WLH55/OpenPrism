@@ -46,6 +46,12 @@ describe("record_flow", () => {
 });
 
 describe("create_plan / checkin_plan", () => {
+  it("checkin_plan 确认门（2026-11-09 误打卡修复）：描述要求只基于用户明确说出的完成事实打卡", async () => {
+    const { by } = await freshTools();
+    expect(by("checkin_plan").description).toContain("只基于用户明确说出的完成事实");
+    expect(by("checkin_plan").description).toContain("不得凭历史推断替用户打卡");
+  });
+
   it("建计划返回 planId 前缀；打卡引用并落 done", async () => {
     const { ledger, by } = await freshTools();
     const plan = (await by("create_plan").execute({ title: "晨跑", scope: "day" }, ctx)) as { planId: string };

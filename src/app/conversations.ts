@@ -683,6 +683,10 @@ export class ConversationStore {
       // 摘要指令按个人助理定位注入（2026-10-19 摘要指令适配）；不传则 harness 用领域中立的缺省口径
       compaction: { summaryInstruction: PERSONAL_SUMMARY_INSTRUCTION },
       systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf()),
+      // 历史日期锚（2026-11-09 时效可见性）：每回合现读会话时区（与 turnContextFor 钟面同口径），
+      // 投影给每条用户消息注入日期行——模型由此看得见每条历史对话发生在哪天，
+      // 不再凭无时间戳的旧历史误判「今天已完成」（2026-11-09 误打卡事故根因之一）
+      dateAnchorTz: () => this.deps.tzOffsetMinutes?.(uid) ?? -new Date().getTimezoneOffset(),
       // 兜底拦截：装配期这个模型不支持图片，而请求里带了图片（历史消息/切换伙伴默认模型后的重放）→
       // 就地失败并说明原因，不把图片发给不认识的端点去猜
       onRequest: (request) => {

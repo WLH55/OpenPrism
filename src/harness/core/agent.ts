@@ -12,7 +12,7 @@ import { isLlmFailure } from "../llm/errors";
 import { DEFAULT_RETRY_POLICY, withRetry, type RetryPolicy } from "../retry/retry";
 import type { InputChannel, TurnEndReason } from "../session/events";
 import { InMemorySessionLog, type SessionLog } from "../session/log";
-import { projectSurface } from "../session/project";
+import { DEFAULT_PRUNE, projectSurface } from "../session/project";
 import { countTurns, currentGeneration, lastRequestHeader, retryBudgetUsed } from "../session/queries";
 import type { AssistantMessage, ContentBlock, ToolCallBlock, UserContent, UserMessage } from "../types";
 import { fnv1a } from "../util";
@@ -41,6 +41,9 @@ export interface AgentConfig {
   compaction?: Partial<CompactionConfig>;
   /** 请求拦截点：可改路由（无头场景换便宜模型不动循环） */
   onRequest?: (request: LlmRequest) => LlmRequest;
+  /** 历史日期锚时区（2026-11-09 时效可见性）：每回合现读的 UTC 偏移分钟数；传了则投影给每条用户消息
+   * 正文前注入 〔YYYY-MM-DD 周X〕 行（事件 ts 的投影确定性推导，铁律 2 投影路径）；不传 = 不注入 */
+  dateAnchorTz?: () => number;
   /** Turn 自然停止前串行回调（无瀑布） */
   onTurnStopping?(context: { reason: TurnEndReason; turn: number }): void | Promise<void>;
 }
@@ -104,7 +107,7 @@ export function createAgent(config: AgentConfig): Agent {
   };
 
   const buildRequest = (): LlmRequest => {
-    const surface = projectSurface(log.readAll());
+    const surface = projectSurface(log.readAll(), DEFAULT_PRUNE, config.dateAnchorTz?.());
     return {
       provider: config.model.provider,
       model: config.model.model,

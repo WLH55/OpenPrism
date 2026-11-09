@@ -213,7 +213,7 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
 
   const checkinPlan: ToolDefinition = {
     name: "checkin_plan",
-    description: "打卡：认证某个计划做了/没做。planId 从 query_ledger 的结果里拿。昨天做了忘了打，带 date 补卡；打错了用 void_flow 撤——刚打的 seq 在回执里，历史打卡的 seq 从 query_ledger what=today 该计划的 checkins 里拿。",
+    description: "打卡：认证某个计划做了/没做。只基于用户明确说出的完成事实打卡（用户说「练完了/做了/打一下卡」才算）；定时提醒、状态播报里不得凭历史推断替用户打卡，没听到用户确认就先问。planId 从 query_ledger 的结果里拿。昨天做了忘了打，带 date 补卡；打错了用 void_flow 撤——刚打的 seq 在回执里，历史打卡的 seq 从 query_ledger what=today 该计划的 checkins 里拿。",
     parameters: {
       type: "object",
       required: ["planId"],
