@@ -44,6 +44,13 @@ describe("composeAssistantPrompt", () => {
     expect(composeAssistantPrompt({})).not.toContain("定时提醒会话");
   });
 
+  it("事实性写入确认门（2026-11-09 误打卡修复）：纪律要求用户明确确认，提醒会话规则对事实性写入留例外", () => {
+    const prompt = composeAssistantPrompt({});
+    expect(prompt).toContain("不得从历史消息推断");
+    const feed = composeAssistantPrompt({ taskFeed: true });
+    expect(feed).toContain("不得按假设执行");
+  });
+
   it("身份块：伙伴名字+描述进 prompt；灵魂优先级声明；无身份退默认助手", () => {
     const withIdentity = composeAssistantPrompt({
       persona: "## 语气\n像老朋友。",

@@ -19,7 +19,7 @@ import type { ToolDefinition } from "../src/harness/tools/registry";
 import { llmFailure } from "../src/harness/llm/errors";
 import { createMockLlmAdapter, type MockScriptStep } from "../src/harness/llm/mock";
 import { InMemorySessionLog } from "../src/harness/session/log";
-import { projectSurface, type SurfaceItem } from "../src/harness/session/project";
+import { DEFAULT_PRUNE, deriveMessages, projectSurface, type SurfaceItem } from "../src/harness/session/project";
 import { currentGeneration } from "../src/harness/session/queries";
 import type { AssistantMessage, Message, UserMessage } from "../src/harness/types";
 import { echoTool, fakeEnv } from "./helpers";
@@ -412,5 +412,86 @@ describe("requestCompact 回合间隙执行（2026-10-19 手动压缩入口）",
       .map((event) => (event as { reason: string }).reason);
     expect(reasons).toEqual(["completed", "completed"]);
     expect(mock.requests).toHaveLength(4); // 回合1两步 + 间隙摘要请求 + 回合2一步
+  });
+});
+
+describe("历史日期锚（2026-11-09 时效可见性）", () => {
+  it("每条用户消息正文首块前缀当日锚行；助手消息不打标；不传 tz 与现状逐字节一致", async () => {
+    let nowTs = Date.UTC(2026, 10, 9, 2, 0); // 2026-11-09 02:00 UTC = 北京 10:00 周一
+    const log = new InMemorySessionLog(() => nowTs);
+    await log.append({ type: "user/message", channel: "followup", message: user("早上好") });
+    await log.append({ type: "assistant/message", message: { role: "assistant", content: [{ type: "text", text: "早" }] } });
+    const messages = deriveMessages(log.readAll(), DEFAULT_PRUNE, 480);
+    expect(messages[0]).toEqual({ role: "user", content: [{ type: "text", text: "〔2026-11-09 周一〕\n早上好" }] });
+    expect(messages[1]).toEqual({ role: "assistant", content: [{ type: "text", text: "早" }] });
+    expect(deriveMessages(log.readAll())[0]).toEqual({ role: "user", content: [{ type: "text", text: "早上好" }] });
+  });
+
+  it("时区换日：UTC 16:00 + 480 → 锚落次日", async () => {
+    const log = new InMemorySessionLog(() => Date.UTC(2026, 10, 9, 16, 0)); // 北京已是 2026-11-10 00:00 周二
+    await log.append({ type: "user/message", channel: "followup", message: user("夜宵记一笔") });
+    const [first] = deriveMessages(log.readAll(), DEFAULT_PRUNE, 480);
+    expect(first).toEqual({ role: "user", content: [{ type: "text", text: "〔2026-11-10 周二〕\n夜宵记一笔" }] });
+  });
+
+  it("多块消息只在首个 text 块前缀锚；纯附件消息头部插独立锚块", async () => {
+    const log = new InMemorySessionLog(() => Date.UTC(2026, 10, 9, 2, 0));
+    await log.append({
+      type: "user/message",
+      channel: "followup",
+      message: {
+        role: "user",
+        content: [
+          { type: "file", name: "a.md", mediaType: "text/markdown", text: "正文" },
+          { type: "text", text: "看看这个" },
+        ],
+      },
+    });
+    await log.append({
+      type: "user/message",
+      channel: "followup",
+      message: { role: "user", content: [{ type: "file", name: "b.md", mediaType: "text/markdown", text: "只有附件" }] },
+    });
+    const messages = deriveMessages(log.readAll(), DEFAULT_PRUNE, 480);
+    expect(messages[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "file", name: "a.md", mediaType: "text/markdown", text: "正文" },
+        { type: "text", text: "〔2026-11-09 周一〕\n看看这个" },
+      ],
+    });
+    expect(messages[1]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "〔2026-11-09 周一〕" },
+        { type: "file", name: "b.md", mediaType: "text/markdown", text: "只有附件" },
+      ],
+    });
+  });
+
+  it("AgentConfig.dateAnchorTz 每回合现读：两回合跨日 → wire 用户消息锚随钟面换日", async () => {
+    let nowTs = Date.UTC(2026, 10, 9, 2, 0);
+    const log = new InMemorySessionLog(() => nowTs);
+    const mock = createMockLlmAdapter([{ kind: "text", text: "好" }, { kind: "text", text: "好" }]);
+    const agent = createAgent({
+      env: fakeEnv(),
+      sessionLog: log,
+      adapter: mock.adapter,
+      model: { provider: "p", model: "m" },
+      systemPrompt: () => "S",
+      dateAnchorTz: () => 480,
+    });
+    agent.followup("早上好");
+    await agent.whenIdle();
+    nowTs = Date.UTC(2026, 10, 10, 2, 0); // 次日
+    agent.followup("又一天");
+    await agent.whenIdle();
+    const lastUserText = (messages: Message[]): string => {
+      const last = [...messages].reverse().find((m) => m.role === "user")!;
+      return (last.content.find((b) => b.type === "text") as { text: string }).text;
+    };
+    expect(lastUserText(mock.requests[0]!.messages)).toBe("〔2026-11-09 周一〕\n早上好");
+    const secondTurnUsers = mock.requests[1]!.messages.filter((m) => m.role === "user");
+    expect(lastUserText(secondTurnUsers as Message[])).toBe("〔2026-11-10 周二〕\n又一天"); // 各带各的日期
   });
 });

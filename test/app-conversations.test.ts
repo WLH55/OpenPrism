@@ -124,6 +124,25 @@ describe("ConversationStore（批次1 回归）", () => {
     expect(mock.requests[0]!.contextWindow).toBe(128000);
   });
 
+  it("历史日期锚接线（2026-11-09）：deps.tzOffsetMinutes 喂进投影，wire 用户消息带当日锚", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, tzOffsetMinutes: () => 480 },
+      db,
+    );
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "今天练完了");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    const lastUser = [...mock.requests[0]!.messages].reverse().find((m) => m.role === "user")!;
+    const anchored = lastUser.content.find(
+      (b) => b.type === "text" && (b as { text: string }).text.endsWith("今天练完了"),
+    ) as { text: string };
+    // NOW = 2026-09-03 12:00 UTC + 480 → 当地 2026-09-03 20:00 周四；锚行前缀注入，原文随后
+    expect(anchored.text).toBe("〔2026-09-03 周四〕\n今天练完了");
+  });
+
   it("会话级模型绑定：switchModel 后下一回合用新模型（弃池重装配）；置空跟随全局", async () => {    const db = testDb();
     const mock = createMockLlmAdapter([
       { kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }) },
@@ -370,8 +389,12 @@ describe("ConversationStore（多模态图片输入）", () => {
     const wire = mock.requests[0]!.messages[0] as { role: string; content: { type: string; text?: string }[] };
     expect(wire.role).toBe("user");
     expect(wire.content[0]!.text).toContain("〔系统上下文〕"); // 回合上下文注入块在最前（2026-10-14）
-    expect(wire.content.slice(1)).toEqual([
-      { type: "text", text: "这是什么" },
+    expect(wire.content[1]).toEqual({
+      type: "text",
+      // 历史日期锚（2026-11-09）：正文带当日锚行前缀（回退时区本机相关，用通配断言）
+      text: expect.stringMatching(/〔\d{4}-\d{2}-\d{2} 周.〕\n这是什么$/),
+    });
+    expect(wire.content.slice(2)).toEqual([
       { type: "image", mediaType: "image/webp", data: "QUJD" },
       { type: "file", name: "note.md", mediaType: "text/markdown", text: "# 正文" },
     ]);

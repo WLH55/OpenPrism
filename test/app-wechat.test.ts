@@ -89,6 +89,7 @@ function makeFixture(script: MockScriptStep[]) {
       modelConfigFor: async () => ({ baseURL: "https://mock.local", model: "mock-1" }),
       adapterFactory: () => mock.adapter as LlmAdapter,
       now: NOW,
+      tzOffsetMinutes: () => 480, // 历史日期锚（2026-11-09）固定时区：ts=12345 → 锚恒为〔1970-01-01 周四〕
       agents,
       skills,
       // 技能包文件访问面（测试注入空实现：这些用例不触包文件）
