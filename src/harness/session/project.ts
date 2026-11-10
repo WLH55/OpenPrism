@@ -27,6 +27,13 @@ export const DEFAULT_PRUNE: PruneConfig = {
 
 export const PRUNE_PLACEHOLDER = "[... tool result middle pruned ...]";
 
+/** 悬空 tool_call 补全的合成 code（2026-11-10 崩溃恢复）：进程硬崩溃可能落在 assistant/message 落日志
+ * 与 tool/result 落日志之间——日志 append-only 无法回插，投影层确定性推导补上合成 isError 结果，
+ * 恢复 wire 协议合法（与 agent.ts Turn Budget 补全同形态，铁律 2 投影路径，与日期锚同类）。 */
+export const INTERRUPTED_TOOL_CODE = "INTERRUPTED";
+
+const INTERRUPTED_TOOL_TEXT = "进程中断，此工具调用未取得结果。";
+
 const WEEKDAY_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
 /** 历史日期锚（2026-11-09 时效可见性）：给用户消息正文注入 〔YYYY-MM-DD 周X〕 行——事件 ts + 时区偏移
@@ -90,8 +97,14 @@ function pruneToolResult(message: ToolResultMessage, cfg: PruneConfig): ToolResu
   return changed ? { ...message, content } : message;
 }
 
-export function summaryCheckpointMessage(summary: string): UserMessage {
-  return { role: "user", content: [{ type: "text", text: summary }] };
+/** 压缩 checkpoint 消息：摘要正文 + 可选的遮蔽区间标注（2026-11-10 Spill 回读）——
+ * 模型由此知道区间原文存在、知道用 read_shadow 按序号取回（区间是日志 seq，原文永不删除）。 */
+export function summaryCheckpointMessage(summary: string, range?: readonly [number, number]): UserMessage {
+  const note =
+    range === undefined
+      ? ""
+      : `\n\n〔以上为压缩摘要；序号 ${range[0]}–${range[1]} 的原文保留在日志中，可用 read_shadow 工具按区间取回〕`;
+  return { role: "user", content: [{ type: "text", text: `${summary}${note}` }] };
 }
 
 /** 从日志投影模型可见历史：跳过遮蔽区间、应用裁剪规则；传了 dateAnchorTz 再给每条用户消息注入日期锚 */
@@ -102,6 +115,12 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
   // 按 seq 记位（压缩会重建 items，下标不稳）；该消息若被压缩区间吞掉则自然放弃注入。
   let lastContext: { seq: number; text: string } | undefined;
   const turnStartSeqs: number[] = [];
+  // 悬空 tool_call 补全预扫描：结果 id 全集（含遮蔽区间内——压缩遮蔽不切开 call/result 配对，
+  // 遮蔽内的结果只会对应遮蔽内的调用，不影响可见面的配对判定）
+  const answeredCalls = new Set<string>();
+  for (const event of events) {
+    if (event.type === "tool/result") answeredCalls.add(event.id);
+  }
   for (const event of events) {
     if (event.type === "turn/start") turnStartSeqs.push(event.seq);
     switch (event.type) {
@@ -114,6 +133,20 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
         break;
       case "assistant/message":
         items.push({ seq: event.seq, message: event.message });
+        // 悬空补全：硬崩溃留在日志里的无结果调用，紧随其后插合成 isError 结果，保 wire 协议合法
+        for (const call of event.message.content) {
+          if (call.type !== "tool_call" || answeredCalls.has(call.id)) continue;
+          items.push({
+            seq: event.seq,
+            message: {
+              role: "tool_result",
+              callId: call.id,
+              isError: true,
+              content: [{ type: "text", text: INTERRUPTED_TOOL_TEXT }],
+              code: INTERRUPTED_TOOL_CODE,
+            },
+          });
+        }
         break;
       case "tool/result":
         items.push({
@@ -141,7 +174,7 @@ export function projectSurface(events: SessionEvent[], prune: PruneConfig = DEFA
             break;
           }
         }
-        kept.splice(insertAt, 0, { seq: start, message: summaryCheckpointMessage(event.summary) });
+        kept.splice(insertAt, 0, { seq: start, message: summaryCheckpointMessage(event.summary, event.shadowed) });
         items = kept;
         break;
       }

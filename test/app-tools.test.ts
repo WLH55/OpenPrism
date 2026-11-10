@@ -2,7 +2,9 @@
 
 import { describe, expect, it } from "vitest";
 import type { ToolDefinition } from "../src/harness/index";
+import { InMemorySessionLog } from "../src/harness/index";
 import { defaultAssistantPrompt } from "../src/app/persona";
+import { createReadShadowTool } from "../src/app/shadow";
 import { createLedgerTools } from "../src/app/tools";
 import { Ledger, type FlowRecord, type PlanRecord } from "../src/app/ledger";
 import { testDb } from "./helpers-db";
@@ -480,5 +482,68 @@ describe("计划执行内容（2026-10-17 计划执行内容存储与AI读取：
     await expect(by("create_plan").execute({ title: "x", scope: "day", details: "长".repeat(8001) }, ctx)).rejects.toThrow("details 过长");
     await expect(by("query_ledger").execute({ what: "plan" }, ctx)).rejects.toThrow("planId");
     await expect(by("query_ledger").execute({ what: "plan", planId: "plan-none" }, ctx)).rejects.toThrow("不存在");
+  });
+});
+
+// ── read_shadow（2026-11-10 Spill 回读：压缩遮蔽区间原文按 seq 取回）──
+
+describe("read_shadow", () => {
+  const shadowUser = (text: string) => ({ type: "user/message" as const, channel: "followup" as const, message: { role: "user" as const, content: [{ type: "text" as const, text }] } });
+  const shadowAssistant = (text: string) => ({ type: "assistant/message" as const, message: { role: "assistant" as const, content: [{ type: "text" as const, text }] } });
+
+  it("按 seq 区间取回原文：区间内逐行渲染，区间外不进", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await log.append(shadowUser("旧问题")); // #0
+    await log.append({
+      type: "assistant/message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "旧回答" },
+          { type: "tool_call", id: "c1", name: "query_ledger", arguments: { what: "today" } },
+        ],
+      },
+    }); // #1
+    await log.append({ type: "tool/result", id: "c1", isError: false, content: [{ type: "text", text: "支出 28 元" }] }); // #2
+    await log.append(shadowUser("新问题")); // #3
+    const tool = createReadShadowTool({ log });
+    const value = (await tool.execute({ start: 1, end: 2 }, ctx)) as { text: string; count: number };
+    expect(value.count).toBe(2);
+    expect(value.text).toContain("#seq 1–2 的原文");
+    expect(value.text).toContain("#1 助手：旧回答 〔调用工具 query_ledger");
+    expect(value.text).toContain("#2 工具结果：支出 28 元");
+    expect(value.text).not.toContain("旧问题");
+    expect(value.text).not.toContain("新问题");
+  });
+
+  it("区间校验失败就地抛错：反区间 / 过宽 / 非整数", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await log.append(shadowUser("一"));
+    const tool = createReadShadowTool({ log });
+    await expect(tool.execute({ start: 5, end: 2 }, ctx)).rejects.toThrow("区间反了");
+    await expect(tool.execute({ start: 0, end: 500 }, ctx)).rejects.toThrow("单次最多 500 条");
+    await expect(tool.execute({ start: 0.5, end: 2 }, ctx)).rejects.toThrow("非负整数");
+  });
+
+  it("空区间不报错：count 0 + 说明文案；失败工具结果带（失败）标记", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await log.append({ type: "turn/start", turn: 1 }); // #0：协议事件不渲染
+    await log.append({ type: "tool/result", id: "x", isError: true, code: "TOOL_ERROR", content: [{ type: "text", text: "炸了" }] }); // #1
+    const tool = createReadShadowTool({ log });
+    const empty = (await tool.execute({ start: 3, end: 4 }, ctx)) as { text: string; count: number };
+    expect(empty.count).toBe(0);
+    expect(empty.text).toContain("区间内没有消息记录");
+    const hit = (await tool.execute({ start: 0, end: 1 }, ctx)) as { text: string; count: number };
+    expect(hit.count).toBe(1);
+    expect(hit.text).toContain("#1 工具结果（失败 TOOL_ERROR）：炸了");
+  });
+
+  it("超长文本按 800 字截断并标注总长", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    await log.append(shadowAssistant("长".repeat(1000))); // #0
+    const tool = createReadShadowTool({ log });
+    const value = (await tool.execute({ start: 0, end: 0 }, ctx)) as { text: string; count: number };
+    expect(value.text).toContain("……（截断，共 1000 字）");
+    expect(value.text).not.toContain("长".repeat(900));
   });
 });
