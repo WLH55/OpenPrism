@@ -12,7 +12,7 @@ import { migrateLegacyModelConfig } from "./migrate";
 import { loadUsers, readUserTz, SessionStore } from "./auth";
 import { loadOrCreateMasterKey, open, readModelConfig, readModelProviderConfig, type ModelConfig } from "./secretbox";
 import { Ledger } from "./ledger";
-import { ConversationStore } from "./conversations";
+import { ConversationStore, DEFAULT_TURN_DEADLINE_MS } from "./conversations";
 import { SqliteSessionLog } from "./session-log";
 import { AgentStore } from "./agents";
 import { SkillStore } from "./skills";
@@ -153,6 +153,11 @@ async function main(): Promise<void> {
     );
   };
 
+  // 回合超时看护阈值（2026-11-10 Watchdog 前半）：须大于最长工具超时（skill_exec 上限 600s）。
+  // OP_TURN_MAX_MS（毫秒）可覆盖；非正数/小于 60s 一律回落缺省 20 分钟（审查：负值会把一切运行中回合当超时停掉）
+  const turnDeadlineRaw = Number(process.env.OP_TURN_MAX_MS ?? "");
+  const turnDeadlineMs = Number.isFinite(turnDeadlineRaw) && turnDeadlineRaw >= 60_000 ? turnDeadlineRaw : DEFAULT_TURN_DEADLINE_MS;
+
   const conversations = new ConversationStore(
     {
       env: nodeEnv,
@@ -176,6 +181,7 @@ async function main(): Promise<void> {
       // 微信绑定真相（A4 2026-10-06）：create_task/update_task 设 wechat 渠道时结果回报；桥在下方构建，回调惰性求值无 TDZ 问题
       wechatStatus: (uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number } => wechat.status(uid),
       onTurnDone: (uidTurn) => memoryExtractor.notify(uidTurn),
+      turnDeadlineMs: () => turnDeadlineMs,
     },
     db,
   );
@@ -326,6 +332,25 @@ async function main(): Promise<void> {
 `),
   });
   scheduler.start();
+  // 回合超时看护（2026-11-10 Watchdog 前半）：独立 30s 定时器扫「连续运行超过阈值」的会话 →
+  // abort 收尾 + 站内通知（阈值解析见 conversations 装配处，经 deps.turnDeadlineMs 注入）
+  const TURN_WATCH_CHECK_MS = 30 * 1000;
+  const turnWatchTimer = setInterval(() => {
+    void conversations
+      .sweepStuckTurns()
+      .then(async (stuck) => {
+        for (const item of stuck) {
+          const entry = (await conversations.list(item.uid)).find((c) => c.id === item.cid);
+          const title = entry?.title ?? item.cid;
+          process.stdout.write(`[openprism] turn watchdog: stop ${item.uid}/${item.cid}（连续运行 ${(item.runningMs / 60000).toFixed(1)} 分钟）\n`);
+          await notifications.push(item.uid, {
+            kind: "system",
+            text: `会话「${title}」的 AI 回合连续运行超过 ${Math.round(item.runningMs / 60000)} 分钟，已被自动停止（可能是模型卡住或任务异常）。部分已生成的内容保留在会话里，可回看或重新发送。`,
+          });
+        }
+      })
+      .catch((error) => process.stdout.write(`[openprism] turn watchdog failed: ${String((error as Error).message)}\n`));
+  }, TURN_WATCH_CHECK_MS);
   // 记忆提取调度（2026-09-10，WeKnora 化）：10s 扫描到期用户（去抖 90s 登记的）→ 逐个串行提取；
   // 在飞超时自动判死（进程崩溃后重启即恢复），无需专门恢复逻辑
   const EXTRACT_CHECK_MS = 10 * 1000;
@@ -350,6 +375,7 @@ async function main(): Promise<void> {
     scheduler.stop();
     clearInterval(extractTimer);
     clearInterval(nightlyTimer);
+    clearInterval(turnWatchTimer);
     server.close(() => process.exit(0));
   });
 

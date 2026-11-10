@@ -4,7 +4,7 @@
 // 会话模型：cid = wechat:<uid>（置顶固定会话，web 端同步可见同一份日志）；非绑定微信用户的消息忽略。
 
 import type { DatabaseSync } from "node:sqlite";
-import type { ContentBlock, PlatformEnv } from "../harness/index";
+import type { Agent, ContentBlock, PlatformEnv } from "../harness/index";
 import type { ConversationStore } from "./conversations";
 import { ModelNotMultimodalError } from "./conversations";
 import type { NotificationStore } from "./notify";
@@ -137,6 +137,14 @@ export class WechatBridge {
   /** 回合串行链（2026-10-17 聚合引入）：timer 触发的 flush 回合与轮询循环里的文本回合可能并发，
    * per-uid 排队保「同会话同时至多一个回合」（send 的会话池不会并发跑同 key 回合，排队是防线） */
   private turnChains = new Map<string, Promise<unknown>>();
+
+  /** steer 插话链（2026-11-10 全双工）：多条插话的增量推送按序收口——前一条推完并推进水位后，
+   * 后一条才计算增量，防止同一段回复被两条插话各推一次 */
+  private steerChains = new Map<string, Promise<unknown>>();
+
+  /** 增量推送水位（2026-11-10 全双工）：uid → 已成功推回微信的最新 assistant/message seq；
+   * followup 回合与 steer 插话共用，插话回复只推「水位之后的增量」 */
+  private pushedUpTo = new Map<string, number>();
 
   constructor(private deps: WechatBridgeDeps) {
     this.client = createILinkClient({ fetch: deps.env.fetch });
@@ -362,6 +370,12 @@ export class WechatBridge {
     if (text !== "") {
       const pending = this.takePendingMedia(uid);
       const blocks = [...(pending?.blocks ?? []), ...attachments];
+      // steer 路由（2026-11-10 全双工）：回合运行中 + 纯文本（无附件、无攒批媒体、无 / 前缀）→ 插入当前回合改向，
+      // 插话不排队等整个回合结束；其余（新话头 / 带附件 / 点名技能）照旧排串行链开新回合
+      if (pending === undefined && attachments.length === 0 && !text.startsWith("/")) {
+        const steered = await this.trySteerTurn(uid, bind, msg, text);
+        if (steered) return;
+      }
       // 锚 = 当前文本消息（最后到达；比攒批里的图新，回推复用最新 token）
       await this.enqueueTurn(uid, () => this.runTurn(uid, bind, msg, text, blocks));
       return;
@@ -428,12 +442,66 @@ export class WechatBridge {
       );
       return;
     }
+    const lastAssistant = [...events].reverse().find((event) => event.type === "assistant/message");
+    if (lastAssistant !== undefined) this.pushedUpTo.set(uid, lastAssistant.seq); // 推送前先认领水位（插话增量以此为准，防双推；失败有下方日志）
     try {
       await this.sendSegmented(bind.botToken, anchorMsg.fromUserId, anchorMsg.contextToken, reply);
     } catch (error) {
       // 回复推送失败：回合已落日志，web 端可见；下一轮轮询照常（不因单条推送失败停摆）——但必须留日志（排障）
       console.error(
         `[wechat] 回复推送失败（uid=${uid} cid=${cid} 回复 ${reply.length} 字分 ${splitWechatSegments(reply, SEND_SEGMENT_MAX_CHARS).length} 段）:`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  /** 尝试把纯文本消息以 steer 通道插入运行中的回合（2026-11-10 全双工）：会话在跑返回 true（插话异步投递、
+   * 增量文本推回微信），空闲返回 false（调用方照旧排串行链开新回合）。 */
+  private async trySteerTurn(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage, text: string): Promise<boolean> {
+    await this.ensureFeed(uid);
+    const agent = await this.deps.conversations.agent(uid, WECHAT_FEED_CID(uid));
+    if (agent.status !== "running") return false;
+    void this.steerTurn(uid, bind, msg, text, agent).catch((error) => {
+      console.error("[wechat] steer 插话失败:", error instanceof Error ? error.message : error);
+    });
+    return true;
+  }
+
+  /** 插话链：同 uid 的插话投递与增量推送按序收口（前一条推完并推进水位，后一条才算增量——防同段回复双推） */
+  private steerTurn(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage, text: string, agent: Agent): Promise<void> {
+    const prev = this.steerChains.get(uid) ?? Promise.resolve();
+    const next = prev.then(() => this.steerTurnInner(uid, bind, msg, text, agent));
+    this.steerChains.set(uid, next.then(() => undefined, () => undefined));
+    return next;
+  }
+
+  /** 插话投递 + 增量回复推送：插入点之后的 assistant 文本凑批推回；无新增文本 = 插话被当前回合静默吸收，不推。
+   * 增量下沿 = max(水位, 基线)（2026-11-10 审查修正）：水位可能过期偏低——web 端在同一会话产生的未推送回复
+   * 不该借微信插话一并推给微信端；基线 = 插话落点前最新 assistant，两者取大才是「插入点之后」。
+   * 水位在 whenIdle 之后现读（runTurn 的正常推送与插话增量谁先到都以水位为准——防双推）。 */
+  private async steerTurnInner(uid: string, bind: WechatBindRow & { botToken: string }, msg: ILinkInboundMessage, text: string, agent: Agent): Promise<void> {
+    const baseline = [...agent.sessionLog.readAll()].reverse().find((event) => event.type === "assistant/message")?.seq ?? -1;
+    await this.deps.conversations.steer(uid, WECHAT_FEED_CID(uid), text);
+    await agent.whenIdle();
+    const mark = Math.max(this.pushedUpTo.get(uid) ?? -1, baseline);
+    const texts: string[] = [];
+    let pushedSeq = mark;
+    for (const event of agent.sessionLog.readAll()) {
+      if (event.seq <= mark || event.type !== "assistant/message") continue;
+      const segment = event.message.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { text?: string }).text ?? "")
+        .join("");
+      if (segment !== "") texts.push(segment);
+      pushedSeq = event.seq;
+    }
+    if (texts.length === 0) return;
+    this.pushedUpTo.set(uid, pushedSeq); // 发送前先认领水位（同上：防与 runTurn 推送双推）
+    try {
+      await this.sendSegmented(bind.botToken, msg.fromUserId, msg.contextToken, texts.join("\n\n"));
+    } catch (error) {
+      console.error(
+        `[wechat] 插话回复推送失败（uid=${uid} ${texts.length} 段文本）:`,
         error instanceof Error ? error.message : error,
       );
     }

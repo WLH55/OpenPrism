@@ -183,6 +183,47 @@ describe("工具", () => {
     expect((rendered[0] as { text: string }).text).toContain("user_memory_search");
     expect((rendered[0] as { text: string }).text).toContain("不要编造");
   });
+
+  it("search_memory 给 id：返回本条 + supersede 链邻接（带 id/status）；query 与 id 全缺抛错", async () => {
+    const s = store();
+    const a = s.insertItem("u1", { kind: "fact", content: "用户在学钢琴", topic: "爱好", origin: "extracted" });
+    const b = s.insertItem("u1", { kind: "fact", content: "用户在学爵士钢琴", topic: "爱好", origin: "extracted" }); // 同 normKey → supersede a
+    const c = s.insertItem("u1", { kind: "fact", content: "用户改学吉他了", topic: "爱好", origin: "extracted" }); // 再顶替 b
+    expect(a.outcome).toBe("created");
+    const tool = createSearchMemoryTool({ store: s, uid: "u1" });
+    const byId = (await tool.execute({ id: b.item!.id }, {} as never)) as { results: string[] };
+    expect(byId.results).toHaveLength(3); // 本条(b) 在前，链随后（旧 a → 新 c）
+    expect(byId.results[0]).toContain(`id="${b.item!.id}"`);
+    expect(byId.results[1]).toContain(`id="${a.item!.id}"`);
+    expect(byId.results[1]).toContain('status="superseded"');
+    expect(byId.results[2]).toContain(`id="${c.item!.id}"`);
+    expect(byId.results[2]).toContain('status="active"');
+    const missing = (await tool.execute({ id: "no-such-id" }, {} as never)) as { results: string[] };
+    expect(missing.results).toHaveLength(0);
+    await expect(tool.execute({}, {} as never)).rejects.toThrow("query 与 id 至少给一个");
+  });
+});
+
+describe("searchMemoryById 与注入 id 前缀（2026-11-10 链式召回）", () => {
+  it("按 id 精查任意 status 条目 + 链邻接按旧→新；注入块条目行带 [id] 前缀", () => {
+    const s = store();
+    const first = s.insertItem("u1", { kind: "fact", content: "健身目标是减脂", topic: "健身", origin: "extracted" });
+    const second = s.insertItem("u1", { kind: "fact", content: "健身目标改为增肌", topic: "健身", origin: "extracted" });
+    const mid = second.item!;
+    const deep = s.searchMemoryById("u1", mid.id);
+    expect(deep.item?.id).toBe(mid.id);
+    expect(deep.chain.map((i) => i.id)).toEqual([first.item!.id]); // 链上只有被顶替的旧条
+    // 链中间条目（superseded）同样可精查
+    const older = s.searchMemoryById("u1", first.item!.id);
+    expect(older.item?.status).toBe("superseded");
+    expect(older.chain.map((i) => i.id)).toEqual([mid.id]);
+    // 不存在的 id
+    expect(s.searchMemoryById("u1", "none")).toEqual({ chain: [] });
+    // 注入块带 id 前缀：模型可拿 id 顺链深查（只注入 active，superseded 不进注入块）
+    const block = s.recallBlockSync("u1", "健身");
+    expect(block).toContain(`[${mid.id}]`);
+    expect(block).not.toContain(`[${first.item!.id}]`);
+  });
 });
 
 describe("容量淘汰（2026-09-18）", () => {

@@ -219,11 +219,11 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     expect(mock.requests[0]!.system).toContain("OpenPrism");
     expect(mock.requests[0]!.system).toContain("save_preference");
     expect(mock.requests[0]!.tools?.map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "void_flow",
+      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "delete_task", "query_ledger", "query_tasks", "read_shadow", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "void_flow",
     ]);
   });
 
-  it("场景标签与卡片工具（2026-10-12 工作台化一期）：提供 widgets → 装配 19 工具（含 compact，2026-10-19）；Turn 内 set_conversation_scene 落库、回执入日志", async () => {
+  it("场景标签与卡片工具（2026-10-12 工作台化一期）：提供 widgets → 装配 20 工具（含 compact 与 read_shadow）；Turn 内 set_conversation_scene 落库、回执入日志", async () => {
     const db = testDb();
     const mock = createMockLlmAdapter([
       { kind: "tool-calls", calls: [{ name: "set_conversation_scene", arguments: { scene: "装修" } }] },
@@ -236,7 +236,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "把这个会话归到装修场景");
     await (await store.agent(UID, entry.id)).whenIdle();
     expect((mock.requests[0]!.tools ?? []).map((t) => t.name).sort()).toEqual([
-      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "create_widget", "delete_task", "delete_widget", "list_widgets", "query_ledger", "query_tasks", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "update_widget", "void_flow",
+      "cancel_plan", "checkin_plan", "compact", "create_plan", "create_task", "create_widget", "delete_task", "delete_widget", "list_widgets", "query_ledger", "query_tasks", "read_shadow", "record_flow", "save_preference", "search_memory", "set_conversation_scene", "update_plan", "update_task", "update_widget", "void_flow",
     ]);
     // 工具作用于当前会话：落库 + 回执入会话日志（model-visible means logged）
     expect((await store.list(UID)).find((c) => c.id === entry.id)?.scene).toBe("装修");
@@ -306,7 +306,7 @@ describe("ConversationStore（批次2：伙伴与装配）", () => {
     await store.send(UID, entry.id, "帮我看看");
     await (await store.agent(UID, entry.id)).whenIdle();
     const names = mock.requests[0]!.tools!.map((t) => t.name).sort();
-    expect(names).toEqual(["compact", "create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "read_skill_file", "save_preference", "search_memory", "update_task"]);
+    expect(names).toEqual(["compact", "create_task", "delete_task", "load_skill", "query_ledger", "query_tasks", "read_shadow", "read_skill_file", "save_preference", "search_memory", "update_task"]);
     expect(mock.requests[0]!.system).toContain("健身复盘");
     expect(mock.requests[0]!.system).toContain("健身话题");
     expect(mock.requests[0]!.system).not.toContain("加重要建议"); // 正文不进目录层
@@ -1159,5 +1159,129 @@ describe("技能沙箱执行面与 /技能名 钉住", () => {
     const result = events.find((e) => e.type === "tool/result");
     expect(result).toBeDefined();
     expect(JSON.stringify(result)).toContain("未绑定到当前伙伴");
+  });
+});
+
+// ── steer 运行中插话（2026-11-10 全双工）──
+
+describe("ConversationStore.steer（2026-11-10 运行中插话）", () => {
+  it("回合运行中收到 steer：channel=steer 落日志进当前回合，下一请求携带，不开新回合", async () => {
+    const db = testDb();
+    // 手动放行的 mock：请求 1 挂起（模拟模型在跑），放行后回 tool-calls；请求 2 回文本
+    const gate = deferred<void>();
+    const requests: string[] = [];
+    const gated: LlmAdapter = {
+      name: "gated",
+      async complete(request) {
+        requests.push(JSON.stringify(request.messages));
+        if (requests.length === 1) {
+          await gate.promise;
+          return {
+            message: { role: "assistant", content: [{ type: "tool_call", id: "c1", name: "record_flow", arguments: { category: "餐饮", value: 1, unit: "¥" } }] },
+            finishReason: "tool-calls",
+          };
+        }
+        return { message: { role: "assistant", content: [{ type: "text", text: "已按工作日口径统计" }] }, finishReason: "stop" };
+      },
+    };
+    const deps = makeDeps(db, gated);
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "统计这周外卖");
+    while (requests.length === 0) await new Promise((r) => setTimeout(r, 1)); // 请求 1 已发出（回合在跑）
+    await store.steer(UID, entry.id, "只算工作日的");
+    gate.resolve();
+    const agent = await store.agent(UID, entry.id);
+    await agent.whenIdle();
+
+    const events = agent.sessionLog.readAll();
+    expect(events.filter((e) => e.type === "turn/start")).toHaveLength(1); // steer 并入当前回合，未开新回合
+    const steered = events.find((e) => e.type === "user/message" && (e as { channel?: string }).channel === "steer");
+    expect(steered).toBeDefined();
+    expect(JSON.stringify(steered)).toContain("只算工作日的");
+    const lastWire = requests.at(-1)!;
+    expect(lastWire).toContain("只算工作日的");
+    expect(lastWire).toContain("统计这周外卖");
+  });
+
+  it("空闲时 steer：作为下一回合开场输入（opener channel=steer）", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "text", text: "收到" }]);
+    const deps = makeDeps(db, mock.adapter as LlmAdapter);
+    const store = deps.makeStore();
+    const entry = await store.create(UID);
+    await store.steer(UID, entry.id, "顺便帮我看看计划");
+    await (await store.agent(UID, entry.id)).whenIdle();
+    const events = (await store.agent(UID, entry.id)).sessionLog.readAll();
+    const opener = events.find((e) => e.type === "user/message");
+    expect(opener).toBeDefined();
+    expect((opener as { channel?: string }).channel).toBe("steer");
+  });
+
+  it("越权与不存在按不存在拒", async () => {
+    const db = testDb();
+    const mock = createMockLlmAdapter([{ kind: "text", text: "ok" }]);
+    const store = makeDeps(db, mock.adapter as LlmAdapter).makeStore();
+    const entry = await store.create(UID);
+    await expect(store.steer("u-other", entry.id, "插话")).rejects.toThrow("不存在");
+  });
+});
+
+// ── sweepStuckTurns（2026-11-10 回合超时看护）──
+
+describe("ConversationStore.sweepStuckTurns（2026-11-10 回合超时看护）", () => {
+  /** 挂起 adapter：第一跳等 gate 或 abort（与 openai-compat 同形——abort 抛 llmFailure ABORTED） */
+  function makeGated() {
+    const gate = deferred<void>();
+    const requests: string[] = [];
+    const adapter: LlmAdapter = {
+      name: "gated-watch",
+      async complete(request, options) {
+        requests.push(JSON.stringify(request.messages));
+        if (requests.length === 1) {
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => reject(llmFailure("ABORTED", "request aborted"));
+            options?.signal?.addEventListener("abort", onAbort, { once: true });
+            gate.promise.then(
+              () => {
+                options?.signal?.removeEventListener("abort", onAbort);
+                resolve();
+              },
+              () => undefined,
+            );
+          });
+          return {
+            message: { role: "assistant", content: [{ type: "tool_call", id: "c1", name: "record_flow", arguments: { category: "餐饮", value: 1, unit: "¥" } }] },
+            finishReason: "tool-calls",
+          };
+        }
+        return { message: { role: "assistant", content: [{ type: "text", text: "完成" }] }, finishReason: "stop" };
+      },
+    };
+    return { gate, requests, adapter: adapter as LlmAdapter };
+  }
+
+  it("连续运行超过阈值 → stop（aborted 收尾）并返回被停会话；未超时不动", async () => {
+    const db = testDb();
+    let clock = NOW();
+    const { gate, requests, adapter } = makeGated();
+    const deps = makeDeps(db, adapter);
+    const store = new ConversationStore(
+      { ...deps.base, agents: deps.agents, skills: deps.skills, mcps: deps.mcps, memory: deps.memory, tasks: deps.tasks, now: () => clock, turnDeadlineMs: () => 60_000 },
+      db,
+    );
+    const entry = await store.create(UID);
+    await store.send(UID, entry.id, "长时间任务");
+    while (requests.length === 0) await new Promise((r) => setTimeout(r, 1)); // 回合在跑（跟踪表已置入）
+    clock += 1_000;
+    expect(await store.sweepStuckTurns()).toEqual([]); // 未到阈值：不动
+    clock += 61_000;
+    expect(await store.sweepStuckTurns()).toEqual([{ uid: UID, cid: entry.id, runningMs: 62_000 }]); // 运行起点在 send 时刻
+    const agent = await store.agent(UID, entry.id);
+    await agent.whenIdle(); // abort 后回合收尾（adapter 抛 ABORTED → aborted 结束）
+    const events = agent.sessionLog.readAll();
+    expect(events.filter((e) => e.type === "turn/end").at(-1)).toMatchObject({ reason: "aborted" });
+    gate.resolve();
+    expect(requests).toHaveLength(1); // 停止后不再有后续模型请求
   });
 });

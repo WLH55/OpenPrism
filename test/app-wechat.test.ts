@@ -502,4 +502,125 @@ describe("WechatBridge（绑定 / 对话闭环 / 越权 / 过期 / 推送）", (
     expect(ok?.creds).toEqual({ botToken: "bt2", ilinkBotId: "ib2", ilinkUserId: "iu2" });
     expect(await fixture.bridge.pollQRStatus(UID, "qr-x")).toBeNull(); // 已消费的码不能再轮询（重放拦截）
   });
+
+  // ── steer 插话（2026-11-10 全双工：运行中的回合收到新消息即时改向）──
+
+  it("steer 插话：运行中纯文本插入当前回合（channel=steer、下一请求携带、不开新回合），回复只推一次", async () => {
+    const gate = deferred<void>();
+    const fixture = makeFixture([
+      {
+        kind: "fn",
+        fn: async () => {
+          await gate.promise; // 模拟模型在跑：第一跳挂起，等插话落进 Inbox
+          return {
+            message: { role: "assistant", content: [{ type: "tool_call", id: "c1", name: "record_flow", arguments: { category: "餐饮", value: 1, unit: "¥" } }] },
+            finishReason: "tool-calls",
+          };
+        },
+      },
+      { kind: "text", text: "已按工作日口径统计。" },
+    ]);
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
+    let polls = 0;
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/getupdates"), () => {
+      polls += 1;
+      const msg = (id: number, text: string, ctx: string) => ({
+        message_id: id,
+        from_user_id: "wxuser-1",
+        message_type: 1,
+        item_list: [{ type: 1, text_item: { text } }],
+        context_token: ctx,
+      });
+      return polls === 1
+        ? { ret: 0, errcode: 0, get_updates_buf: "cur-1", msgs: [msg(21, "统计这周外卖", "ctx-21")] }
+        : { ret: 0, errcode: 0, get_updates_buf: "cur-2", msgs: [msg(22, "只算工作日的", "ctx-22")] };
+    });
+    await bindActive(fixture);
+    const first = fixture.bridge.pollOnce(UID); // 不 await：回合在第一跳挂起（运行中）
+    while (fixture.mock.requests.length === 0) await new Promise((r) => setTimeout(r, 1));
+    await fixture.bridge.pollOnce(UID); // 插话消息：running → steer 路由，不排队
+    gate.resolve();
+    await first; // 当前回合收尾（含 runTurn 正常推送 + 水位认领）
+
+    const events = fixture.db
+      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq")
+      .all(WECHAT_FEED_CID(UID)) as unknown as { event_json: string }[];
+    const parsed = events.map((r) => JSON.parse(r.event_json) as { type: string; channel?: string });
+    expect(parsed.filter((e) => e.type === "turn/start")).toHaveLength(1); // 插话并入当前回合，未开新回合
+    const steered = parsed.find((e) => e.type === "user/message" && e.channel === "steer");
+    expect(steered).toBeDefined();
+    expect(JSON.stringify(steered)).toContain("只算工作日的");
+    expect(JSON.stringify(fixture.mock.requests[1])).toContain("只算工作日的"); // 下一请求携带
+    // 回复只推一次：runTurn 正常推送认领水位后，插话增量路径无新增可推
+    const replySends = fixture.iLink.calls
+      .filter((c) => c.url.endsWith("/ilink/bot/sendmessage"))
+      .map((c) => JSON.parse(c.init?.body ?? "{}").msg as { item_list: { text_item?: { text?: string } }[] })
+      .filter((m) => m.item_list.some((item) => (item.text_item?.text ?? "").includes("工作日")));
+    expect(replySends).toHaveLength(1);
+  });
+
+  it("空闲时的纯文本照旧开新回合（steer 路由不误伤正常对话）", async () => {
+    const fixture = makeFixture([{ kind: "text", text: "好的，记下了。" }]);
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
+    fixture.iLink.on(
+      (url) => url.endsWith("/ilink/bot/getupdates"),
+      () => ({
+        ret: 0,
+        errcode: 0,
+        get_updates_buf: "cur-1",
+        msgs: [{ message_id: 41, from_user_id: "wxuser-1", message_type: 1, item_list: [{ type: 1, text_item: { text: "记一下今天跑步 30 分钟" } }], context_token: "ctx-41" }],
+      }),
+    );
+    await bindActive(fixture);
+    await fixture.bridge.pollOnce(UID);
+    const events = fixture.db
+      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq")
+      .all(WECHAT_FEED_CID(UID)) as unknown as { event_json: string }[];
+    const parsed = events.map((r) => JSON.parse(r.event_json) as { type: string; channel?: string });
+    expect(parsed.find((e) => e.type === "user/message")?.channel).toBe("followup"); // 空闲 → followup 开场
+  });
+
+  it("运行中的 `/` 前缀消息不走 steer（技能钉住依赖回合上下文）：排队等当前回合结束后作为 followup 开新回合", async () => {
+    const gate = deferred<void>();
+    const fixture = makeFixture([
+      {
+        kind: "fn",
+        fn: async () => {
+          await gate.promise; // 第一回合挂起（运行中）
+          return { message: { role: "assistant", content: [{ type: "text", text: "第一回合完成" }] }, finishReason: "stop" };
+        },
+      },
+      { kind: "text", text: "已载入技能" },
+    ]);
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/sendmessage"), () => iLinkOk);
+    let polls = 0;
+    fixture.iLink.on((url) => url.endsWith("/ilink/bot/getupdates"), () => {
+      polls += 1;
+      const msg = (id: number, text: string, ctx: string) => ({
+        message_id: id,
+        from_user_id: "wxuser-1",
+        message_type: 1,
+        item_list: [{ type: 1, text_item: { text } }],
+        context_token: ctx,
+      });
+      return polls === 1
+        ? { ret: 0, errcode: 0, get_updates_buf: "cur-1", msgs: [msg(51, "统计这周外卖", "ctx-51")] }
+        : { ret: 0, errcode: 0, get_updates_buf: "cur-2", msgs: [msg(52, "/技能名 看看", "ctx-52")] };
+    });
+    await bindActive(fixture);
+    const first = fixture.bridge.pollOnce(UID); // 不 await：第一回合挂起
+    while (fixture.mock.requests.length === 0) await new Promise((r) => setTimeout(r, 1));
+    gate.resolve();
+    await first; // 第一回合收尾
+    await fixture.bridge.pollOnce(UID); // / 前缀消息：排队链已空 → followup 开新回合（经串行链，非 steer）
+    const events = fixture.db
+      .prepare("SELECT event_json FROM conversation_events WHERE cid = ? ORDER BY seq")
+      .all(WECHAT_FEED_CID(UID)) as unknown as { event_json: string }[];
+    const parsed = events.map((r) => JSON.parse(r.event_json) as { type: string; channel?: string });
+    expect(parsed.filter((e) => e.type === "turn/start")).toHaveLength(2); // 两个独立回合
+    const openers = parsed.filter((e) => e.type === "user/message");
+    expect(openers[0]?.channel).toBe("followup");
+    expect(openers[1]?.channel).toBe("followup"); // / 前缀未走 steer
+    expect(JSON.stringify(openers[1])).toContain("/技能名");
+  });
 });

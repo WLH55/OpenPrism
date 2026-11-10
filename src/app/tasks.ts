@@ -601,6 +601,10 @@ export interface SchedulerDeps {
 
 const CATCHUP_WINDOW_MS = 24 * 3600 * 1000;
 
+/** 组间并发上界（2026-11-10 到点任务分组并发）：同时推进的 feed 会话组数；组内（同一伙伴的任务共享
+ * 一个 feed 会话）严格串行，保「每任务推送取自己回合末条回复」的归属语义 */
+const TASK_GROUP_CONCURRENCY = 3;
+
 export class Scheduler {
   private timer: ReturnType<typeof setInterval> | undefined;
   /** 重入防护（评审 2026-09-29 pre-existing）：模型回合可超 tick 间隔（last_run_ts 要等 whenIdle 后才写），
@@ -633,6 +637,9 @@ export class Scheduler {
   private async tickInner(): Promise<number> {
     const now = this.deps.now();
     let fired = 0;
+    // 扫描阶段收集到点任务，按 feed 会话分组（组 = feed:<uid>:<agentId|default>，与 ensureTaskFeed 同构）：
+    // 分发即推 lastRun；组内串行保推送归属，组间并行提吞吐（2026-11-10 分组并发）
+    const groups = new Map<string, { uid: string; task: TaskDef; due: number }[]>();
     for (const uid of this.deps.uids()) {
       const tasks = await this.deps.tasks.list(uid);
       for (const task of tasks) {
@@ -655,19 +662,41 @@ export class Scheduler {
           await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "skipped", detail: `错过 ${(now - due) / 3600000}h` });
           continue;
         }
-        try {
-          await this.deps.runTask(uid, task, { kind: "scheduled", due });
-          task.lastRunTs = now;
-          await this.deps.tasks.updateLastRun(uid, task.id, now);
-          await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "ran" });
-          fired += 1;
-        } catch (error) {
-          task.lastRunTs = now;
-          await this.deps.tasks.updateLastRun(uid, task.id, now);
-          await this.deps.tasks.recordRun(uid, task.id, { ts: now, status: "failed", detail: String((error as Error).message).slice(0, 200) });
-        }
+        // 分发即推锚点（2026-11-10 分组并发）：lastRun 在投递时就推进，任务回合挂起期间重复 tick 不重发
+        // （recordRun 仍在完成/失败时落，ran/failed 结局与原来一致）
+        task.lastRunTs = now;
+        await this.deps.tasks.updateLastRun(uid, task.id, now);
+        const groupKey = `${TASK_FEED_CID_PREFIX}${uid}:${task.agentId ?? "default"}`;
+        const group = groups.get(groupKey) ?? [];
+        group.push({ uid, task, due });
+        groups.set(groupKey, group);
       }
     }
+    // 组内串行（保同 feed 会话回合顺序与推送归属）、组间并行（上界 TASK_GROUP_CONCURRENCY）：
+    // 一条慢简报不再阻塞同 tick 里其他 feed 会话的到点任务
+    const runOne = async (item: { uid: string; task: TaskDef; due: number }): Promise<boolean> => {
+      try {
+        await this.deps.runTask(item.uid, item.task, { kind: "scheduled", due: item.due });
+        await this.deps.tasks.recordRun(item.uid, item.task.id, { ts: now, status: "ran" });
+        return true;
+      } catch (error) {
+        await this.deps.tasks.recordRun(item.uid, item.task.id, { ts: now, status: "failed", detail: String((error as Error).message).slice(0, 200) });
+        return false;
+      }
+    };
+    const queue = [...groups.values()];
+    const workers = Array.from({ length: Math.min(TASK_GROUP_CONCURRENCY, queue.length) }, async (): Promise<number> => {
+      let count = 0;
+      for (;;) {
+        const group = queue.shift();
+        if (group === undefined) break;
+        for (const item of group) {
+          if (await runOne(item)) count += 1;
+        }
+      }
+      return count;
+    });
+    for (const count of await Promise.all(workers)) fired += count;
     return fired;
   }
 }

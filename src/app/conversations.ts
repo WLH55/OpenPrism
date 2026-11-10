@@ -8,6 +8,7 @@ import { createAgent, flattenText, hasImageBlocks } from "../harness/index";
 import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
+import { createReadShadowTool } from "./shadow";
 import { createLedgerTools } from "./tools";
 import { composeAssistantPrompt, dateLine } from "./persona";
 import { createLoadSkillTool, createReadSkillFileTool, skillCatalogPrompt, type SkillMeta } from "./skills";
@@ -39,6 +40,9 @@ export class ModelNotMultimodalError extends Error {
  * 个人助理口径的压缩摘要指令（2026-10-19 摘要指令适配）：会话被压缩时，摘要保的是用户近况、
  * 目标计划、约定承诺这些陪伴/习惯管理要素；harness 缺省为领域中立口径，app 语义在 app 层。
  */
+/** 回合超时看护缺省阈值（2026-11-10 Watchdog 前半）：须大于最长工具超时（skill_exec 上限 600s） */
+export const DEFAULT_TURN_DEADLINE_MS = 20 * 60_000;
+
 export const PERSONAL_SUMMARY_INSTRUCTION = `请把以上对话历史压缩为一份结构化 Markdown 摘要，供后续对话作为唯一的历史记忆。严格按以下小节输出：
 
 # 用户近况与情绪
@@ -119,6 +123,8 @@ export interface ConversationDeps {
   wechatStatus?(uid: string): { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
   /** 一轮对话完成（agent.whenIdle 后）的回调——记忆提取去抖登记用；缺省不触发 */
   onTurnDone?(uid: string): void;
+  /** 回合超时看护阈值（毫秒，2026-11-10 Watchdog 前半）；缺省 20 分钟，生产从 OP_TURN_MAX_MS 读入 */
+  turnDeadlineMs?(): number;
 }
 
 export interface TaskStoreLike {
@@ -252,6 +258,10 @@ export class ConversationStore {
   private assembling = new Map<string, Promise<Agent>>();
   /** 本回合思考开关（send() 写入、onRequest 闭包读；缺省 = 端点方言各自决定，智谱 coding 缺省关） */
   private turnThinking = new Map<string, boolean>();
+
+  /** 回合开始跟踪（2026-11-10 超时看护）：watch key（uid:conversationId）→ 本轮连续运行的起始时钟读数；
+   * status=running 置入（同一驱动的连续回合不重置——连续运行超阈同样该停），status 离开 running 清除 */
+  private turnStartedAt = new Map<string, number>();
 
   constructor(
     private deps: ConversationDeps,
@@ -669,6 +679,9 @@ export class ConversationStore {
         return { arranged: true };
       },
     });
+    // 压缩区间回读工具（2026-11-10 Spill 回读）：系统级，与 compact 配对——压缩摘要把原文移出可见面时
+    // 标注可回读的 seq 区间，模型按需用本工具读回原文（内容直接来自会话日志，铁律 2 天然满足）
+    tools.push(createReadShadowTool({ log: sessionLog }));
 
     const agent = createAgent({
       env,
@@ -702,6 +715,13 @@ export class ConversationStore {
       maxStepsPerTurn: 24,
     });
     agentRef = agent;
+    // 回合开始跟踪（2026-11-10 超时看护）：sweepStuckTurns 据此判「运行超过阈值」的会话
+    agent.subscribe((event) => {
+      if (event.type !== "status") return;
+      const watchKey = `${uid}:${conversationId}`;
+      if (event.status === "running") this.turnStartedAt.set(watchKey, this.deps.now());
+      else this.turnStartedAt.delete(watchKey);
+    });
     return agent;
   }
 
@@ -794,6 +814,17 @@ export class ConversationStore {
     this.deps.onTurnDone?.(uid);
   }
 
+  /**
+   * 运行中插话（2026-11-10 全双工）：消息以 steer 通道插入当前回合——回合在跑时下一条模型请求前生效（当步改向），
+   * 空闲时作为下一回合开场输入（harness steer 语义）。不带回合上下文：钟面/记忆召回是回合 opener 的装配，
+   * steer 是当步补充，投影口径与 harness 一致（channel=steer 落日志，铁律 2 可重建）。
+   */
+  async steer(uid: string, cid: string, text: string): Promise<void> {
+    if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
+    const agent = await this.agent(uid, cid);
+    agent.steer(text);
+  }
+
   /** /技能名 前缀钉住（2026-10-21 手动调用）：命中当前伙伴绑定的可用技能 → 回合上下文追加强制载入指令；
    *  compact 是保留命令（前端 /compact 压缩入口），即便有同名技能也不钉住（验收 N8）；
    *  已安装可用但未绑定的技能 → 注入提示行，让模型告知用户先绑定（绑定才可用，2026-10-21 绑定裁决） */
@@ -821,6 +852,33 @@ export class ConversationStore {
     if (this.ownerOf(cid) !== uid) throw new Error(`conversation "${cid}" 不存在`);
     const agent = await this.agent(uid, cid);
     agent.cancel();
+  }
+
+  /**
+   * 回合超时看护（2026-11-10 Watchdog 前半）：Turn Budget 封步数、流空闲超时封挂起，
+   * 这里封「合法开始却长时间不结束」的回合——连续运行超过阈值的会话按 abort 语义 stop
+   * （已收到的部分输出保留为 interrupted 消息、Inbox 清空），返回被停会话供调用方落站内通知。
+   * 阈值须大于最长工具超时（skill_exec 上限 600s），缺省 20 分钟，deps.turnDeadlineMs 可覆盖。
+   */
+  async sweepStuckTurns(): Promise<Array<{ uid: string; cid: string; runningMs: number }>> {
+    const deadlineMs = this.deps.turnDeadlineMs?.() ?? DEFAULT_TURN_DEADLINE_MS;
+    const now = this.deps.now();
+    const stuck: Array<{ uid: string; cid: string; runningMs: number }> = [];
+    for (const [key, startedAt] of this.turnStartedAt) {
+      if (now - startedAt < deadlineMs) continue;
+      const sep = key.indexOf(":");
+      const uid = key.slice(0, sep);
+      const cid = key.slice(sep + 1);
+      try {
+        await this.stop(uid, cid);
+      } catch (error) {
+        // 会话已被删除：清跟踪；其他原因（装配失败等）：保留跟踪，下轮 sweep 重试，不外抛（2026-11-10 审查）
+        if (String((error as Error)?.message ?? error).includes("不存在")) this.turnStartedAt.delete(key);
+        continue;
+      }
+      stuck.push({ uid, cid, runningMs: now - startedAt });
+    }
+    return stuck;
   }
 
   /** 任务触发回合不经 send()（main.ts 直投 followup）：投递前清回合思考标志，避免吃到用户在 web 端同会话留下的残留 */

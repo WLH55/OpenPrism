@@ -133,9 +133,11 @@ describe("compactConversation", () => {
     const summaryEvent = log.readAll().find((event) => event.type === "compaction/summary");
     expect(summaryEvent).toBeDefined();
     expect(currentGeneration(log.readAll())).toBe(1);
-    // 投影：遮蔽区间被 checkpoint 替换
+    // 投影：遮蔽区间被 checkpoint 替换（checkpoint 末尾带区间回读标注，2026-11-10 Spill 回读）
     const surface = projectSurface(log.readAll());
-    expect((surface[0]!.message.content[0] as { text: string }).text).toBe("# 摘要\n聊了两个问题");
+    expect((surface[0]!.message.content[0] as { text: string }).text).toBe(
+      "# 摘要\n聊了两个问题\n\n〔以上为压缩摘要；序号 0–1 的原文保留在日志中，可用 read_shadow 工具按区间取回〕",
+    );
     expect(surface[surface.length - 1]!.message).toEqual(user("第二个问题"));
   });
 
@@ -235,7 +237,9 @@ describe("agent 集成：压力与溢出", () => {
     expect(summaryEvent).toBeDefined();
     expect(mock.requests).toHaveLength(3);
     const secondRequest = mock.requests[2]!.messages;
-    expect((secondRequest[0]!.content[0] as { text: string }).text).toBe("# 摘要");
+    expect((secondRequest[0]!.content[0] as { text: string }).text).toBe(
+      "# 摘要\n\n〔以上为压缩摘要；序号 1–1 的原文保留在日志中，可用 read_shadow 工具按区间取回〕",
+    );
     const reasons = log.readAll().filter((event) => event.type === "turn/end");
     expect(reasons.every((event) => (event as { reason: string }).reason === "completed")).toBe(true);
   });
@@ -269,7 +273,9 @@ describe("agent 集成：压力与溢出", () => {
     expect(mock.requests).toHaveLength(4);
     // 重试请求以 checkpoint 开头
     const retryRequest = mock.requests[3]!.messages;
-    expect((retryRequest[0]!.content[0] as { text: string }).text).toBe("概要");
+    expect((retryRequest[0]!.content[0] as { text: string }).text).toBe(
+      "概要\n\n〔以上为压缩摘要；序号 1–3 的原文保留在日志中，可用 read_shadow 工具按区间取回〕",
+    );
     // 摘要请求复用会话前缀（同 system + 被压区间消息）
     expect(mock.requests[2]!.system).toBe("S");
   });

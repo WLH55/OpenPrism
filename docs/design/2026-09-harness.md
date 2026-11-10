@@ -92,6 +92,10 @@ OpenAI 兼容协议（覆盖 DeepSeek/GLM/Qwen/Moonshot/OpenRouter）：SSE 流�
 1. **裁剪**（零成本）：`tool/result` 文本 > 8192 字符 → 头 4096 + 尾 1024 + 占位符 `[... tool result middle pruned ...]`（按 Unicode code point 计量；非文本块不动）；
 2. **摘要**（花 token）：保留尾部 `retainTokens = 0.16 × contextWindow`，从头部选可压缩区间，**边界回退至不切开 tool-call/result 配对**；摘要请求**复用会话前缀**（同 system + tools + 被压区间消息）以保 KV cache 命中，仅在末尾追加一条指令消息；输出结构化 Markdown（任务意图 / 关键概念 / 文件与代码 / 错误与修复 / 未竟事项 / 当前工作 / 下一步 / 关键上下文），要求精确保留路径、命令、错误串、数值。
 
+checkpoint 消息末尾带遮蔽区间的序号标注（2026-11-10 Spill 回读）：模型由此知道区间原文保留在日志中、可用宿主提供的 read_shadow 类工具按序号区间取回——压缩只改模型可见面，原文永不删除（遮蔽语义）。
+
+**投影悬空补全**（2026-11-10）：进程硬崩溃可能落在 `assistant/message` 落日志与全部 `tool/result` 落日志之间，留下无结果的 tool_call；日志 append-only 无法回插，投影层确定性推导补上 `code: "INTERRUPTED"` 的合成 isError 结果（紧随悬空调用、铁律 2 投影路径），恢复 wire 协议合法。
+
 ### 5.4 事务与正确性
 
 - `compaction/start` → 摘要 → **稳定性检查**（摘要期间 Surface 变更则放弃提交）→ `compaction/summary` 事件（含被遮蔽区间与摘要）+ checkpoint 消息整体替换区间 → `compaction/end`（失败也收尾）；

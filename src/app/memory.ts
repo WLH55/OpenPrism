@@ -574,7 +574,8 @@ export class MemoryStore {
 
   private renderEntry(item: MemoryItem): string {
     const label = item.topic !== "" ? `${KIND_LABELS[item.kind]}·${item.topic}` : KIND_LABELS[item.kind];
-    return `- (${label}) ${item.content}`;
+    // id 前缀（2026-11-10 链式召回）：模型可拿 id 调 search_memory 深查本条与 supersede 链邻接条目
+    return `- [${item.id}] (${label}) ${item.content}`;
   }
 
   /**
@@ -647,6 +648,49 @@ export class MemoryStore {
     const vectorOrder = (vectorHits ?? []).filter((h) => byId.has(h.id)).map((h) => h.id);
     const order = vectorOrder.length > 0 ? fuseRankings(lexicalOrder, vectorOrder) : lexicalOrder;
     return order.map((id) => byId.get(id)!).slice(0, cap);
+  }
+
+  /**
+   * 按 id 查条目与 supersede 链邻接（2026-11-10 链式召回）：注入块与 search_memory 结果带条目 id，
+   * 模型可顺 id 深查「这条记忆的来龙去脉」。本条任意 status 可查（含 superseded/archived/pending）；
+   * chain = 链上其余条目（沿 supersededBy 向新追 + 反查 superseded_by 指向链上条目的旧条），按旧 → 新排序。
+   */
+  searchMemoryById(uid: string, id: string): { item?: MemoryItem; chain: MemoryItem[] } {
+    const byId = (target: string): MemoryItem | undefined => {
+      const row = this.deps.db.prepare(`SELECT * FROM memory_items WHERE uid = ? AND id = ?`).get(uid, target) as unknown as ItemRow | undefined;
+      return row === undefined ? undefined : rowToItem(row);
+    };
+    const item = byId(id);
+    if (item === undefined) return { chain: [] };
+    const chain: MemoryItem[] = [];
+    const visited = new Set<string>([item.id]);
+    // 向新：沿本条 supersededBy 逐跳前进
+    let newerId = item.supersededBy;
+    while (newerId !== undefined && !visited.has(newerId)) {
+      const newer = byId(newerId);
+      if (newer === undefined) break;
+      visited.add(newer.id);
+      chain.push(newer);
+      newerId = newer.supersededBy;
+    }
+    // 向旧：反查被链上条目顶替的条目（一条旧条目只被一条新条目顶替，防御性取全部并逐层外扩）
+    let frontier = [item.id];
+    const olderItems: MemoryItem[] = [];
+    while (frontier.length > 0) {
+      const placeholders = frontier.map(() => "superseded_by = ?").join(" OR ");
+      const rows = this.deps.db
+        .prepare(`SELECT * FROM memory_items WHERE uid = ? AND (${placeholders})`)
+        .all(uid, ...frontier) as unknown as ItemRow[];
+      frontier = [];
+      for (const row of rows) {
+        if (visited.has(row.id)) continue;
+        visited.add(row.id);
+        olderItems.push(rowToItem(row));
+        frontier.push(row.id);
+      }
+    }
+    olderItems.reverse(); // 收集顺序是「较新 → 较旧」，翻成旧 → 新
+    return { item, chain: [...olderItems, ...chain] };
   }
 
   // ── meta（调度状态原语，MemoryExtractor 用） ──
@@ -755,12 +799,13 @@ export function createSearchMemoryTool(deps: {
   return {
     name: "search_memory",
     description:
-      "检索对这位用户的长期记忆。开场时已有部分记忆自动注入；当对话推进到注入块没覆盖的细节、或用户问「你记得我什么」时调用。用用户自己的话描述要查的主题。",
+      "检索对这位用户的长期记忆。开场时已有部分记忆自动注入；当对话推进到注入块没覆盖的细节、或用户问「你记得我什么」时调用。用用户自己的话描述要查的主题；注入块里的记忆条目带方括号 id，给 id 则返回该条与它的 supersede 链邻接条目（看这条记忆怎么演变来的）。",
     parameters: {
       type: "object",
-      required: ["query"],
+      required: [],
       properties: {
         query: { type: "string", description: "要查的主题，用用户自己的话" },
+        id: { type: "string", description: "按条目 id 精查（返回本条 + supersede 链邻接）；与 query 二选一" },
         limit: { type: "number", description: "返回条数上限，默认 10" },
       },
     },
@@ -773,16 +818,23 @@ export function createSearchMemoryTool(deps: {
       },
     },
     async execute(args) {
+      const id = String((args as { id?: unknown })?.id ?? "");
+      const memoryEntry = (item: MemoryItem): string => {
+        const date = new Date(item.validFrom).toISOString().slice(0, 10);
+        const label = item.topic !== "" ? `${KIND_LABELS[item.kind]}·${item.topic}` : KIND_LABELS[item.kind];
+        return `<memory id="${item.id}" kind="${label}" status="${item.status}" recorded="${date}">${sanitizeMemoryContent(item.content)}</memory>`;
+      };
+      if (id !== "") {
+        const { item, chain } = deps.store.searchMemoryById(deps.uid, id);
+        if (item === undefined) return { results: [] };
+        return { results: [memoryEntry(item), ...chain.map(memoryEntry)] };
+      }
       const query = String((args as { query?: unknown })?.query ?? "");
+      if (query.trim() === "") throw new Error("query 与 id 至少给一个");
       const limit = Number((args as { limit?: unknown })?.limit ?? 10);
       const hits = deps.vectorRecall ? await deps.vectorRecall(deps.uid, query) : null;
       const items = deps.store.searchMemory(deps.uid, query, Number.isFinite(limit) ? limit : 10, hits ?? undefined);
-      const results = items.map((item) => {
-        const date = new Date(item.validFrom).toISOString().slice(0, 10);
-        const label = item.topic !== "" ? `${KIND_LABELS[item.kind]}·${item.topic}` : KIND_LABELS[item.kind];
-        return `<memory kind="${label}" recorded="${date}">${sanitizeMemoryContent(item.content)}</memory>`;
-      });
-      return { results };
+      return { results: items.map(memoryEntry) };
     },
     isConcurrencySafe: () => true,
   };

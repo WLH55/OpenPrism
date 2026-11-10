@@ -6,6 +6,7 @@ import type { SessionEvent } from "../src/harness/session/events";
 import { InMemorySessionLog, JsonlSessionLog } from "../src/harness/session/log";
 import {
   DEFAULT_PRUNE,
+  INTERRUPTED_TOOL_CODE,
   PRUNE_PLACEHOLDER,
   deriveMessages,
   projectSurface,
@@ -73,7 +74,7 @@ describe("deriveMessages 投影", () => {
     expect(messages).toEqual([user("问题"), assistant("回答")]);
   });
 
-  it("遮蔽区间被 compaction/summary 整体替换为 checkpoint 消息", async () => {
+  it("遮蔽区间被 compaction/summary 整体替换为 checkpoint 消息（带区间回读标注）", async () => {
     const log = new InMemorySessionLog(() => 0);
     await log.append({ type: "user/message", channel: "followup", message: user("旧问题") }); // seq 0
     await log.append({ type: "assistant/message", message: assistant("旧回答") }); // seq 1
@@ -85,8 +86,90 @@ describe("deriveMessages 投影", () => {
       generation: 1,
     });
     const messages = deriveMessages(log.readAll());
-    expect(messages).toEqual([user("# 摘要\n旧对话讲过 X"), user("新问题")]);
+    expect(messages).toEqual([
+      user("# 摘要\n旧对话讲过 X\n\n〔以上为压缩摘要；序号 0–1 的原文保留在日志中，可用 read_shadow 工具按区间取回〕"),
+      user("新问题"),
+    ]);
     expect(currentGeneration(log.readAll())).toBe(1);
+  });
+
+  it("悬空 tool_call 投影补全：硬崩溃留下的无结果调用紧随合成 isError 结果", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    const withCall: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "查一下" }, { type: "tool_call", id: "c1", name: "query", arguments: {} }],
+    };
+    await log.append({ type: "user/message", channel: "followup", message: user("问题") }); // seq 0
+    await log.append({ type: "assistant/message", message: withCall }); // seq 1——崩溃点：result 永远没来
+    await log.append({ type: "user/message", channel: "followup", message: user("重启后新消息") }); // seq 2
+    const messages = deriveMessages(log.readAll());
+    expect(messages).toHaveLength(4);
+    expect(messages[1]).toMatchObject({ role: "assistant", content: withCall.content });
+    expect(messages[2]).toEqual({
+      role: "tool_result",
+      callId: "c1",
+      isError: true,
+      content: [{ type: "text", text: "进程中断，此工具调用未取得结果。" }],
+      code: INTERRUPTED_TOOL_CODE,
+    });
+    expect(messages[3]).toEqual(user("重启后新消息"));
+    // 协议合法：每个 tool_call 恰有一个配对结果，结果在调用之后
+    expect(messages.filter((m) => m.role === "tool_result")).toHaveLength(1);
+  });
+
+  it("悬空补全：一条 assistant 带多个无结果调用全部补齐；已有结果的不重复补", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    const answered: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "tool_call", id: "ok1", name: "t", arguments: {} }],
+    };
+    const dangling: AssistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "tool_call", id: "d1", name: "t", arguments: { n: 1 } },
+        { type: "tool_call", id: "d2", name: "t", arguments: { n: 2 } },
+      ],
+    };
+    await log.append({ type: "assistant/message", message: answered }); // seq 0
+    await log.append({ type: "tool/result", id: "ok1", isError: false, content: [{ type: "text", text: "好" }] }); // seq 1
+    await log.append({ type: "assistant/message", message: dangling }); // seq 2——崩溃点
+    const messages = deriveMessages(log.readAll());
+    expect(messages).toHaveLength(5); // assistant + result + assistant(悬空) + 合成×2
+    expect(messages.filter((m) => m.role === "tool_result").map((m) => (m as { callId: string }).callId)).toEqual([
+      "ok1",
+      "d1",
+      "d2",
+    ]);
+    for (const message of messages) {
+      if (message.role === "tool_result" && (message as { callId: string }).callId.startsWith("d")) {
+        expect((message as { code?: string }).code).toBe(INTERRUPTED_TOOL_CODE);
+        expect((message as { isError: boolean }).isError).toBe(true);
+      }
+    }
+  });
+
+  it("遮蔽区间内的悬空调用不补（随区间一起消失）；正常配对投影与改动前逐字节一致", async () => {
+    const log = new InMemorySessionLog(() => 0);
+    const dangling: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "tool_call", id: "old", name: "t", arguments: {} }],
+    };
+    await log.append({ type: "user/message", channel: "followup", message: user("旧") }); // seq 0
+    await log.append({ type: "assistant/message", message: dangling }); // seq 1——悬空后被压缩吞掉
+    await log.append({ type: "user/message", channel: "followup", message: user("新") }); // seq 2
+    await log.append({ type: "assistant/message", message: assistant("新答") }); // seq 3
+    await log.append({ type: "compaction/summary", shadowed: [0, 1], summary: "概", generation: 1 }); // seq 4
+    const messages = deriveMessages(log.readAll());
+    expect(messages.filter((m) => m.role === "tool_result")).toHaveLength(0); // 无孤儿合成结果
+    // 正常配对不受影响：结果存在时不插合成项
+    const log2 = new InMemorySessionLog(() => 0);
+    const paired: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "tool_call", id: "p1", name: "t", arguments: {} }],
+    };
+    await log2.append({ type: "assistant/message", message: paired });
+    await log2.append({ type: "tool/result", id: "p1", isError: false, content: [{ type: "text", text: "结果" }] });
+    expect(deriveMessages(log2.readAll())).toHaveLength(2);
   });
 
   it("interrupted assistant 照常进入投影", async () => {

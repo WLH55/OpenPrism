@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { nodeEnv } from "../src/app/env";
 import { createTaskTools, builtinTaskTemplates, cronMatches, describeTrigger, nextDue, Scheduler, taskTriggerMessage, TaskStore, type TaskDef, type TaskRunTrigger, type TaskTrigger } from "../src/app/tasks";
 import { testDb } from "./helpers-db";
+import { deferred, sleep } from "./helpers";
 
 const TZ = 480; // UTC+8
 const T = (s: string): number => Date.parse(s); // UTC 解析
@@ -541,5 +542,96 @@ describe("微信绑定真相回报（A4，2026-10-06）+ 内置保活文案（C�
     expect(brief.instruction).toContain("回");
     expect(report.instruction).toContain("12 小时");
     expect(weekly.instruction).not.toContain("12 小时");
+  });
+});
+
+// ── 分组并发（2026-11-10）：组（feed 会话）内串行保推送归属，组间并行不被慢任务阻塞 ──
+
+describe("Scheduler 分组并发（2026-11-10）", () => {
+  /** 建两用户各一个到点任务（daily 23:00 当地 → 15:01Z 到点） */
+  const makeDue = async () => {
+    const db = testDb();
+    const createStore = new TaskStore({ db, now: () => T("2026-09-03T00:00:00Z"), randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+    const a = await createStore.create("u-a", { title: "A", instruction: "a", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
+    const b = await createStore.create("u-b", { title: "B", instruction: "b", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
+    return { db, store: createStore, a, b };
+  };
+
+  it("组间并行：一个组挂起不阻塞其他组执行", async () => {
+    const { store, a } = await makeDue();
+    const gateA = deferred<void>();
+    const started = { a: false, b: false };
+    const scheduler = new Scheduler({
+      uids: () => ["u-a", "u-b"],
+      tasks: store,
+      runTask: async (uidRun) => {
+        if (uidRun === "u-a") {
+          started.a = true;
+          await gateA.promise; // u-a 的简报挂起（模拟慢回合）
+        } else {
+          started.b = true; // u-b 照常推进
+        }
+      },
+      now: () => T("2026-09-03T15:01:00Z"),
+    });
+    const ticking = scheduler.tick();
+    while (!started.b) await sleep(1); // u-a 挂起期间 u-b 已在跑（并行证据）
+    expect(started.a).toBe(true);
+    expect((await store.runs("u-a", a.id)).length).toBe(0); // u-a 未完成 → 尚无 run 记录
+    gateA.resolve();
+    expect(await ticking).toBe(2);
+    expect((await store.runs("u-a", a.id)).at(-1)).toMatchObject({ status: "ran" }); // 释放后补落 ran
+  });
+
+  it("组内串行 + 挂起期间重复 tick 不重发", async () => {
+    const db = testDb();
+    const store = new TaskStore({ db, now: () => T("2026-09-03T00:00:00Z"), randomUUID: () => `tid-${Math.random().toString(36).slice(2, 8)}` });
+    const t1 = await store.create("u-1", { title: "T1", instruction: "1", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
+    const t2 = await store.create("u-1", { title: "T2", instruction: "2", trigger: { kind: "daily", time: "23:00" }, tzOffsetMinutes: TZ });
+    const seen: string[] = [];
+    const gate = deferred<void>();
+    const scheduler = new Scheduler({
+      uids: () => ["u-1"],
+      tasks: store,
+      runTask: async (_uid, task) => {
+        if (seen.length === 0) {
+          seen.push(task.id);
+          await gate.promise; // 组内第一个任务挂起
+        } else {
+          seen.push(task.id);
+        }
+      },
+      now: () => T("2026-09-03T15:01:00Z"),
+    });
+    const ticking = scheduler.tick();
+    await sleep(5); // 扫描分发完成、同组第一个任务开始执行并挂起
+    expect(seen).toHaveLength(1); // 组内串行：第一个未完成，第二个未开始（不依赖 list 返回顺序）
+    expect(await scheduler.tick()).toBe(0); // 重入防护：挂起期间重复 tick 不重发
+    gate.resolve();
+    expect(await ticking).toBe(2);
+    expect(seen).toHaveLength(2); // 释放后第二个才跑
+    expect((await store.runs("u-1", t2.id)).at(-1)).toMatchObject({ status: "ran" });
+    expect(t1.id === seen[0] || t2.id === seen[0]).toBe(true);
+  });
+
+  it("分发即推 lastRun：任务挂起期间锚点已推进（重启后新调度器不重发）", async () => {
+    const { store, a } = await makeDue();
+    const gateA = deferred<void>();
+    const scheduler = new Scheduler({
+      uids: () => ["u-a"],
+      tasks: store,
+      runTask: async () => {
+        await gateA.promise;
+      },
+      now: () => T("2026-09-03T15:01:00Z"),
+    });
+    const ticking = scheduler.tick();
+    await sleep(5); // 已分发（lastRun 已推）
+    expect((await store.get("u-a", a.id))?.lastRunTs).toBe(T("2026-09-03T15:01:00Z"));
+    // 真实"重启"：新调度器实例、锚点已推进 → 不再触发
+    const after = new Scheduler({ uids: () => ["u-a"], tasks: store, runTask: async () => undefined, now: () => T("2026-09-03T15:02:00Z") });
+    expect(await after.tick()).toBe(0);
+    gateA.resolve();
+    expect(await ticking).toBe(1);
   });
 });
