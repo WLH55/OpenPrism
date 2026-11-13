@@ -3,7 +3,7 @@
 // "模型可见即日志可重建"天然满足。
 
 import type { DatabaseSync } from "node:sqlite";
-import type { ToolDefinition } from "../harness/index";
+import type { AppTool } from "./tools";
 import { parseSkillFile } from "./skillpkg";
 import type { SkillFilesIO } from "./skillpkg";
 
@@ -219,9 +219,10 @@ export function createLoadSkillTool(deps: {
   files: SkillFilesIO;
   /** 装配期伙伴绑定的技能 id 集：未绑定就绪技能在此拒绝（绑定才可用，2026-10-21） */
   allowedSkillIds: ReadonlySet<string>;
-}): ToolDefinition {
+}): AppTool {
   return {
     name: "load_skill",
+    domain: "skill",
     description: "载入某个已安装技能的完整内容（目录只给了摘要，正文用这个工具拿）；返回正文与捆绑文件清单。",
     parameters: {
       type: "object",
@@ -267,9 +268,10 @@ export function createReadSkillFileTool(deps: {
   files: SkillFilesIO;
   /** 装配期伙伴绑定的技能 id 集：与 load_skill 同一裁决（绑定才可用，2026-10-21） */
   allowedSkillIds: ReadonlySet<string>;
-}): ToolDefinition {
+}): AppTool {
   return {
     name: "read_skill_file",
+    domain: "skill",
     description:
       "读取已安装技能的捆绑文件内容（load_skill 返回的文件清单里的路径）。路径必须是该技能包内的相对路径。",
     parameters: {

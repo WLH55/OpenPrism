@@ -7,7 +7,7 @@
 
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { ToolDefinition } from "../harness/index";
+import type { AppTool } from "./tools";
 
 export const MEMORY_KINDS = ["profile", "preference", "fact", "task", "interest"] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -760,9 +760,10 @@ export class MemoryStore {
 // ── 模型写记忆的工具 ──────────
 
 /** save_preference：用户显式表达的偏好 → preference 条目（origin=explicit 常驻注入） */
-export function createSavePreferenceTool(deps: { store: MemoryStore; uid: string; now(): number }): ToolDefinition {
+export function createSavePreferenceTool(deps: { store: MemoryStore; uid: string; now(): number }): AppTool {
   return {
     name: "save_preference",
+    domain: "memory",
     description: "用户显式表达了偏好或要求（如称呼、语气、习惯）时，用这个工具记住。只记用户明确说出的，不要猜、不要推断。一次一条。",
     parameters: {
       type: "object",
@@ -795,9 +796,10 @@ export function createSearchMemoryTool(deps: {
   uid: string;
   /** 语义命中预查（未配置 embedding 时缺省 → 纯词法）；返回 null = 不可用，同样退词法 */
   vectorRecall?(uid: string, query: string): Promise<MemoryVectorHit[] | null>;
-}): ToolDefinition {
+}): AppTool {
   return {
     name: "search_memory",
+    domain: "memory",
     description:
       "检索对这位用户的长期记忆。开场时已有部分记忆自动注入；当对话推进到注入块没覆盖的细节、或用户问「你记得我什么」时调用。用用户自己的话描述要查的主题；注入块里的记忆条目带方括号 id，给 id 则返回该条与它的 supersede 链邻接条目（看这条记忆怎么演变来的）。",
     parameters: {

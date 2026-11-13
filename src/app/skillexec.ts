@@ -5,7 +5,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { ToolDefinition } from "../harness/index";
+import type { AppTool } from "./tools";
 import type { DockerClient } from "./skilldocker";
 import { skillVisible, type SkillStore } from "./skills";
 
@@ -118,10 +118,11 @@ export function createSkillExecTool(deps: {
   runsRoot: string;
   randomUUID(): string;
   limits?: SkillOutputLimits;
-}): ToolDefinition {
+}): AppTool {
   const limits = deps.limits ?? DEFAULT_OUTPUT_LIMITS;
   return {
     name: "skill_exec",
+    domain: "skill",
     description:
       "在技能的沙箱容器里执行命令（脚本已随技能安装：Python 依赖在 .venv、Node 依赖在 node_modules、工作目录 /home/skill 是技能根）。" +
       "产物文件必须写到 $SKILL_OUTPUT_DIR 指向的目录；执行结束返回 exit_code（非零不算失败，看输出判断）、stdout/stderr（超限保头保尾截断）与产物清单（文件已入库，用户可在网页端下载）。",

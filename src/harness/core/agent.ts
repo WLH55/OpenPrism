@@ -128,6 +128,9 @@ export function createAgent(config: AgentConfig): Agent {
       model: request.model,
       systemFingerprint: fnv1a(request.system),
       toolsFingerprint: registry.fingerprint(),
+      // 尺寸度量（2026-11-13）：同指纹必同长度，字段随版本序列生命期（指纹不变不重复落档）
+      systemChars: request.system.length,
+      toolsChars: JSON.stringify(registry.publicSchemas()).length,
     };
     const last = lastRequestHeader(log.readAll());
     if (

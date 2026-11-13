@@ -5,7 +5,7 @@
 // 需求闸门（借 dsh workbench-standard）：create_widget 描述要求先确认用途/数据来源/更新方式再创建。
 
 import type { DatabaseSync } from "node:sqlite";
-import type { ToolDefinition } from "../harness/index";
+import type { AppTool } from "./tools";
 
 export type WidgetKind = "note" | "progress";
 
@@ -148,11 +148,12 @@ export interface WidgetToolsDeps {
   uid: string;
 }
 
-export function createWidgetTools(deps: WidgetToolsDeps): ToolDefinition[] {
+export function createWidgetTools(deps: WidgetToolsDeps): AppTool[] {
   const { store, uid } = deps;
 
-  const createWidget: ToolDefinition = {
+  const createWidget: AppTool = {
     name: "create_widget",
+    domain: "widget",
     description:
       "在用户的「今天」页驾驶舱创建一张自定义卡片（note 便签 = 标题+正文；progress 进度 = 标题+当前值/目标值）。创建前必须先向用户确认三件事：这张卡的用途、数据从哪来、以后怎么更新——说不清就先问，不要自行编造目标值或进度。卡片是驾驶舱不是便签墙，用户明确要才建。",
     parameters: {
@@ -186,8 +187,9 @@ export function createWidgetTools(deps: WidgetToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const updateWidget: ToolDefinition = {
+  const updateWidget: AppTool = {
     name: "update_widget",
+    domain: "widget",
     description:
       "更新「今天」页的自定义卡片：progress 卡推进度（payload 只传要改的字段，如 {value: 150}）、note 卡改正文，也可改标题。id 在创建回执或 list_widgets 里。",
     parameters: {
@@ -223,8 +225,9 @@ export function createWidgetTools(deps: WidgetToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const deleteWidget: ToolDefinition = {
+  const deleteWidget: AppTool = {
     name: "delete_widget",
+    domain: "widget",
     description: "删除「今天」页的自定义卡片。删前告知用户删的是哪张；id 在 list_widgets 里。",
     parameters: {
       type: "object",
@@ -251,8 +254,9 @@ export function createWidgetTools(deps: WidgetToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const listWidgets: ToolDefinition = {
+  const listWidgets: AppTool = {
     name: "list_widgets",
+    domain: "widget",
     description: "列出「今天」页现有的自定义卡片（标题/类型/当前值）。建卡前先看一眼避免重复建。",
     parameters: { type: "object", properties: {} },
     output: {

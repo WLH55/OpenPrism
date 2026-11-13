@@ -3,12 +3,20 @@
 // checkin_plan（date/time 可补历史卡）/ query_ledger 只读（limit）/ void_flow（流水作废+打卡撤销）+ cancel_plan 走作废回路。
 // 2026-09-30 目标层级下线（SDD 2026-09-30_00-29）：goal 三工具与 goalId 挂载参数移除；what=goals 下线。
 // execute 返回 canonical JSON value；render 产出人话文本块（模型输入与 UI 回执共用）。
+// 2026-11-13 守则段级注入：工具在注册处声明归属域（AppTool.domain），persona.ts 守则段表按域条件注入——
+// 工具名与守则段的关联只有这一处真相（改工具名/加工具标对 domain 即跟随，守则段不列工具名）。
 
 import { randomUUID } from "node:crypto";
 import type { ContentBlock, ToolDefinition } from "../harness/index";
 import { todayView } from "./fold";
 import { mergePlanUpdate, parseAt, PLAN_DETAILS_MAX_CHARS } from "./plans";
 import type { Ledger, LedgerActor, PlanRecord } from "./ledger";
+
+/** 工具域：装配处按此派生在场域集合，守则段表（persona.ts RULE_SEGMENTS）据此条件注入 */
+export type ToolDomain = "ledger" | "task" | "scene" | "widget" | "memory" | "skill";
+
+/** app 层工具 = harness ToolDefinition + 可选域标注（域是 app 概念，不进 harness 类型） */
+export type AppTool = ToolDefinition & { domain?: ToolDomain };
 
 export interface LedgerToolsDeps {
   ledger: Ledger;
@@ -19,15 +27,16 @@ export interface LedgerToolsDeps {
   tzOffsetMinutes?: () => number;
 }
 
-export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
+export function createLedgerTools(deps: LedgerToolsDeps): AppTool[] {
   const { ledger, now } = deps;
   const tz = () => deps.tzOffsetMinutes?.() ?? 0;
   const actor = () => ({ ...(deps.actor?.() ?? {}), agentName: deps.actor?.().agentName ?? "助手" });
   // 写入类工具统一以注入时钟落账（确定性；ts = 事件时刻）
   const append = (record: Parameters<Ledger["append"]>[0]) => ledger.append(record, now());
 
-  const recordFlow: ToolDefinition = {
+  const recordFlow: AppTool = {
     name: "record_flow",
+    domain: "ledger",
     description: "记一笔生活流水：花钱、吃饭、运动、心情、任何发生的事。需要写入账本时必须调用本工具。",
     parameters: {
       type: "object",
@@ -73,8 +82,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const createPlan: ToolDefinition = {
+  const createPlan: AppTool = {
     name: "create_plan",
+    domain: "ledger",
     description: "建一个计划/待办：今天要做的事、本周目标、带截止日的任务等。",
     parameters: {
       type: "object",
@@ -152,8 +162,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const updatePlan: ToolDefinition = {
+  const updatePlan: AppTool = {
     name: "update_plan",
+    domain: "ledger",
     description: "修改计划：标题/截止日/周期/每期配额/执行内容，只传要改的字段，未提供的保持原值。比取消重建好——planId 不变，已打的卡都还在。",
     parameters: {
       type: "object",
@@ -211,8 +222,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const checkinPlan: ToolDefinition = {
+  const checkinPlan: AppTool = {
     name: "checkin_plan",
+    domain: "ledger",
     description: "打卡：认证某个计划做了/没做。只基于用户明确说出的完成事实打卡（用户说「练完了/做了/打一下卡」才算）；定时提醒、状态播报里不得凭历史推断替用户打卡，没听到用户确认就先问。planId 从 query_ledger 的结果里拿。昨天做了忘了打，带 date 补卡；打错了用 void_flow 撤——刚打的 seq 在回执里，历史打卡的 seq 从 query_ledger what=today 该计划的 checkins 里拿。",
     parameters: {
       type: "object",
@@ -334,8 +346,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     return [{ type: "text", text: JSON.stringify(value) }];
   };
 
-  const queryLedger: ToolDefinition = {
+  const queryLedger: AppTool = {
     name: "query_ledger",
+    domain: "ledger",
     description:
       "查用户的账本：今天视图（流水+计划+打卡态+Top3）、活跃计划列表、单个计划全文（执行内容 details）、按分类/日期过滤流水。只读。计划带「有详情」标记时，用户问怎么执行/要具体步骤就用 what=plan 查全文。",
     parameters: {
@@ -406,8 +419,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => true,
   };
 
-  const voidFlow: ToolDefinition = {
+  const voidFlow: AppTool = {
     name: "void_flow",
+    domain: "ledger",
     description:
       "作废一笔记错/重复的流水，或撤销一条打错的打卡（seq 从 query_ledger 的 flows / today 计划的 checkins / 打卡回执拿）。修正流水 = 作废后用 record_flow 重记，不要原地补偿。",
     parameters: {
@@ -442,8 +456,9 @@ export function createLedgerTools(deps: LedgerToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const cancelPlan: ToolDefinition = {
+  const cancelPlan: AppTool = {
     name: "cancel_plan",
+    domain: "ledger",
     description: "取消一个计划/待办：作废后不再出现在今天视图。planId 从 query_ledger 的 plans 拿；已打的卡不受影响。",
     parameters: {
       type: "object",

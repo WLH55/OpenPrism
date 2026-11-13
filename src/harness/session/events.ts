@@ -78,6 +78,9 @@ export interface RequestHeaderEvent {
   model: string;
   systemFingerprint: string;
   toolsFingerprint: string;
+  /** prompt 体积度量（2026-11-13 尺寸度量）：system 字符数与工具面 JSON 字符数，随版本序列落档；旧日志无此字段 */
+  systemChars?: number;
+  toolsChars?: number;
 }
 
 export type SessionEventPayload =

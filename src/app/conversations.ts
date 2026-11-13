@@ -9,7 +9,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "./ledger";
 import { AgentStore, type AgentBinding } from "./agents";
 import { createReadShadowTool } from "./shadow";
-import { createLedgerTools } from "./tools";
+import { createLedgerTools, type AppTool } from "./tools";
 import { composeAssistantPrompt, dateLine } from "./persona";
 import { createLoadSkillTool, createReadSkillFileTool, skillCatalogPrompt, type SkillMeta } from "./skills";
 import { createSkillExecTool } from "./skillexec";
@@ -175,9 +175,10 @@ export interface SceneToolsDeps {
   setScene(uid: string, cid: string, scene: string | null): Promise<unknown>;
 }
 
-export function createSceneTools(deps: SceneToolsDeps): ToolDefinition[] {
-  const setConversationScene: ToolDefinition = {
+export function createSceneTools(deps: SceneToolsDeps): AppTool[] {
+  const setConversationScene: AppTool = {
     name: "set_conversation_scene",
+    domain: "scene",
     description:
       "给当前会话设置或清除场景标签（如「装修」「读书」）——侧栏可按场景过滤，打开一个场景只见相关工作。用户明确要求归类、或会话主题与用户已说过的场景明显吻合时设置；改名、清除同样以用户的话为准，不要擅自批量改。",
     parameters: {
@@ -600,7 +601,7 @@ export class ConversationStore {
     // 能力绑定的工具开关对场景/卡片工具同样生效（写类工具可被伙伴白名单关掉）
     const allowByBinding = (tool: ToolDefinition) => !binding.tools || binding.tools.length === 0 || binding.tools.includes(tool.name);
 
-    const tools: ToolDefinition[] = [...ledgerTools];
+    const tools: AppTool[] = [...ledgerTools];
     if (binding.skills.length > 0) {
       // 绑定才可用（2026-10-21 绑定裁决）：工具面按装配期绑定集收口——目录层、钉住、load/read 同一口径
       const allowedSkillIds = new Set(binding.skills);
@@ -683,6 +684,10 @@ export class ConversationStore {
     // 标注可回读的 seq 区间，模型按需用本工具读回原文（内容直接来自会话日志，铁律 2 天然满足）
     tools.push(createReadShadowTool({ log: sessionLog }));
 
+    // 守则段注入域集合（2026-11-13 段级注入）：从最终装配面派生（白名单过滤、条件装配之后），
+    // 与发给模型的 tools 数组同源——装配期快照一次，会话内不变（前缀缓存安全）；守则段据此条件注入
+    const presentDomains = new Set<string>(tools.flatMap((tool) => (tool.domain !== undefined ? [tool.domain] : [])));
+
     const agent = createAgent({
       env,
       sessionLog,
@@ -695,7 +700,7 @@ export class ConversationStore {
       },
       // 摘要指令按个人助理定位注入（2026-10-19 摘要指令适配）；不传则 harness 用领域中立的缺省口径
       compaction: { summaryInstruction: PERSONAL_SUMMARY_INSTRUCTION },
-      systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf()),
+      systemPrompt: () => this.composePromptWithMeta(uid, conversationId, metaOf(), presentDomains),
       // 历史日期锚（2026-11-09 时效可见性）：每回合现读会话时区（与 turnContextFor 钟面同口径），
       // 投影给每条用户消息注入日期行——模型由此看得见每条历史对话发生在哪天，
       // 不再凭无时间戳的旧历史误判「今天已完成」（2026-11-09 误打卡事故根因之一）
@@ -766,7 +771,8 @@ export class ConversationStore {
     return this.turnContextFor(uid, query, undefined, this.modelIdentityLine(config));
   }
 
-  private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta): string {
+  /** 守则段注入域集合 = 装配期快照（与 tools 面同源）；人设/目录仍每步重读（热更） */
+  private composePromptWithMeta(uid: string, cid: string, meta: ConversationMeta, presentDomains: ReadonlySet<string>): string {
     const current = this.syncCurrentAgent(uid, meta);
     const catalog = skillCatalogPrompt(this.syncBoundSkills(uid, current.binding));
     return composeAssistantPrompt({
@@ -774,6 +780,7 @@ export class ConversationStore {
       ...(current.identity ? { identity: { name: current.name, description: current.identity.description, language: current.identity.language } } : {}),
       ...(catalog !== "" ? { skillCatalog: catalog } : {}),
       taskFeed: cid.startsWith(TASK_FEED_CID_PREFIX),
+      presentDomains,
     });
   }
 

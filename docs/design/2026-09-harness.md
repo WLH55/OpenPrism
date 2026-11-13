@@ -143,7 +143,7 @@ interface ToolDefinition {
 | `tool/call` / `tool/result` | id/name/args；id/isError/content/code |
 | `llm/retry` | attempt、code、delayMs（预算恢复源） |
 | `compaction/summary` | 被遮蔽区间 [startSeq, endSeq] + 摘要 |
-| `request/header` | provider/model/system 指纹/工具表指纹（仅变更时记） |
+| `request/header` | provider/model/system 指纹/工具表指纹（仅变更时记）+ prompt 尺寸 systemChars/toolsChars（2026-11-13 尺寸度量，随指纹生命期；旧日志无此字段） |
 
 刻意不记：`assistant/chunk`（流式动画还原，不值手机写盘成本）、`step/start|end`（可从消息序列推导）。
 

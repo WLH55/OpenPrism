@@ -3,7 +3,7 @@
 // 补跑不补吵：锚点 = lastRunTs ?? createdTs，错过 <24h 补最近一次，≥24h 记 skipped（锚点推进，不堆积）。
 
 import type { DatabaseSync } from "node:sqlite";
-import type { ToolDefinition } from "../harness/index";
+import type { AppTool } from "./tools";
 
 export type TaskTrigger =
   | { kind: "once"; at: number }
@@ -714,7 +714,7 @@ export interface TaskToolsDeps {
   wechatStatus?: (uid: string) => { bound: boolean; state: "active" | "expired"; lastMsgTs?: number };
 }
 
-export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
+export function createTaskTools(deps: TaskToolsDeps): AppTool[] {
   /** 微信绑定真相（A4）：工具结果附加字段——模型可见、进会话日志（model-visible means logged） */
   const wechatBindResult = ():
     | { state: "active" | "expired" | "unbound"; lastMsgMinutesAgo?: number; note: string }
@@ -738,8 +738,9 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     };
   };
 
-  const createTask: ToolDefinition = {
+  const createTask: AppTool = {
     name: "create_task",
+    domain: "task",
     description: "为用户创建一个定时任务（提醒/定时检查）。触发时刻用结构化字段，解析不了就问用户，不要猜。",
     parameters: {
       type: "object",
@@ -789,8 +790,9 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const queryTasks: ToolDefinition = {
+  const queryTasks: AppTool = {
     name: "query_tasks",
+    domain: "task",
     description: "查用户的定时任务列表：id、标题、触发、启用态、下次到点、通知渠道（站内 inapp | 微信 wechat）。用户问「我有哪些提醒」「那个任务还在吗」「简报是走微信还是站内」就用它。",
     parameters: {
       type: "object",
@@ -849,8 +851,9 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => true,
   };
 
-  const updateTask: ToolDefinition = {
+  const updateTask: AppTool = {
     name: "update_task",
+    domain: "task",
     description: "修改定时任务：启停（enabled）、改标题/指令/触发时刻。taskId 从 query_tasks 拿。",
     parameters: {
       type: "object",
@@ -903,8 +906,9 @@ export function createTaskTools(deps: TaskToolsDeps): ToolDefinition[] {
     isConcurrencySafe: () => false,
   };
 
-  const deleteTask: ToolDefinition = {
+  const deleteTask: AppTool = {
     name: "delete_task",
+    domain: "task",
     description: "删除定时任务：用户说「这个提醒不要了/别再叫我」时用。删前不必确认服务器，但拿不准用户意图时先问一句。",
     parameters: {
       type: "object",
