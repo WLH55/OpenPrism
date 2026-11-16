@@ -65,8 +65,6 @@ describe("SqliteSessionLog 与 JsonlSessionLog 对拍", () => {
     // 按不同 key 隔离
     const other = SqliteSessionLog.open(db, "c2", () => 1);
     expect(other.readAll()).toHaveLength(0);
-    const taskLog = SqliteSessionLog.open(db, "task:tid-1", () => 1);
-    expect(taskLog.readAll()).toHaveLength(0);
   });
 });
 

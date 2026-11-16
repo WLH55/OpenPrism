@@ -85,7 +85,7 @@ OpenPrism 现在是**自托管的生活记录助理应用**，叠加在纯 TS ag
 |---|---|---|---|
 | 任务模型 | 四字段：agentId/trigger/instruction/enabled | `tasks.ts` `TaskDef` | 双入口：模型对话四工具（`create_task`/`query_tasks`/`update_task`/`delete_task`，2026-09-04 补齐 CRUD——起因：用户实测"只能建不能撤"）+ UI/API 直建 |
 | 触发 | 枚举 + cron 逃生门 | `tasks.ts` `cronMatches`/`nextDue` | 自研零依赖 5 段匹配器（`* n a-b a,b */n`，周日 0\|7 归一）；**全部在任务时区求值**；cron 逐分钟前进、上限 2 年 |
-| 执行 | 到点投 `instruction` 进**任务专属持久会话**跑离线回合 | `conversations.ts:165-170`（`taskAgent`）、`main.ts:85-96`（`taskRunner`） | 与聊天回合同权装配（伙伴 = task.agentId 快照，人设仍热读）；收口后把最后一条 assistant/message 文本落站内通知 |
+| 执行 | 到点投 `instruction` 进**每伙伴一个置顶 feed 会话**跑离线回合 | `conversations.ts`（`ensureTaskFeed`）、`main.ts`（`taskRunner`） | 与聊天回合同权装配；同伙伴全部任务共享该会话（纵向记忆）；收口后把最后一条 assistant/message 文本落站内通知 |
 | 补跑不补吵 | 锚点 = `lastRunTs ?? createdTs` | `tasks.ts` `Scheduler.tick` | 错过 <24h 补最近一次；≥24h 记 `skipped` 并推进锚点（不堆积）；30s 一 tick；支持手动 `POST …/run` |
 | 站内通知 | 追加式 JSONL + 通道缝 | `notify.ts` | `NotifyChannel = (uid, payload)`；站内 = 永远在线兜底通道（微信桥后接入，架构位留给 D9.2 双向网关）；单条/全部已读重写整文件 |
 

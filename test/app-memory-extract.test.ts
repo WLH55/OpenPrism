@@ -99,14 +99,13 @@ describe("extractOnce：三 surface 检测 + 决策落库", () => {
     expect(again.skipped).toBe("no_new_input");
   });
 
-  it("提醒投递会话（feed:/task:）不进 chat 提取面：任务上下文不当成用户发言", async () => {
+  it("提醒投递会话（feed:）不进 chat 提取面：任务上下文不当成用户发言", async () => {
     const db = testDb();
     const memory = makeStore(db);
     seedChat(db, "u1", "feed:default", [
       { role: "user", text: "【定时任务触发】工作提醒\n任务内容：提醒我工作辛苦了", ts: 1000 },
       { role: "assistant", text: "辛苦了，记得歇一会儿", ts: 1001 },
     ]);
-    seedChat(db, "u1", "task:tid-9", [{ role: "user", text: "任务专属会话的指令", ts: 1002 }]);
     const prompts: string[] = [];
     const mock = createMockLlmAdapter([
       {

@@ -86,7 +86,7 @@ flowchart TB
     LEDT --> LG
     PER -. "读取" .-> MEM & AGT & SKL
     MEXT --> MEM & MTOP & MVEC
-    TSK -- "任务专属会话 followup" --> CONV
+    TSK -- "feed 会话 followup" --> CONV
     TSK --> NTF
 
     %% ===== harness 内部 =====

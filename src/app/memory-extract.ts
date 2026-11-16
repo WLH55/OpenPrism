@@ -21,7 +21,7 @@ import {
   type MemoryKind,
 } from "./memory";
 import { createLlmTopicAdjudicator, listTopTopics, observeTopics } from "./memory-topics";
-import { describeTrigger, TASK_FEED_CID_PREFIX, TASK_SESSION_CID_PREFIX, type TaskTrigger } from "./tasks";
+import { describeTrigger, TASK_FEED_CID_PREFIX, type TaskTrigger } from "./tasks";
 
 // ── 常量（Spec §6.3） ──────────
 
@@ -362,10 +362,10 @@ export class MemoryExtractor {
         `SELECT ce.id AS eid, ce.cid, ce.ts, ce.role, ce.event_json FROM conversation_events ce
          JOIN conversations c ON c.cid = ce.cid
          WHERE c.uid = ? AND ce.id > ? AND ce.type IN ('user/message','assistant/message')
-           AND c.cid NOT LIKE ? AND c.cid NOT LIKE ?
+           AND c.cid NOT LIKE ?
          ORDER BY ce.id LIMIT 400`,
       )
-      .all(uid, cursor ?? 0, `${TASK_FEED_CID_PREFIX}%`, `${TASK_SESSION_CID_PREFIX}%`) as unknown as { eid: number; cid: string; ts: number; role: string | null; event_json: string }[];
+      .all(uid, cursor ?? 0, `${TASK_FEED_CID_PREFIX}%`) as unknown as { eid: number; cid: string; ts: number; role: string | null; event_json: string }[];
 
     type Msg = { eid: number; cid: string; ts: number; role: string; text: string };
     const msgs: Msg[] = [];

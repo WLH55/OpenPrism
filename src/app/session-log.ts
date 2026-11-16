@@ -1,6 +1,6 @@
 // SQLite 版会话日志（ADR 0008）：实现 harness 的 SessionLog 缝（宿主可换任意载体）。
 // 九事件完整原文落 conversation_events（cid+seq 唯一）；seq 从库里最后一条续排（崩溃重启不回退）。
-// cid 约定：聊天会话 = cid；任务专属会话 = "task:<taskId>"。
+// cid 约定：聊天会话 cid（feed: 前缀 = 定时提醒会话）。
 // 图片分离（2026-10-17 媒体膨胀治理）：user/message 里 image 块的 base64 在落库前抽到
 // conversation_blobs（内容寻址），事件（内存缓存与磁盘一致）只留 blobRef 引用——
 // 单会话不再随图片数线性膨胀（生产实测曾达 29MB）；回填入口见 conversations.ts hydrateImageRefs。

@@ -88,13 +88,13 @@ export function hydrateImageRefs(db: DatabaseSync, messages: Message[]): Message
 
 export interface ConversationDeps {
   env: PlatformEnv;
-  /** 会话日志缝：key = 聊天 cid 或 `task:<taskId>`；生产 = SqliteSessionLog，测试可注入内存实现 */
+  /** 会话日志缝：key = 聊天 cid；生产 = SqliteSessionLog，测试可注入内存实现 */
   sessionLog(key: string): Promise<SessionLog>;
   ledgerFor(uid: string): Promise<Ledger>;
   /** providerId 缺省/null = 跟随用户全局激活模型 */
   modelConfigFor(uid: string, providerId?: string | null): Promise<ModelConfig | null>;
   /** 测试注 mock；生产 = openai-compat + 主密钥解 keyEnc（providerId 非空时现读该供应商行）。
-   *  sessionKey = 会话稳定标识（聊天 cid / `task:<taskId>`），OpenCode Go 等网关按它带 x-opencode-session 头 */
+   *  sessionKey = 会话稳定标识（聊天 cid），OpenCode Go 等网关按它带 x-opencode-session 头 */
   adapterFactory(uid: string, providerId: string | null, config: ModelConfig, sessionKey?: string): LlmAdapter;
   now(): number;
   /** 用户档案时区（分钟，UTC+local；2026-09-29 起按会话 uid 读——浏览器上报/个人资料页可改）；缺省按服务器本地时区 */
@@ -525,14 +525,6 @@ export class ConversationStore {
   async agent(uid: string, cid: string): Promise<Agent> {
     return this.pooled(`${uid}:${cid}`, () =>
       this.assemble(uid, cid, cid, () => this.dbMetaSync(uid, cid)),
-    );
-  }
-
-  /** 任务专属持久会话（D6.2）：与聊天回合同权装配；伙伴 = task.agentId（快照），人设正文仍每步热读 */
-  async taskAgent(uid: string, taskId: string, agentId: string | undefined): Promise<Agent> {
-    const meta: ConversationMeta = { switches: [], ...(agentId !== undefined ? { agentId } : {}) };
-    return this.pooled(`${uid}:task:${taskId}`, () =>
-      this.assemble(uid, `task:${taskId}`, taskId, () => meta),
     );
   }
 

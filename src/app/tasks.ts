@@ -1,5 +1,5 @@
 // 定时任务（D6，ADR 0008 领域表）：tasks/task_runs 两表。任务四字段（agentId/trigger/instruction/enabled）
-// + 任务专属持久会话 + 调度器。触发：枚举（daily/weekly/monthly/yearly/interval/once）+ cron 逃生门（自研零依赖 5 段匹配器）；
+// + 调度器。触发：枚举（daily/weekly/monthly/yearly/interval/once）+ cron 逃生门（自研零依赖 5 段匹配器）；
 // 补跑不补吵：锚点 = lastRunTs ?? createdTs，错过 <24h 补最近一次，≥24h 记 skipped（锚点推进，不堆积）。
 
 import type { DatabaseSync } from "node:sqlite";
@@ -50,8 +50,6 @@ export type TaskRunTrigger = { kind: "scheduled"; due: number } | { kind: "manua
 
 /** 定时提醒会话的 cid 前缀（每伙伴一个，见 conversations.ensureTaskFeed） */
 export const TASK_FEED_CID_PREFIX = "feed:";
-/** 任务专属会话的 cid 前缀（会话日志键 = `task:<taskId>`） */
-export const TASK_SESSION_CID_PREFIX = "task:";
 
 // ── cron 匹配器（5 段：分 时 日 月 周；支持 * n a-b a,b */n；周日用 0|7） ──
 
@@ -554,8 +552,6 @@ export class TaskStore {  constructor(private deps: TaskStoreDeps) {}
     const result = this.deps.db.prepare("DELETE FROM tasks WHERE id = ? AND uid = ?").run(id, uid);
     if (result.changes === 0) throw new Error(`task "${id}" 不存在`);
     this.deps.db.prepare("DELETE FROM task_runs WHERE task_id = ? AND uid = ?").run(id, uid);
-    // 任务专属会话的事件一并清理（旧文件版此处会遗留孤儿 session.jsonl）
-    this.deps.db.prepare("DELETE FROM conversation_events WHERE cid = ?").run(`task:${id}`);
   }
 
   async runs(uid: string, id: string): Promise<TaskRun[]> {

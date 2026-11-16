@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 CREATE INDEX IF NOT EXISTS idx_conv_uid ON conversations(uid, created_ts);
 
--- 会话九事件（harness/session/events.ts 词表）：cid = 聊天 cid 或 "task:<taskId>"。
+-- 会话九事件（harness/session/events.ts 词表）：cid = 聊天 cid（feed: 前缀 = 定时提醒会话）。
 -- event_json 保留九事件完整原文（content 块多态由 harness 类型管校验）；role 为消息类冗余列。
 CREATE TABLE IF NOT EXISTS conversation_events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,

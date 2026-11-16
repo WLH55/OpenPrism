@@ -24,7 +24,7 @@ OpenPrism 应用层存储从 append-only JSONL 文件整体切换为 SQLite（No
 - **账本单表继承**：`ledger_entries` 以 `kind` 判别列 + 各类专有列建模（(uid, seq) 主键）；四类记录共享 seq 空间，
   void→target_seq 更正回路保持"只追加不抹除"。
 - **九事件落 `conversation_events`**：cid+seq 唯一，type/role 冗余列供查询，`event_json` 保留完整原文（content
-  块多态由 harness 类型管校验）。任务会话 cid = `task:<taskId>`，与聊天会话同表隔离。
+  块多态由 harness 类型管校验）。定时提醒会话 cid = `feed:<uid>:<agentId|default>`，与聊天会话同表隔离。
 - **可靠性增益**：WAL + `synchronous=FULL` + 事务，取代无 fsync 的文件追加与多处"整文件重写"（agents/skills/tasks
   索引、notifications markRead 均改为单行 UPDATE）；备份用 `VACUUM INTO`（WAL 伴生文件不可裸拷）。
 

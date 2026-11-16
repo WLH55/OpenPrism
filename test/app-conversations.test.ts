@@ -586,23 +586,7 @@ describe("migrateTaskFeedCid（存量提醒会话改名）", () => {
   });
 });
 
-describe("ConversationStore（批次3：任务会话）", () => {
-  it("taskAgent：独立于聊天会话池；followup 落任务会话日志（task: 前缀）；不进会话列表", async () => {
-    const db = testDb();
-    const mock = createMockLlmAdapter([{ kind: "fn", fn: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "到点了，去睡觉" }] } }) }]);
-    const deps = makeDeps(db, mock.adapter as LlmAdapter);
-    const store = deps.makeStore();
-    const agent = await store.taskAgent(UID, "tid-99", undefined);
-    agent.followup("23:00 了，提醒睡觉");
-    await agent.whenIdle();
-    const events = agent.sessionLog.readAll();
-    expect(events.map((e) => e.type)).toContain("turn/end");
-    expect((await store.list(UID))).toHaveLength(0); // 任务会话不混入聊天列表
-    expect(await store.taskAgent(UID, "tid-99", undefined)).toBe(agent); // 池化
-    const taskEvents = db.prepare("SELECT COUNT(*) AS n FROM conversation_events WHERE cid = 'task:tid-99'").get() as unknown as { n: number };
-    expect(taskEvents.n).toBeGreaterThan(0); // 事件在库里，cid = task:<taskId>
-  });
-
+describe("ConversationStore（批次3：会话文本聚合）", () => {
   it("collectSessionTexts：SQL 聚合全部聊天会话的用户/助手文本（凝练原料）", async () => {
     const db = testDb();
     const { adapter } = createMockLlmAdapter([{ kind: "text", text: "好" }]);
@@ -613,8 +597,11 @@ describe("ConversationStore（批次3：任务会话）", () => {
     await (await store.agent(UID, entry.id)).whenIdle();
     const texts = store.collectSessionTexts(UID);
     expect(texts.some((t) => t.role === "user" && t.text === "今天很累")).toBe(true);
-    // 任务会话事件不混入（不在 conversations 表）
-    await (await store.taskAgent(UID, "tid-x", undefined)).whenIdle().catch(() => undefined);
+    // 无 conversations 行的事件（历史孤儿）不混入聚合面
+    db.prepare("INSERT INTO conversation_events (cid, seq, type, ts, role, event_json) VALUES (?, 1, 'user/message', 1, 'user', ?)").run(
+      "orphan-cid",
+      JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "孤儿事件" }] } }),
+    );
     const count = store.collectSessionTexts(UID).length;
     expect(count).toBe(texts.length);
   });
